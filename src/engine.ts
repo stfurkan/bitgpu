@@ -104,7 +104,7 @@ interface EngineInternal extends Engine {
 
 type TypedArrayCtor = Float32ArrayConstructor | Uint8ArrayConstructor | Uint16ArrayConstructor
 const VIEW: Record<string, TypedArrayCtor> = { FLOAT: Float32Array, UINT8: Uint8Array, FLOAT16: Uint16Array }
-const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rmsnorm', 'rope', 'swiglu', 'attention_cache', 'copy']
+const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rope', 'swiglu', 'copy']
 const DEFAULT_MAX_SEQ = 2048
 
 const PARAM_AB = new ArrayBuffer(64)
@@ -229,7 +229,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const tiledPrefill = (S: number): boolean => FORCETILE || (!NOTILE && S >= 64) // tiled GEMM wins only once it fills its 64-row tiles
   const SYNC_N = Math.max(1, opts.syncSteps ?? 4) // decode: chain N steps per CPU sync
   const maxSeqLen = Math.max(1, opts.maxSeqLen ?? DEFAULT_MAX_SEQ) // KV-cache length cap (VRAM ~ maxSeqLen x 224KB)
-  const useSG = hasSG && sgMin === sgMax && (sgMax === 32 || sgMax === 64) && !forceNoSG // uniform >=32 -> head_dim/SG<=4
+  const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && !forceNoSG // uniform 16/32/64 (16 = Arm Mali) -> head_dim/SG<=8
   const device = await adapter.requestDevice({ requiredFeatures: useSG ? (['subgroups'] as GPUFeatureName[]) : [] }) // no requiredLimits -> code to the guaranteed minimums (runs on low-end/mobile)
   // awareness: largest binding (lm_head ~77MB) < 128MiB, shared mem <=8KB < 16KB min, WG <=256
 
@@ -263,7 +263,8 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     for (const n of ['matmul_split_sm', 'matmul_resid_sm', 'matmul_q2_sm']) specs.push([n, { SG: sgMax }]) // small-batch (M=2..9) verify-pass GEMVs
     for (const n of ['matmul_resid_mr_sg', 'matmul_swiglu_mr_sg']) specs.push([n, { SG: sgMax, ROWS: ROWS_MR }])
   } else {
-    for (const n of ['matmul_split_wg', 'matmul_resid_wg', 'matmul_q2_wg']) specs.push([n, { WG: WG_NS }])
+    for (const n of ['matmul_split_wg', 'matmul_resid_wg', 'matmul_q2_wg', 'rmsnorm_wg']) specs.push([n, { WG: WG_NS }])
+    specs.push(['attention_wg']) // fixed 64-thread workgroup (per-thread acc covers head_dim <= 128)
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
@@ -636,7 +637,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const rms = (pass: GPUComputePassEncoder, x: GPUBuffer, g: string, R: number, Dn: number, out: GPUBuffer): void =>
     useSG
       ? runN(pass, 'rmsnorm_sg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
-      : run(pass, 'rmsnorm', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
+      : runN(pass, 'rmsnorm_wg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
   // fused q/k/v or gate/up matmul
   function fusedMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, S: number, outs: GPUBuffer[]): void {
     const Ntot = w.N0! + w.N1! + w.N2!
@@ -732,7 +733,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     const att = actBuf(S * H * Dh)
     const attF: Field[] = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]]
     if (useSG) runN(pass, 'attention_sg', attF, [qr, Kc[li], Vc[li]], att, S * H)
-    else run(pass, 'attention_cache', attF, [qr, Kc[li], Vc[li]], att, S * H)
+    else runN(pass, 'attention_wg', attF, [qr, Kc[li], Vc[li]], att, S * H)
     cap(li, 'att', att)
     const o = W[`layers.${li}.attn.o_proj`],
       h2 = actBuf(S * Hd)

@@ -38,7 +38,9 @@
       log('loading model (~290 MB) via the packaged engine...');
       let engine;
       try {
-        engine = await createEngine({ modelUrl: './model', onProgress: (p) => log(`  [load] ${p.phase}`) });
+        // ?nosg=1 forces the no-subgroup fallback path (fallback perf/correctness on SG hardware).
+        const nosg = new URLSearchParams(location.search).get('nosg') === '1';
+        engine = await createEngine({ modelUrl: './model', forceNoSubgroups: nosg, onProgress: (p) => log(`  [load] ${p.phase}`) });
       } catch (e) {
         if (e instanceof WebGPUUnavailableError) { log('WebGPU not available: ' + e.message); return; }
         throw e;
@@ -73,9 +75,10 @@
       const groups = {
         'layer matmul': ['matmul_split_sg', 'matmul_resid_mr_sg', 'matmul_swiglu_mr_sg', 'matmul_split_wg', 'matmul_resid_wg'],
         'lm_head': ['matmul_q2_sg', 'matmul_q2', 'matmul_q2_wg'],
-        attention: ['attention_sg'],
-        'norm+rope': ['rmsnorm_rope_sg'],
-        rmsnorm: ['rmsnorm_sg'],
+        attention: ['attention_sg', 'attention_cache'],
+        'norm+rope': ['rmsnorm_rope_sg', 'rope'],
+        rmsnorm: ['rmsnorm_sg', 'rmsnorm'],
+        'copy+swiglu': ['copy', 'swiglu'],
       };
       const none = await engine.profileDecode(ids, 12, new Set());
       log(`  skeleton (dispatch/barrier floor) = ${none.gpuMs.toFixed(1)} ms/token`);

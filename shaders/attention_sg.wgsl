@@ -1,7 +1,7 @@
 // Causal GQA attention, subgroup-parallel: one subgroup (= one workgroup) per (query, head).
 // Lanes split head_dim; flash-style online softmax over the cached positions; the per-position
 // score (q.k) is reduced with subgroupAdd. Fixes the decode bottleneck where attention ran only
-// H threads. SG = device subgroup size (>=32 so head_dim/SG <= 4). Reads K/V from the cache.
+// H threads. SG = device subgroup size (16/32/64, so head_dim/SG <= 8). Reads K/V from the cache.
 enable subgroups;
 override SG: u32 = 32u;
 struct Params { S: u32, H: u32, KV: u32, D: u32, posBase: u32, Ltot: u32 };
@@ -22,9 +22,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) l
   let kvh = h / (p.H / p.KV);
   let qb = (qi * p.H + h) * p.D;
   let inv = 1.0 / sqrt(f32(p.D));
-  let dper = p.D / SG;                         // <= 4 for SG>=32, D=128
+  let dper = p.D / SG;                         // <= 8 for SG>=16, D=128
 
-  var acc: array<f32, 4>;
+  var acc: array<f32, 8>;
   for (var t = 0u; t < dper; t = t + 1u) { acc[t] = 0.0; }
   var m = -1e30;
   var l = 0.0;
