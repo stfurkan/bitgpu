@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>bitgpu - package verification</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, monospace; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 18px; }
+    button { font: inherit; padding: 8px 14px; cursor: pointer; }
+    pre { background: #f4f4f5; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+    .pass { color: #166534; font-weight: 700; }
+    .fail { color: #b91c1c; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>bitgpu - package verification</h1>
+  <p>Imports the <b>built package</b> (<code>../dist/index.js</code>) and re-runs the bit-exact
+     correctness + decode-throughput checks, to prove the extraction (TS port, inlined shaders,
+     options API) is identical to the validated engine.</p>
+  <button id="run">Run verification</button>
+  <pre id="out">idle.</pre>
+
+  <script type="module">
+    import { createEngine, WebGPUUnavailableError } from '../dist/index.js';
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; };
+    const buf = async (u) => await (await fetch(u)).arrayBuffer();
+    const cos = (a, e) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < e.length; i++) { d += a[i] * e[i]; na += a[i] * a[i]; nb += e[i] * e[i]; } return d / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9); };
+
+    // The committed known-good greedy continuation for the fixture prompt (bit-exact gate).
+    const KNOWN_GOOD = [26194, 13, 576, 6722, 315, 279, 3639, 4180, 374, 6515, 11, 422, 727, 13, 576, 6722, 315, 279, 3639, 15072, 374, 7148, 13, 576, 6722, 315, 279, 25662, 374, 37741, 13, 576];
+
+    async function run() {
+      out.textContent = '';
+      const fp = await (await fetch('../test-fixtures/forward/params.json')).json();
+      const ids = fp.ids;
+      log('loading model (~290 MB) via the packaged engine...');
+      let engine;
+      try {
+        engine = await createEngine({ modelUrl: './model', onProgress: (p) => log(`  [load] ${p.phase}`) });
+      } catch (e) {
+        if (e instanceof WebGPUUnavailableError) { log('WebGPU not available: ' + e.message); return; }
+        throw e;
+      }
+      const cap = engine.capabilities;
+      log(`path: ${cap.useSubgroups ? 'subgroups (SG=' + cap.subgroupSize + ')' : 'no-subgroup fallback'}  adapter: ${cap.adapter.vendor || '?'}/${cap.adapter.architecture || '?'}`);
+
+      // 1) forward correctness vs reference fixtures
+      log('\nchecking correctness vs reference...');
+      const r = await engine.forward(ids);
+      let ok = true;
+      for (const name of ['embed', 'layer0', 'finalnorm', 'logits']) {
+        const c = cos(r[name], new Float32Array(await buf(`../test-fixtures/forward/${name}.bin`)));
+        const pass = c > 0.999; ok = ok && pass;
+        log(`  ${pass ? '[PASS]' : '[FAIL]'} ${name.padEnd(11)} cosine=${c.toFixed(7)}`);
+      }
+
+      // 2) generate + bit-exact id check
+      log('\ngenerating 32 tokens...');
+      const g = await engine.generate(ids, { maxTokens: 32 });
+      const idsMatch = g.tokens.length === KNOWN_GOOD.length && g.tokens.every((t, i) => t === KNOWN_GOOD[i]);
+      ok = ok && idsMatch;
+      log(`first token = ${g.tokens[0]} (expect 26194 = " Tokyo") ${g.tokens[0] === 26194 ? 'OK' : 'MISMATCH'}`);
+      log(`ids vs known-good: ${idsMatch ? '[PASS] identical' : '[FAIL] DIVERGED'}`);
+      log(`prefill (TTFT, ${ids.length} tokens) = ${g.prefillMs.toFixed(0)} ms`);
+      log(`decode = ${g.decodeMs.toFixed(0)} ms for ${g.tokens.length - 1} tokens  ->  ${g.tokensPerSecond.toFixed(2)} tok/s`);
+      log(`  per-token breakdown: record=${g.timing.recordMs.toFixed(1)}ms  gpu=${g.timing.gpuMs.toFixed(1)}ms  readback=${g.timing.readbackMs.toFixed(1)}ms`);
+      log(`generated ids: [${g.tokens.join(', ')}]`);
+
+      // 3) per-kernel breakdown (diagnostic handle)
+      log('\nin-context per-kernel breakdown...');
+      const groups = {
+        'layer matmul': ['matmul_split_sg', 'matmul_resid_mr_sg', 'matmul_swiglu_mr_sg', 'matmul_split_wg', 'matmul_resid_wg'],
+        'lm_head': ['matmul_q2_sg', 'matmul_q2', 'matmul_q2_wg'],
+        attention: ['attention_sg'],
+        'norm+rope': ['rmsnorm_rope_sg'],
+        rmsnorm: ['rmsnorm_sg'],
+      };
+      const none = await engine.profileDecode(ids, 12, new Set());
+      log(`  skeleton (dispatch/barrier floor) = ${none.gpuMs.toFixed(1)} ms/token`);
+      for (const [name, ks] of Object.entries(groups)) {
+        const pr = await engine.profileDecode(ids, 12, new Set(ks));
+        log(`  ${name.padEnd(10)} = ${Math.max(0, pr.gpuMs - none.gpuMs).toFixed(1)} ms/token`);
+      }
+
+      // 4) long-prompt prefill (tiled GEMM path). 800 tokens deliberately exceeds the point where a
+      // per-element prefill kernel needs >65535 workgroups (swiglu = ceil(800*6144/64) = 76800), which
+      // used to throw "Dispatch workgroup count exceeds max ... per dimension" - so this also proves
+      // the 2D-grid dispatch fix.
+      const long = []; while (long.length < 800) long.push(...ids);
+      const lp = await engine.generate(long.slice(0, 800), { maxTokens: 2 });
+      const lpOk = lp.tokens.length === 2;
+      ok = ok && lpOk;
+      log(`\nlong-prompt prefill (800 tokens) = ${lp.prefillMs.toFixed(0)} ms  ${lpOk ? '[PASS] no dispatch overflow' : '[FAIL] generation broke'}`);
+
+      // 5) sampler (Phase 2): kernel diff vs CPU math, determinism, sampled tok/s
+      log('\nsampler (do_sample) checks...');
+      const SOPT = { temperature: 0.5, topK: 20, repetitionPenalty: 1.15, noRepeatNgramSize: 3 };
+      // CPU emulation helpers (mirror sampler.ts; that math is headless bit-exact vs transformers.js)
+      const affected = (h) => [...new Set(h)];
+      const ngramBans = (h, n) => {
+        if (h.length + 1 < n) return [];
+        const gen = new Map();
+        for (let j = 0; j < h.length + 1 - n; j++) {
+          const ng = h.slice(j, j + n), key = JSON.stringify(ng.slice(0, n - 1));
+          const arr = gen.get(key) || []; arr.push(ng[n - 1]); gen.set(key, arr);
+        }
+        return gen.get(JSON.stringify(h.slice(h.length + 1 - n, h.length))) || [];
+      };
+      const topKSort = (data, k) => { const idx = Array.from(data, (_, i) => i); idx.sort((a, b) => data[b] - data[a] || a - b); return idx.slice(0, k); };
+
+      // (a) kernel diff: penalize the kernel's OWN base logits on the CPU and diff vs the GPU result
+      const dbg = await engine.debugSampler(ids, SOPT);
+      const cpu = dbg.base.slice();
+      for (const id of affected(ids)) cpu[id] = cpu[id] < 0 ? cpu[id] * 1.15 : cpu[id] / 1.15;
+      for (const id of ngramBans(ids, 3)) cpu[id] = -Infinity;
+      let pmax = 0, pmis = 0;
+      for (let i = 0; i < cpu.length; i++) {
+        if (cpu[i] === -Infinity && dbg.penalized[i] === -Infinity) continue;
+        const d = Math.abs(dbg.penalized[i] - cpu[i]);
+        if (d > pmax) pmax = d;
+        if (d > 1e-4) pmis++;
+      }
+      const penOk = pmis === 0; ok = ok && penOk;
+      log(`  ${penOk ? '[PASS]' : '[FAIL]'} sampler_penalty kernel == CPU (maxdiff=${pmax.toExponential(1)}, mism=${pmis})`);
+      const cpuTop = topKSort(cpu, 20);
+      let candOk = true; for (let i = 0; i < 20; i++) if (dbg.candIds[i] !== cpuTop[i]) candOk = false;
+      ok = ok && candOk;
+      log(`  ${candOk ? '[PASS]' : '[FAIL]'} argmax_masked top-20 == CPU top-20`);
+
+      // (b) determinism: same seed -> identical sequence twice
+      const s1 = await engine.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+      const s2 = await engine.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+      const detOk = s1.tokens.length === s2.tokens.length && s1.tokens.every((t, i) => t === s2.tokens[i]);
+      ok = ok && detOk;
+      log(`  ${detOk ? '[PASS]' : '[FAIL]'} determinism (seed 42 identical twice)`);
+      log(`  sampled ids (seed 42): [${s1.tokens.join(', ')}]`);
+      log(`  sampled decode = ${s1.tokensPerSecond.toFixed(2)} tok/s (greedy was ${g.tokensPerSecond.toFixed(2)})`);
+
+      // 6) cross-turn KV reuse (Phase 2b): a reused turn must equal a full prefill of the same sequence
+      log('\ncross-turn KV reuse checks...');
+      const R1 = 8, R2 = 8, delta = ids.slice(0, 5);
+      engine.resetCache();
+      const turn1 = await engine.generate(ids, { maxTokens: R1 });               // reset + full prefill
+      const reuseT2 = await engine.generate(delta, { maxTokens: R2, reuseCache: true }); // append delta, reuse cache
+      engine.resetCache();
+      const fullSeq = [...ids, ...turn1.tokens, ...delta];
+      const fullT2 = await engine.generate(fullSeq, { maxTokens: R2 });          // full prefill of the same total sequence
+      const reuseOk = reuseT2.tokens.length === fullT2.tokens.length && reuseT2.tokens.every((t, i) => t === fullT2.tokens[i]);
+      ok = ok && reuseOk;
+      log(`  ${reuseOk ? '[PASS]' : '[FAIL]'} reuse turn-2 == full-prefill turn-2 (greedy, bit-exact)`);
+      log(`    reuse: [${reuseT2.tokens.join(', ')}]`);
+      log(`    full:  [${fullT2.tokens.join(', ')}]`);
+      log(`    TTFT: reuse(delta ${delta.length}) ${reuseT2.prefillMs.toFixed(0)}ms vs full(${fullSeq.length}) ${fullT2.prefillMs.toFixed(0)}ms`);
+      // sampled reuse (the worker's actual path): greedy turn-1 to fix the state, then sampled turn-2
+      // with a fixed seed; reuse must still equal a full prefill (tests cross-turn penalty history + cache)
+      const SS = { temperature: 0.5, topK: 20, repetitionPenalty: 1.15, noRepeatNgramSize: 3, seed: 7 };
+      engine.resetCache();
+      const sT1 = await engine.generate(ids, { maxTokens: R1 });
+      const sReuseT2 = await engine.generate(delta, { ...SS, maxTokens: R2, reuseCache: true });
+      engine.resetCache();
+      const sFullT2 = await engine.generate([...ids, ...sT1.tokens, ...delta], { ...SS, maxTokens: R2 });
+      const sReuseOk = sReuseT2.tokens.length === sFullT2.tokens.length && sReuseT2.tokens.every((t, i) => t === sFullT2.tokens[i]);
+      ok = ok && sReuseOk;
+      log(`  ${sReuseOk ? '[PASS]' : '[FAIL]'} sampled reuse turn-2 == full-prefill turn-2 (seed 7)`);
+
+      // 6c) prefill() primitive (system-prompt prewarming): prefill(prefix) + reuse(delta) must equal
+      // a COLD full prefill of [prefix, ...delta], token-for-token - the exact property the worker's
+      // load-time prewarm relies on (prefill the system block, then the first turn reuses it).
+      log('\nprefill() prewarm checks...');
+      const split = Math.max(1, ids.length - 3), PFX = ids.slice(0, split), APP = ids.slice(split);
+      engine.resetCache();
+      await engine.prefill(PFX);                                                   // warm the prefix, no decode
+      const pwReuse = await engine.generate(APP, { maxTokens: R2, reuseCache: true });
+      engine.resetCache();
+      const pwCold = await engine.generate([...PFX, ...APP], { maxTokens: R2 });    // cold full prefill of the same
+      const pwOk = pwReuse.tokens.length === pwCold.tokens.length && pwReuse.tokens.every((t, i) => t === pwCold.tokens[i]);
+      ok = ok && pwOk;
+      log(`  ${pwOk ? '[PASS]' : '[FAIL]'} prefill(prefix)+reuse == cold full-prefill (greedy, bit-exact)`);
+      engine.resetCache();
+      await engine.prefill(PFX);
+      const pwSReuse = await engine.generate(APP, { ...SS, maxTokens: R2, reuseCache: true });
+      engine.resetCache();
+      const pwSCold = await engine.generate([...PFX, ...APP], { ...SS, maxTokens: R2 });
+      const pwSOk = pwSReuse.tokens.length === pwSCold.tokens.length && pwSReuse.tokens.every((t, i) => t === pwSCold.tokens[i]);
+      ok = ok && pwSOk;
+      log(`  ${pwSOk ? '[PASS]' : '[FAIL]'} sampled prefill(prefix)+reuse == cold (seed 7)`);
+      engine.resetCache();
+
+      // 6d) growable KV cache: a reuse turn that crosses the initial capacity (512) must GROW the
+      // cache, preserve the prior K/V, and still equal a cold full prefill of the same total sequence.
+      log('\ngrowable KV cache check (reuse turn crosses 512)...');
+      const bigT1 = []; while (bigT1.length < 504) bigT1.push(...ids); // first turn just under the 512 floor
+      const bigDelta = ids.slice(0, 30);                               // appended turn pushes the cache past 512
+      engine.resetCache();
+      const gT1 = await engine.generate(bigT1, { maxTokens: 4 });      // fill the cache near 512 (no growth yet)
+      const gReuse = await engine.generate(bigDelta, { maxTokens: 8, reuseCache: true }); // crosses 512 -> grows
+      engine.resetCache();
+      const gCold = await engine.generate([...bigT1, ...gT1.tokens, ...bigDelta], { maxTokens: 8 });
+      const growOk = gReuse.tokens.length === gCold.tokens.length && gReuse.tokens.every((t, i) => t === gCold.tokens[i]);
+      ok = ok && growOk;
+      log(`  ${growOk ? '[PASS]' : '[FAIL]'} reuse-across-growth == cold full-prefill (bit-exact, ${bigT1.length}->${bigT1.length + gT1.tokens.length + bigDelta.length} tok)`);
+      engine.resetCache();
+
+      // 6e) prompt-lookup speculative decoding: output must be IDENTICAL to normal decoding
+      // (greedy AND sampled with the same seed); it may only be faster.
+      log('\nprompt-lookup speculative decoding checks...');
+      engine.resetCache();
+      const pg = await engine.generate(ids, { maxTokens: 32, promptLookup: true });
+      const pgOk = pg.tokens.length === g.tokens.length && pg.tokens.every((t, i) => t === g.tokens[i]);
+      ok = ok && pgOk;
+      const pgs = pg.speculation ?? { steps: 0, drafted: 0, accepted: 0 };
+      log(`  ${pgOk ? '[PASS]' : '[FAIL]'} pld greedy == greedy  (${pg.tokensPerSecond.toFixed(2)} vs ${g.tokensPerSecond.toFixed(2)} tok/s; ${pgs.steps} steps, ${pgs.accepted}/${pgs.drafted} drafts accepted)`);
+      engine.resetCache();
+      const ps = await engine.generate(ids, { ...SOPT, maxTokens: 24, seed: 42, promptLookup: true });
+      const psOk = ps.tokens.length === s1.tokens.length && ps.tokens.every((t, i) => t === s1.tokens[i]);
+      ok = ok && psOk;
+      const pss = ps.speculation ?? { steps: 0, drafted: 0, accepted: 0 };
+      log(`  ${psOk ? '[PASS]' : '[FAIL]'} pld sampled (seed 42) == sampled  (${ps.tokensPerSecond.toFixed(2)} vs ${s1.tokensPerSecond.toFixed(2)} tok/s; ${pss.steps} steps, ${pss.accepted}/${pss.drafted} accepted)`);
+      engine.resetCache();
+      const pldT1 = await engine.generate(ids, { maxTokens: 8, promptLookup: true });
+      const pldDelta = ids.slice(0, 5);
+      const pldT2 = await engine.generate(pldDelta, { maxTokens: 8, reuseCache: true, promptLookup: true });
+      engine.resetCache();
+      const pldCold = await engine.generate([...ids, ...pldT1.tokens, ...pldDelta], { maxTokens: 8 });
+      const prOk = pldT2.tokens.length === pldCold.tokens.length && pldT2.tokens.every((t, i) => t === pldCold.tokens[i]);
+      ok = ok && prOk;
+      log(`  ${prOk ? '[PASS]' : '[FAIL]'} pld reuse turn-2 == cold full-prefill turn-2 (greedy, bit-exact)`);
+      engine.resetCache();
+
+      // An oversized maxTokens CLAMPS to the window (no throw); only a prompt that itself
+      // exceeds maxSeqLen throws, and it must throw BEFORE touching the reuse state.
+      let guardOk = false;
+      const huge = []; while (huge.length <= 2048) huge.push(...ids);
+      try { await engine.generate(huge, { maxTokens: 4 }); } catch (e) { guardOk = /maxSeqLen/.test(e.message); }
+      ok = ok && guardOk;
+      log(`  ${guardOk ? '[PASS]' : '[FAIL]'} length guard throws when the prompt exceeds maxSeqLen (oversized maxTokens clamps)`);
+      engine.resetCache();
+
+      out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);
+    }
+
+    document.getElementById('run').onclick = () => run().catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
+  </script>
+</body>
+</html>

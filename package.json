@@ -1,0 +1,60 @@
+{
+  "name": "bitgpu",
+  "version": "0.1.0",
+  "description": "Fast WebGPU runtime for 1-bit (binary-weight) LLMs in the browser. Bit-exact, zero runtime dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sait Furkan Teke",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stfurkan/bitgpu.git"
+  },
+  "homepage": "https://github.com/stfurkan/bitgpu#readme",
+  "bugs": "https://github.com/stfurkan/bitgpu/issues",
+  "keywords": [
+    "webgpu",
+    "llm",
+    "low-bit",
+    "1-bit",
+    "quantization",
+    "binary",
+    "inference",
+    "browser",
+    "on-device",
+    "qwen3"
+  ],
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "gen:shaders": "tsx scripts/gen-shaders.ts",
+    "build": "npm run gen:shaders && tsdown",
+    "dev": "npm run gen:shaders && tsdown --watch",
+    "typecheck": "npm run gen:shaders && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "test:sampler": "tsx scripts/verify-sampler.ts",
+    "test:pld": "tsx scripts/verify-pld.ts",
+    "verify:headless": "node scripts/headless-verify.mjs",
+    "check:publish": "publint --strict && attw --pack . --profile esm-only",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm run check:publish"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "0.18.4",
+    "@huggingface/transformers": "4.2.0",
+    "@types/node": "26.0.0",
+    "@webgpu/types": "0.1.70",
+    "playwright-core": "1.61.1",
+    "publint": "0.3.21",
+    "tsdown": "0.22.3",
+    "tsx": "4.22.4",
+    "typescript": "6.0.3"
+  }
+}
