@@ -122,6 +122,18 @@ Or open `http://localhost:8000/examples/verify.html` in a WebGPU browser and cli
 gate on real hardware before every release; CI covers only the CPU-checkable parts (types, sampler
 math, drafter, packaging).
 
+### Releasing
+
+Publishing runs through GitHub Actions with npm trusted publishing (OIDC + provenance, no token).
+After the GPU gate passes locally: bump `version` in package.json, commit, then
+
+```sh
+git tag v0.1.1 && git push origin main v0.1.1
+```
+
+The release workflow re-runs the CPU checks, verifies the tag matches the package version, and
+publishes.
+
 The WGSL kernels live in `shaders/` and are inlined into the bundle at build time (no runtime
 `fetch`). `scripts/gen-shaders.ts` does the inlining.
 

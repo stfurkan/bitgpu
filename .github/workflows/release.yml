@@ -1,0 +1,35 @@
+name: Release
+
+# Publishes to npm via trusted publishing (OIDC): no token secret; npm mints a
+# short-lived credential from the workflow identity and attaches provenance
+# automatically. Requires the Trusted Publisher configured on npmjs.com to point
+# at this repo + this workflow file. Trigger: push a tag matching the package
+# version (git tag v0.1.1 && git push origin v0.1.1).
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:sampler
+      - run: npm run test:pld
+      - name: Tag must match package.json version
+        run: |
+          pkg="v$(npm pkg get version | tr -d '"')"
+          [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match package version $pkg"; exit 1; }
+      # prepublishOnly runs the build + publint/attw before the actual publish.
+      - run: npm publish
