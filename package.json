@@ -49,12 +49,12 @@
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.4",
     "@huggingface/transformers": "4.2.0",
-    "@types/node": "26.0.0",
-    "@webgpu/types": "0.1.70",
+    "@types/node": "26.1.0",
+    "@webgpu/types": "0.1.71",
     "playwright-core": "1.61.1",
     "publint": "0.3.21",
     "tsdown": "0.22.3",
-    "tsx": "4.22.4",
+    "tsx": "4.23.0",
     "typescript": "6.0.3"
   }
 }
