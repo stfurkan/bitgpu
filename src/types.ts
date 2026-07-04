@@ -37,8 +37,16 @@ export interface EngineOptions {
   syncSteps?: number
   /** Prefill GEMM tiling: `'auto'` tiles once a prompt fills the 64-row tiles, `'always'`/`'never'` force it. Default `'auto'`. */
   prefillTiling?: 'auto' | 'always' | 'never'
-  /** Max KV-cache length (prompt + generated positions). Caps VRAM (~`maxSeqLen` x 224 KB). Default `2048`. */
+  /** Max KV-cache length (prompt + generated positions). Caps VRAM (~`maxSeqLen` x 224 KB at f32,
+   *  half that with `kvCache: 'f16'`). Default `2048`. */
   maxSeqLen?: number
+  /** KV-cache STORAGE precision. `'f16'` halves KV memory (the industry-standard choice: all
+   *  arithmetic stays f32; each cached K/V value is rounded once at cache-write). Outputs are no
+   *  longer guaranteed bit-identical to f32 mode, though within f16 mode decoding stays exact and
+   *  deterministic (same seed -> same tokens; cache reuse == full prefill). Falls back to `'f32'`
+   *  silently when the adapter lacks `shader-f16` (see `capabilities.kvCache` for what's active).
+   *  Default `'f32'`. */
+  kvCache?: 'f32' | 'f16'
   /** Called as the model loads. */
   onProgress?: (progress: LoadProgress) => void
   /** Called if the GPU device is lost after creation (driver reset, OS reclaim, tab backgrounding
@@ -125,6 +133,8 @@ export interface EngineCapabilities {
   useSubgroups: boolean
   /** Subgroup width when the subgroup path is active. */
   subgroupSize: number
+  /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16). */
+  kvCache: 'f32' | 'f16'
   /** Adapter identification, when the browser exposes it. */
   adapter: { vendor?: string; architecture?: string; device?: string; description?: string }
   /** Relevant adapter limits the engine codes against. */

@@ -230,7 +230,14 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const SYNC_N = Math.max(1, opts.syncSteps ?? 4) // decode: chain N steps per CPU sync
   const maxSeqLen = Math.max(1, opts.maxSeqLen ?? DEFAULT_MAX_SEQ) // KV-cache length cap (VRAM ~ maxSeqLen x 224KB)
   const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && !forceNoSG // uniform 16/32/64 (16 = Arm Mali) -> head_dim/SG<=8
-  const device = await adapter.requestDevice({ requiredFeatures: useSG ? (['subgroups'] as GPUFeatureName[]) : [] }) // no requiredLimits -> code to the guaranteed minimums (runs on low-end/mobile)
+  // f16 KV STORAGE (math stays f32; one rounding at cache-write). 'f16' silently falls back to
+  // f32 where shader-f16 is missing, so callers can request it unconditionally.
+  const kv16 = opts.kvCache === 'f16' && adapter.features.has('shader-f16' as GPUFeatureName)
+  const KVB = kv16 ? 2 : 4 // bytes per cached K/V element
+  const features: GPUFeatureName[] = []
+  if (useSG) features.push('subgroups' as GPUFeatureName)
+  if (kv16) features.push('shader-f16' as GPUFeatureName)
+  const device = await adapter.requestDevice({ requiredFeatures: features }) // no requiredLimits -> code to the guaranteed minimums (runs on low-end/mobile)
   // awareness: largest binding (lm_head ~77MB) < 128MiB, shared mem <=8KB < 16KB min, WG <=256
 
   // Surface device loss (driver reset, OS reclaim) instead of hanging: consumers get a promise +
@@ -266,6 +273,16 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     for (const n of ['matmul_split_wg', 'matmul_resid_wg', 'matmul_q2_wg', 'rmsnorm_wg']) specs.push([n, { WG: WG_NS }])
     specs.push(['attention_wg']) // fixed 64-thread workgroup (per-thread acc covers head_dim <= 128)
   }
+  if (kv16) {
+    // f16-KV variants (compiled only when the device has shader-f16; `enable f16;` fails otherwise)
+    specs.push(['copy_kv16'])
+    if (useSG) for (const n of ['attention_sg_kv16', 'rmsnorm_rope_sg_kv16']) specs.push([n, { SG: sgMax }])
+    else specs.push(['attention_wg_kv16'])
+  }
+  // Cache-touching kernel names resolve once by KV storage mode.
+  const ATT = kv16 ? (useSG ? 'attention_sg_kv16' : 'attention_wg_kv16') : useSG ? 'attention_sg' : 'attention_wg'
+  const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache
+  const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
   const S_ = GPUBufferUsage.STORAGE,
@@ -494,8 +511,8 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const Kc: GPUBuffer[] = [],
     Vc: GPUBuffer[] = []
   for (let li = 0; li < A.layers; li++) {
-    Kc.push(actBuf(kvCapacity * KV * Dh))
-    Vc.push(actBuf(kvCapacity * KV * Dh))
+    Kc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
+    Vc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
   }
   const loadOom = await device.popErrorScope()
   if (loadOom) throw new GpuOutOfMemoryError(`GPU allocation failed while loading weights (~350 MB VRAM needed): ${loadOom.message}`)
@@ -506,13 +523,13 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   async function ensureKvCapacity(needed: number): Promise<void> {
     if (needed <= kvCapacity) return
     const newCap = Math.min(maxSeqLen, Math.max(needed, kvCapacity * 2))
-    const copyBytes = kvCapacity * KV * Dh * 4 // preserve all currently-allocated K/V
+    const copyBytes = kvCapacity * KV * Dh * KVB // preserve all currently-allocated K/V
     device.pushErrorScope('out-of-memory')
     const enc = device.createCommandEncoder()
     const olds: GPUBuffer[] = []
     for (let li = 0; li < A.layers; li++) {
-      const nk = device.createBuffer({ size: newCap * KV * Dh * 4, usage: S_ | CS | CD })
-      const nv = device.createBuffer({ size: newCap * KV * Dh * 4, usage: S_ | CS | CD })
+      const nk = device.createBuffer({ size: newCap * KV * Dh * KVB, usage: S_ | CS | CD })
+      const nv = device.createBuffer({ size: newCap * KV * Dh * KVB, usage: S_ | CS | CD })
       enc.copyBufferToBuffer(Kc[li], 0, nk, 0, copyBytes)
       enc.copyBufferToBuffer(Vc[li], 0, nv, 0, copyBytes)
       olds.push(Kc[li], Vc[li])
@@ -689,13 +706,13 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
       const Ntot = qkv.N0! + qkv.N1! + qkv.N2!,
         gx = Math.min(Ntot, 65535)
       runWG(pass, 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
-      run(pass, 'copy', [['u', KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], KV * Dh)
+      run(pass, COPY_KV, [['u', KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], KV * Dh)
       const qr = actBuf(H * Dh)
       runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
-      runN(pass, 'rmsnorm_rope_sg', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], Kc[li], KV)
+      runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], Kc[li], KV)
       cap(li, 'qr', qr)
       const att = actBuf(H * Dh)
-      runN(pass, 'attention_sg', [['u', 1], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]], [qr, Kc[li], Vc[li]], att, H)
+      runN(pass, ATT, [['u', 1], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]], [qr, Kc[li], Vc[li]], att, H)
       cap(li, 'att', att)
       const o = W[`layers.${li}.attn.o_proj`],
         h2 = actBuf(Hd)
@@ -727,13 +744,12 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
       kr = actBuf(S * KV * Dh)
     run(pass, 'rope', [['u', S], ['u', H], ['u', Dh], ['u', 0]], [qn, cos, sin], qr, S * H * Dh)
     run(pass, 'rope', [['u', S], ['u', KV], ['u', Dh], ['u', 0]], [kn, cos, sin], kr, S * KV * Dh)
-    run(pass, 'copy', [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [kr], Kc[li], S * KV * Dh)
-    run(pass, 'copy', [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], S * KV * Dh)
+    run(pass, COPY_KV, [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [kr], Kc[li], S * KV * Dh)
+    run(pass, COPY_KV, [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], S * KV * Dh)
     cap(li, 'qr', qr)
     const att = actBuf(S * H * Dh)
     const attF: Field[] = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]]
-    if (useSG) runN(pass, 'attention_sg', attF, [qr, Kc[li], Vc[li]], att, S * H)
-    else runN(pass, 'attention_wg', attF, [qr, Kc[li], Vc[li]], att, S * H)
+    runN(pass, ATT, attF, [qr, Kc[li], Vc[li]], att, S * H)
     cap(li, 'att', att)
     const o = W[`layers.${li}.attn.o_proj`],
       h2 = actBuf(S * Hd)
@@ -1324,8 +1340,11 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
       const ck: Record<string, Float32Array> = {}
       for (const [name, b] of Object.entries(DBG0)) ck[name] = await readback(b, b.size / 4)
       const off = pos * KV * Dh
-      ck.kc = (await readback(Kc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh) // kvCapacity, not maxSeqLen: the cache may not have grown yet
-      ck.vc = (await readback(Vc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh)
+      if (!kv16) {
+        // f32-mode only: readback() types the bytes as f32, which is wrong for an f16 cache
+        ck.kc = (await readback(Kc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh) // kvCapacity, not maxSeqLen: the cache may not have grown yet
+        ck.vc = (await readback(Vc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh)
+      }
       ck.fn = await readback(r.fn, Hd)
       ck.logits = await readback(lg, W.lm_head.N!)
       FORCE_SLOW = false
@@ -1382,6 +1401,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const capabilities: EngineCapabilities = {
     useSubgroups: useSG,
     subgroupSize: sgMax,
+    kvCache: kv16 ? 'f16' : 'f32',
     adapter: { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description },
     limits: {
       // the DEVICE limits (what dispatches are actually validated against), not the adapter's maximums
