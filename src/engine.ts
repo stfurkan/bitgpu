@@ -123,18 +123,6 @@ const eqBytes = (a: Uint8Array, b: Uint8Array): boolean => {
   for (let i = 0; i < b.length; i++) if (a[i] !== b[i]) return false
   return true
 }
-function concat<A extends Uint8Array | Float32Array>(Cls: { new (n: number): A }, arrs: A[]): A {
-  let n = 0
-  for (const a of arrs) n += a.length
-  const o = new Cls(n)
-  let p = 0
-  for (const a of arrs) {
-    o.set(a as unknown as ArrayLike<number>, p)
-    p += a.length
-  }
-  return o
-}
-
 /** Load a 1-bit model and return an {@link Engine}. Pass a model URL string for defaults. */
 export async function createEngine(options: EngineOptions | string): Promise<Engine> {
   const opts: EngineOptions = typeof options === 'string' ? { modelUrl: options } : options
@@ -186,7 +174,9 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   opts.onProgress?.({ phase: 'weights' })
   const dataUrl = opts.dataUrl ?? `${modelDir}/${manifest.data_file}`
   const auxUrl = opts.auxUrl ?? `${modelDir}/${manifest.aux_file}`
-  let [data, aux] = await Promise.all([fetchBytes(dataUrl), fetchBytes(auxUrl)])
+  // Only the SMALL aux file (LUTs, ~160KB) is buffered; the ~290MB data file STREAMS through
+  // per-tensor routes straight into GPU buffers further down (see the streaming weight loader).
+  let aux = await fetchBytes(auxUrl)
   const A = manifest.arch
   const T = manifest.tensors
   // Fail loud on manifests the kernels cannot run, instead of producing silent garbage: the WGSL
@@ -200,19 +190,16 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   }
 
   const readRef = (ref: Ref): Float32Array | Uint8Array | Uint16Array => {
-    const src = ref.src === 'aux' ? aux : data
-    if (ref.off + ref.len > src.byteLength)
-      throw new Error(
-        `bitgpu: tensor range ${ref.off}+${ref.len} exceeds the ${ref.src === 'aux' ? 'aux' : 'data'} file (${src.byteLength} bytes); the download is truncated or the manifest does not match it`,
-      )
+    if (ref.src !== 'aux') throw new Error('bitgpu: internal - readRef reads aux-file refs; data-file tensors stream through routes')
+    if (ref.off + ref.len > aux.byteLength)
+      throw new Error(`bitgpu: tensor range ${ref.off}+${ref.len} exceeds the aux file (${aux.byteLength} bytes); the download is truncated or the manifest does not match it`)
     const V = VIEW[ref.dtype]!
-    if (V === Uint8Array) return new Uint8Array(src, ref.off, ref.len)
+    if (V === Uint8Array) return new Uint8Array(aux, ref.off, ref.len)
     const bpe = V.BYTES_PER_ELEMENT
-    if (ref.off % bpe === 0) return new V(src, ref.off, ref.len / bpe)
-    return new V(src.slice(ref.off, ref.off + ref.len))
+    if (ref.off % bpe === 0) return new V(aux, ref.off, ref.len / bpe)
+    return new V(aux.slice(ref.off, ref.off + ref.len))
   }
   const readU8 = (ref: Ref): Uint8Array => readRef(ref) as Uint8Array
-  const readF32 = (ref: Ref): Float32Array => readRef(ref) as Float32Array
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference }) // pick the discrete GPU on multi-GPU machines, not the weak iGPU
   if (!adapter) throw new WebGPUUnavailableError('No suitable WebGPU adapter was found.')
@@ -373,91 +360,252 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     fullHistory = []
   }
 
+  if (manifest.luts.tgt2.src !== 'aux')
+    throw new Error('bitgpu: luts.tgt2 must live in the aux file (the streaming loader needs it before the weights arrive)')
   const tgt2 = readU8(manifest.luts.tgt2) // load-time only (sign table + q2 expansion); not captured by any closure
-  let tgt4 = readU8(manifest.luts.tgt4)
   const signTable = new Uint8Array(256)
   for (let b = 0; b < 256; b++) {
     let bits = 0
     for (let j = 0; j < 8; j++) bits |= ((((tgt2[2 * b + (j >> 2)] >> (2 * (j & 3))) & 3) >> 1) & 1) << j
     signTable[b] = bits
   }
-  const rawBin = (name: string): { sign: Uint8Array; scales: Float32Array; N: number; K: number; nb: number } => {
-    const t = T[name]
-    const wq = readU8(t.weight!)
-    const sign = new Uint8Array(wq.length)
-    for (let i = 0; i < wq.length; i++) sign[i] = signTable[wq[i]]
-    return { sign, scales: readF32(t.scales!), N: t.N!, K: t.K!, nb: t.K! / 128 }
+
+  // ---- streaming weight loader ----
+  // Every data-file tensor is wired as a ROUTE: a byte range of the file feeding a GPU buffer
+  // (optionally through a per-byte transform: the binary sign table, or the 1->2 q2 code
+  // expansion) and/or a CPU array. The file then streams through the routes in ONE sequential
+  // pass, so the ~290MB download never exists in memory at once. (The old path materialized the
+  // whole file plus an expanded lm_head transient: a CPU peak that read as "loads fine, then the
+  // OS kills the tab at the first keyboard" on phones.) aux-file refs are tiny and feed the same
+  // sinks synchronously from the aux buffer at wiring time.
+  interface Route { off: number; len: number; push: (b: Uint8Array) => void; finish: () => void }
+  const routes: Route[] = []
+  const gbuf = (len: number): GPUBuffer => device.createBuffer({ size: (len + 3) & ~3, usage: S_ | CD })
+  const gpuSink = (buf: GPUBuffer, base: number): { push: (b: Uint8Array) => void; finish: () => void } => {
+    let written = 0
+    let carry = new Uint8Array(0) // writeBuffer needs 4-byte-aligned offsets/sizes; chunks split anywhere
+    return {
+      push(bytes: Uint8Array): void {
+        let all = bytes
+        if (carry.length) {
+          all = new Uint8Array(carry.length + bytes.length)
+          all.set(carry)
+          all.set(bytes, carry.length)
+        }
+        const n = all.length & ~3
+        if (n) device.queue.writeBuffer(buf, base + written, all, 0, n) // writeBuffer copies synchronously
+        carry = all.subarray(n).slice()
+        written += n
+      },
+      finish(): void {
+        if (!carry.length) return
+        const pad = new Uint8Array(4)
+        pad.set(carry)
+        device.queue.writeBuffer(buf, base + written, pad) // gbuf pads buffers to 4 bytes
+        written += 4
+        carry = new Uint8Array(0)
+      },
+    }
+  }
+  // Wire a ref to a sink: data-file refs register a stream route; aux refs feed the sink NOW.
+  const wire = (ref: Ref, push: (b: Uint8Array) => void, finish: () => void): void => {
+    if (ref.src === 'aux') {
+      push(new Uint8Array(readRef(ref).buffer, ref.off, ref.len))
+      finish()
+    } else routes.push({ off: ref.off, len: ref.len, push, finish })
+  }
+  const wireRaw = (ref: Ref, buf: GPUBuffer, base = 0): void => {
+    const s = gpuSink(buf, base)
+    wire(ref, s.push, s.finish)
+  }
+  const wireSign = (ref: Ref, buf: GPUBuffer, base = 0): void => {
+    const s = gpuSink(buf, base)
+    wire(
+      ref,
+      (b) => {
+        const o = new Uint8Array(b.length)
+        for (let i = 0; i < b.length; i++) o[i] = signTable[b[i]]
+        s.push(o)
+      },
+      s.finish,
+    )
+  }
+  const wireQ2 = (ref: Ref, buf: GPUBuffer): void => {
+    const s = gpuSink(buf, 0)
+    wire(
+      ref,
+      (b) => {
+        const o = new Uint8Array(b.length * 2)
+        for (let i = 0; i < b.length; i++) {
+          o[2 * i] = tgt2[2 * b[i]]
+          o[2 * i + 1] = tgt2[2 * b[i] + 1]
+        }
+        s.push(o)
+      },
+      s.finish,
+    )
+  }
+  const wireCpu = (ref: Ref): Uint8Array => {
+    const dst = new Uint8Array(ref.len)
+    let w = 0
+    wire(
+      ref,
+      (b) => {
+        dst.set(b, w)
+        w += b.length
+      },
+      () => undefined,
+    )
+    return dst
+  }
+  const wireCpuGpu = (ref: Ref): { cpu: Uint8Array; buf: GPUBuffer } => {
+    const buf = gbuf(ref.len)
+    const s = gpuSink(buf, 0)
+    const dst = new Uint8Array(ref.len)
+    let w = 0
+    wire(
+      ref,
+      (b) => {
+        dst.set(b, w)
+        w += b.length
+        s.push(b)
+      },
+      s.finish,
+    )
+    return { cpu: dst, buf }
   }
 
-  // WebGPU allocation errors are DEFERRED: without an error scope the ~300 MB of weight uploads
-  // "succeed" with invalid buffers on VRAM-poor devices and every later generate returns garbage.
+  // WebGPU allocation errors are DEFERRED: without an error scope the ~300 MB of weight buffers
+  // "succeed" as invalid buffers on VRAM-poor devices and every later generate returns garbage.
   device.pushErrorScope('out-of-memory')
   const W: Record<string, GpuWeight> = {}
   for (const [name, t] of Object.entries(T)) {
     if (t.kind === 'q2') {
-      const wq = readU8(t.weight!),
-        codes = new Uint8Array(wq.length * 2)
-      for (let i = 0; i < wq.length; i++) {
-        codes[2 * i] = tgt2[2 * wq[i]]
-        codes[2 * i + 1] = tgt2[2 * wq[i] + 1]
-      }
-      W[name] = { N: t.N!, K: t.K!, nb: t.K! / 128, zp: 2, codes: upload(codes), scales: upload(readF32(t.scales!)) }
+      const codes = gbuf(t.weight!.len * 2) // 1 byte of q2 data expands to 2 code bytes
+      wireQ2(t.weight!, codes)
+      const scales = gbuf(t.scales!.len)
+      wireRaw(t.scales!, scales)
+      W[name] = { N: t.N!, K: t.K!, nb: t.K! / 128, zp: 2, codes, scales }
     } else if (t.kind === 'f32' && t.weight) {
-      W[name] = { buf: upload(readRef(t.weight)) }
+      const buf = gbuf(t.weight.len)
+      wireRaw(t.weight, buf)
+      W[name] = { buf }
     }
   }
-  // fuse per-layer matmul weights: qkv (3), gate/up (2); o_proj + down_proj stay individual (residual-folded)
+  // fuse per-layer matmul weights: qkv (3), gate/up (2); o_proj + down_proj stay individual
+  // (residual-folded). Fusion needs no CPU concat: each part streams into its fused-buffer slice.
+  const fuse = (parts: MTensor[]): { sign: GPUBuffer; scales: GPUBuffer } => {
+    const sign = gbuf(parts.reduce((n, p) => n + p.weight!.len, 0))
+    const scales = gbuf(parts.reduce((n, p) => n + p.scales!.len, 0))
+    let so = 0
+    let co = 0
+    for (const p of parts) {
+      wireSign(p.weight!, sign, so)
+      so += p.weight!.len
+      wireRaw(p.scales!, scales, co)
+      co += p.scales!.len
+    }
+    return { sign, scales }
+  }
   for (let li = 0; li < A.layers; li++) {
-    const q = rawBin(`layers.${li}.attn.q_proj`),
-      k = rawBin(`layers.${li}.attn.k_proj`),
-      v = rawBin(`layers.${li}.attn.v_proj`)
-    W[`layers.${li}.attn.qkv`] = {
-      K: q.K,
-      nb: q.nb,
-      N0: q.N,
-      N1: k.N,
-      N2: v.N,
-      sign: upload(concat(Uint8Array, [q.sign, k.sign, v.sign])),
-      scales: upload(concat(Float32Array, [q.scales, k.scales, v.scales])),
-    }
-    const g = rawBin(`layers.${li}.mlp.gate_proj`),
-      u = rawBin(`layers.${li}.mlp.up_proj`)
-    W[`layers.${li}.mlp.gateup`] = {
-      K: g.K,
-      nb: g.nb,
-      N0: g.N,
-      N1: u.N,
-      N2: 0,
-      sign: upload(concat(Uint8Array, [g.sign, u.sign])),
-      scales: upload(concat(Float32Array, [g.scales, u.scales])),
-    }
+    const q = T[`layers.${li}.attn.q_proj`],
+      k = T[`layers.${li}.attn.k_proj`],
+      v = T[`layers.${li}.attn.v_proj`]
+    W[`layers.${li}.attn.qkv`] = { K: q.K!, nb: q.K! / 128, N0: q.N!, N1: k.N!, N2: v.N!, ...fuse([q, k, v]) }
+    const g = T[`layers.${li}.mlp.gate_proj`],
+      u = T[`layers.${li}.mlp.up_proj`]
+    W[`layers.${li}.mlp.gateup`] = { K: g.K!, nb: g.K! / 128, N0: g.N!, N1: u.N!, N2: 0, ...fuse([g, u]) }
     for (const nm of [`layers.${li}.attn.o_proj`, `layers.${li}.mlp.down_proj`]) {
-      const r = rawBin(nm)
-      W[nm] = { N: r.N, K: r.K, nb: r.nb, sign: upload(r.sign), scales: upload(r.scales) }
+      const r = T[nm]
+      W[nm] = { N: r.N!, K: r.K!, nb: r.K! / 128, ...fuse([r]) }
     }
   }
 
-  let embWq = readU8(T.embed_tokens.weight!),
-    embScales = readF32(T.embed_tokens.scales!),
-    embZp = readU8(T.embed_tokens.zp!)
-  let cosCache = readF32(T.cos_cache as Ref),
-    sinCache = readF32(T.sin_cache as Ref)
-  // GPU-resident embedding table (for the on-GPU embed gather in the async decode loop). uint8 arrays
-  // are uploaded as bytes and read as u32 (byte-extracted) in embed_gather.wgsl. ~49MB VRAM.
-  const embWqG = upload(embWq),
-    tgt4G = upload(tgt4),
-    embScalesG = upload(embScales),
-    embZpG = upload(embZp)
-  // Detach from the fetched ArrayBuffers: the tables above are VIEWS into `data`/`aux`, and a live
-  // view pins its whole backing buffer, so keeping them would hold the ~290 MB download in CPU RAM
-  // for the engine's lifetime. Copy only what the CPU still needs (~50 MB) and drop the rest.
-  embWq = embWq.slice()
-  embScales = embScales.slice()
-  embZp = embZp.slice()
-  cosCache = cosCache.slice()
-  sinCache = sinCache.slice()
-  tgt4 = tgt4.slice()
-  data = null as unknown as ArrayBuffer
+  // Embedding tables live on BOTH sides: CPU (embedDequant of prompt rows) and GPU (the on-GPU
+  // embed gather in the async decode loop; uint8 arrays are uploaded as bytes and read as u32,
+  // byte-extracted, in embed_gather.wgsl - ~49MB VRAM). cos/sin caches are CPU-only.
+  const embW = wireCpuGpu(T.embed_tokens.weight!)
+  const embS = wireCpuGpu(T.embed_tokens.scales!)
+  const embZ = wireCpuGpu(T.embed_tokens.zp!)
+  const tgt4W = wireCpuGpu(manifest.luts.tgt4)
+  const cosBytes = wireCpu(T.cos_cache as Ref)
+  const sinBytes = wireCpu(T.sin_cache as Ref)
+  const embWq = embW.cpu
+  const embScales = new Float32Array(embS.cpu.buffer)
+  const embZp = embZ.cpu
+  const tgt4 = tgt4W.cpu
+  const cosCache = new Float32Array(cosBytes.buffer)
+  const sinCache = new Float32Array(sinBytes.buffer)
+  const embWqG = embW.buf,
+    tgt4G = tgt4W.buf,
+    embScalesG = embS.buf,
+    embZpG = embZ.buf
+
+  // ONE sequential pass of the data file through the routes. Tied tensors (e.g. lm_head sharing
+  // the embedding bytes) produce EXACT-duplicate ranges: those fan out to every consumer; partial
+  // overlaps have no defined streaming order and stay fatal.
+  routes.sort((a, b) => a.off - b.off || a.len - b.len)
+  const merged: Route[] = []
+  for (const r of routes) {
+    const last = merged[merged.length - 1]
+    if (last && last.off === r.off && last.len === r.len) {
+      const lp = last.push,
+        lf = last.finish
+      last.push = (b): void => {
+        lp(b)
+        r.push(b)
+      }
+      last.finish = (): void => {
+        lf()
+        r.finish()
+      }
+    } else if (last && r.off < last.off + last.len) {
+      throw new Error('bitgpu: partially overlapping data-file tensor ranges (unsupported by the streaming loader)')
+    } else merged.push(r)
+  }
+  const needed = merged.length ? merged[merged.length - 1].off + merged[merged.length - 1].len : 0
+  const dataStream = opts.fetchStream
+    ? await opts.fetchStream(dataUrl)
+    : opts.fetchArrayBuffer
+      ? (new Response(await opts.fetchArrayBuffer(dataUrl)).body as ReadableStream<Uint8Array>)
+      : await (async () => {
+          const res = await fetch(dataUrl)
+          if (!res.ok) throw new Error(`bitgpu: fetch ${dataUrl} failed: HTTP ${res.status}`)
+          return res.body ?? (new Response(await res.arrayBuffer()).body as ReadableStream<Uint8Array>)
+        })()
+  const reader = dataStream.getReader()
+  let cursor = 0
+  let ri = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    let bo = 0
+    while (bo < value.byteLength && ri < merged.length) {
+      const r = merged[ri]
+      if (cursor >= r.off + r.len) {
+        ri++
+        continue
+      }
+      if (cursor < r.off) {
+        const skip = Math.min(r.off - cursor, value.byteLength - bo)
+        cursor += skip
+        bo += skip
+        continue
+      }
+      const n = Math.min(r.off + r.len - cursor, value.byteLength - bo)
+      r.push(value.subarray(bo, bo + n))
+      cursor += n
+      bo += n
+      if (cursor === r.off + r.len) {
+        r.finish()
+        ri++
+      }
+    }
+    cursor += value.byteLength - bo
+    opts.onProgress?.({ phase: 'weights', loaded: Math.min(cursor, needed), total: needed })
+  }
+  if (cursor < needed)
+    throw new Error(`bitgpu: the data file ended at ${cursor} bytes but tensors extend to ${needed}; the download is truncated or the manifest does not match it`)
   aux = null as unknown as ArrayBuffer
 
   function embedDequant(ids: number[]): Float32Array {

@@ -26,6 +26,13 @@ export interface EngineOptions {
   fetchJson?: (url: string) => Promise<unknown>
   /** Fetch binary (data/aux). Override to add caching (e.g. OPFS) for the ~290MB data file. Default: `fetch(url).arrayBuffer()`. */
   fetchArrayBuffer?: (url: string) => Promise<ArrayBuffer>
+  /** Stream the big weights DATA file: chunks flow straight into GPU buffers, so the whole
+   *  ~290MB file never sits in memory at once (critical on phones, where the buffered peak gets
+   *  the tab killed). Used for the data file only (manifest/aux stay on fetchJson/fetchArrayBuffer);
+   *  when set it takes precedence over fetchArrayBuffer for that file. Point it at a cache stream,
+   *  e.g. an OPFS file's `stream()`. Default: the data file streams from `fetch(url).body`
+   *  (or through `fetchArrayBuffer` when that override is provided, for back compatibility). */
+  fetchStream?: (url: string) => Promise<ReadableStream<Uint8Array>>
   /** GPU power preference. Default `'high-performance'` (picks the discrete GPU on multi-GPU machines).
    *  (Spelled out rather than `GPUPowerPreference` so the published d.ts resolves without @webgpu/types.) */
   powerPreference?: 'low-power' | 'high-performance'
