@@ -50,6 +50,33 @@ engine.dispose()
 Tokenization is intentionally out of scope: the engine operates on token ids, so you can pair it
 with any tokenizer.
 
+## Bring your own model
+
+bitgpu loads its own small format instead of parsing ONNX at runtime: a `manifest.json` (the
+architecture contract + every tensor mapped to a byte range) and a ~30 KB aux file, both
+produced ONCE, offline, from a standard export - while the big weights file is used
+byte-for-byte unchanged, so it can keep streaming from wherever it already lives (e.g. the
+Hugging Face Hub). Same one-time-conversion model as GGUF/llama.cpp or MLX.
+
+```sh
+python tools/convert.py --model <dir with config.json + the q1 .onnx + its data file>
+```
+
+Host the two small files anywhere (they're static), point `createEngine` at them, done:
+
+```ts
+createEngine({
+  manifestUrl: 'https://your-site.example/model/manifest.json',
+  auxUrl: 'https://your-site.example/model/model_q1.aux.bin',
+  dataUrl: 'https://huggingface.co/<repo>/resolve/main/onnx/model_q1.onnx_data',
+})
+```
+
+Compatibility envelope: Qwen3-family models quantized with the onnx-community 1-bit ("q1")
+recipe (silu/SwiGLU, head_dim <= 128, 128-wide scale blocks) - the engine validates the
+manifest loudly at load. Format spec: [docs/FORMAT.md](docs/FORMAT.md); the full pipeline
+including regenerating the verification fixtures for a new model: [tools/README.md](tools/README.md).
+
 ## API
 
 - `createEngine(options: EngineOptions | string): Promise<Engine>` - load a model. A bare string is
