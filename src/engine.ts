@@ -106,6 +106,7 @@ type TypedArrayCtor = Float32ArrayConstructor | Uint8ArrayConstructor | Uint16Ar
 const VIEW: Record<string, TypedArrayCtor> = { FLOAT: Float32Array, UINT8: Uint8Array, FLOAT16: Uint16Array }
 const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rope', 'swiglu', 'copy']
 const DEFAULT_MAX_SEQ = 2048
+const PREFILL_SEG = 256 // prefill segment length; see runPrefill for why prefills are segmented
 
 const PARAM_AB = new ArrayBuffer(64)
 const PARAM_DV = new DataView(PARAM_AB)
@@ -224,8 +225,66 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
   if (kv16) features.push('shader-f16' as GPUFeatureName)
-  const device = await adapter.requestDevice({ requiredFeatures: features }) // no requiredLimits -> code to the guaranteed minimums (runs on low-end/mobile)
-  // awareness: largest binding (lm_head ~77MB) < 128MiB, shared mem <=8KB < 16KB min, WG <=256
+  // ---- device limits negotiation ----
+  // Run at WebGPU's guaranteed-minimum limits whenever the model fits them (low-end/mobile devices
+  // keep working exactly as before), and request precisely the raised limits a bigger model needs,
+  // gated on what the adapter can grant. Every buffer the loader will create is sized here FROM THE
+  // MANIFEST, before the device is requested: a model this adapter cannot hold fails loudly now,
+  // instead of "loading fine" with invalid buffers and generating garbage (binding-limit violations
+  // are deferred VALIDATION errors, which no out-of-memory scope ever catches).
+  const DEFAULT_BINDING = 134217728 // maxStorageBufferBindingSize guaranteed minimum (128 MiB)
+  const DEFAULT_BUFFER = 268435456 // maxBufferSize guaranteed minimum (256 MiB)
+  let needBind = 0 // largest single storage buffer/binding the loader will create
+  let weightBytes = 0 // total weight VRAM, for the OOM message
+  const track = (bytes: number): void => {
+    const b = (bytes + 3) & ~3 // gbuf pads to 4
+    needBind = Math.max(needBind, b)
+    weightBytes += b
+  }
+  for (const t of Object.values(T)) {
+    if (t.kind === 'q2') {
+      track(t.weight!.len * 2) // q2 codes expand 1 -> 2 bytes at load (wireQ2)
+      track(t.scales!.len)
+    } else if (t.kind === 'f32' && t.weight) track(t.weight.len)
+  }
+  const fusedLen = (names: string[], f: 'weight' | 'scales'): number => names.reduce((n, nm) => n + T[nm][f]!.len, 0)
+  for (let li = 0; li < A.layers; li++) {
+    const groups = [
+      [`layers.${li}.attn.q_proj`, `layers.${li}.attn.k_proj`, `layers.${li}.attn.v_proj`],
+      [`layers.${li}.mlp.gate_proj`, `layers.${li}.mlp.up_proj`],
+      [`layers.${li}.attn.o_proj`],
+      [`layers.${li}.mlp.down_proj`],
+    ]
+    for (const g of groups) {
+      track(fusedLen(g, 'weight'))
+      track(fusedLen(g, 'scales'))
+    }
+  }
+  for (const r of [T.embed_tokens.weight!, T.embed_tokens.scales!, T.embed_tokens.zp!, manifest.luts.tgt4]) track(r.len)
+  // Non-weight bindings that also count against the limit: a per-layer KV buffer at full
+  // maxSeqLen capacity, the largest prefill-segment activation, and the widest logits scratch.
+  const kvLayerBytes = maxSeqLen * A.kv_heads * A.head_dim * KVB
+  needBind = Math.max(needBind, kvLayerBytes, PREFILL_SEG * Math.max(A.heads * A.head_dim, A.intermediate) * 4, 32 * A.vocab * 4)
+  const requiredLimits: Record<string, number> = {}
+  if (needBind > DEFAULT_BINDING) {
+    if (needBind > adapter.limits.maxStorageBufferBindingSize)
+      throw new GpuOutOfMemoryError(
+        `this model needs a ${Math.ceil(needBind / 1048576)} MiB storage binding but the adapter's maxStorageBufferBindingSize is ${Math.floor(adapter.limits.maxStorageBufferBindingSize / 1048576)} MiB`,
+      )
+    requiredLimits.maxStorageBufferBindingSize = needBind
+  }
+  if (needBind > DEFAULT_BUFFER) {
+    if (needBind > adapter.limits.maxBufferSize)
+      throw new GpuOutOfMemoryError(
+        `this model needs a ${Math.ceil(needBind / 1048576)} MiB buffer but the adapter's maxBufferSize is ${Math.floor(adapter.limits.maxBufferSize / 1048576)} MiB`,
+      )
+    requiredLimits.maxBufferSize = needBind
+  }
+  const device = await adapter.requestDevice({
+    requiredFeatures: features,
+    requiredLimits: Object.keys(requiredLimits).length ? requiredLimits : undefined,
+  })
+  // awareness: shared mem <=8KB < 16KB min, WG <=256; binding sizes negotiated above
 
   // Surface device loss (driver reset, OS reclaim) instead of hanging: consumers get a promise +
   // an optional callback. dispose() also resolves it, with reason 'destroyed' (no callback then).
@@ -477,6 +536,9 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
 
   // WebGPU allocation errors are DEFERRED: without an error scope the ~300 MB of weight buffers
   // "succeed" as invalid buffers on VRAM-poor devices and every later generate returns garbage.
+  // The validation scope backstops the limits negotiation above: any load-time validation error
+  // (e.g. a buffer over a granted limit) fails createEngine loudly instead of console noise.
+  device.pushErrorScope('validation')
   device.pushErrorScope('out-of-memory')
   const W: Record<string, GpuWeight> = {}
   for (const [name, t] of Object.entries(T)) {
@@ -667,7 +729,9 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     Vc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
   }
   const loadOom = await device.popErrorScope()
-  if (loadOom) throw new GpuOutOfMemoryError(`GPU allocation failed while loading weights (~350 MB VRAM needed): ${loadOom.message}`)
+  const loadVal = await device.popErrorScope()
+  if (loadOom) throw new GpuOutOfMemoryError(`GPU allocation failed while loading weights (~${Math.round(weightBytes / 1048576)} MB VRAM needed): ${loadOom.message}`)
+  if (loadVal) throw new Error(`bitgpu: WebGPU validation error while loading weights: ${loadVal.message}`)
   // Grow every layer's K/V buffer to hold at least `needed` positions, preserving the cached content
   // (so a cross-turn reuse mid-conversation survives a growth). Rare (only when crossing a capacity
   // threshold); the copy is GPU-side and bounded geometrically. Invalidates cached decode bind groups
@@ -989,7 +1053,6 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   // blocks the GPU for whole seconds. Returns the LAST segment's final-norm buffer + the final
   // token's row within it, or null when aborted (fullHistory is cleared: K/V is only partially
   // written, so nothing may reuse the sequence).
-  const PREFILL_SEG = 256
   async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
