@@ -1228,12 +1228,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // no_repeat_ngram bans) and selects the top-K via K masked-argmax passes; only K (id, logit) pairs
   // are read back, and the CPU does temperature + softmax + MT19937 multinomial (exact transformers.js
   // semantics). Per-step (syncN=1) because the chosen token is picked on the CPU and feeds the next
-  // step's embed gather. Greedy decode (generateImpl) is the separate, untouched GPU-resident path.
+  // step's embed gather. A GREEDY turn with processors (repetition_penalty / no_repeat_ngram) also
+  // runs here - the chain filters, then pick() takes the penalized argmax without touching the RNG.
+  // Plain greedy decode (generateImpl) is the separate, untouched GPU-resident path.
   async function generateSampledImpl(ids: number[], posBase: number, nTokens: number, genOpts: GenerateOptions, history: number[]): Promise<RawGenResult> {
     await ensureKvCapacity(posBase + ids.length + nTokens)
     // `ids` = the tokens to prefill this turn (the whole prompt, or [lastToken, ...delta] on reuse).
     // `history` = the FULL conversation token sequence (shared, mutated): the sampler's penalty/ngram
     // see the entire sequence, like transformers.js; generated tokens are pushed onto it.
+    const sampled = genOpts.temperature != null && genOpts.temperature > 0 && genOpts.temperature !== 1
     const vocab = W.lm_head.N!
     const K = Math.max(1, Math.min(genOpts.topK ?? 20, vocab))
     const temperature = genOpts.temperature ?? 1
@@ -1279,6 +1282,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       rbBuf.unmap()
       return { ci, cv }
     }
+    // candidates are descending, so ci[0] is the argmax of the penalized logits (greedy+processors)
+    const pick = (ci: Uint32Array, cv: Float32Array): number => (sampled ? sampleFromCandidates(ci, cv, temperature, rng) : ci[0])
 
     transients = [] // track prefill scratch so it can be destroyed once the prefill completes
     try {
@@ -1299,7 +1304,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       device.queue.submit([encP.finish()])
       await device.queue.onSubmittedWorkDone()
       const first = await readCands()
-      const firstTok = sampleFromCandidates(first.ci, first.cv, temperature, rng)
+      const firstTok = pick(first.ci, first.cv)
       flushTransients() // the last segment's scratch is dead now
       const prefillMs = performance.now() - t0
 
@@ -1343,7 +1348,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         t = performance.now()
         const { ci, cv } = await readCands()
         rbMs += performance.now() - t
-        const tk = sampleFromCandidates(ci, cv, temperature, rng)
+        const tk = pick(ci, cv)
         total += 1
         if (stopSet?.has(tk)) { stopped = true; break } // EOS: stop without emitting the stop token
         gen.push(tk)
@@ -1389,6 +1394,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const onToken = genOpts.onToken
     const signal = genOpts.signal
     const rng = new MT19937(genOpts.seed)
+    // Greedy with processors (repetition_penalty / no_repeat_ngram) also needs the per-row sampler
+    // chain - the penalties see each row's history - but picks the penalized argmax, no RNG draw.
+    const useChain = sampled || penalty !== 1 || ngramN > 0
 
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS | CD }) // one row, target of the per-row copy
     const lgAll = device.createBuffer({ size: (maxDraft + 1) * vocab * 4, usage: S_ | CS }) // lm_head over all rows
@@ -1417,9 +1425,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         pass.dispatchWorkgroups(1)
       }
     }
-    // draw the row-j candidates from a mapped copy of rbAll
+    // draw the row-j candidates from a mapped copy of rbAll (candidates are descending, so
+    // index 0 is the penalized argmax for a greedy-with-processors turn - no RNG draw)
     const rowDraw = (m: ArrayBuffer, j: number): number =>
-      sampleFromCandidates(new Uint32Array(m, j * K * 8, K), new Float32Array(m, j * K * 8 + K * 4, K), temperature, rng)
+      sampled
+        ? sampleFromCandidates(new Uint32Array(m, j * K * 8, K), new Float32Array(m, j * K * 8 + K * 4, K), temperature, rng)
+        : new Uint32Array(m, j * K * 8, 1)[0]
 
     transients = []
     try {
@@ -1430,7 +1441,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const encP = device.createCommandEncoder()
       const lastP = actBuf(Hd)
       encP.copyBufferToBuffer(pfx.fn, pfx.lastRow * Hd * 4, lastP, 0, Hd * 4)
-      const pf = sampled ? writeAffBan(history) : null
+      const pf = useChain ? writeAffBan(history) : null
       let pass = encP.beginComputePass()
       lmHead(pass, lastP, 1, lg)
       if (pf) samplerChain(pass, pf.affLen, pf.banLen)
@@ -1496,7 +1507,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         lmHead(pass, r.fn, S, lgAll)
         pass.end()
         SMALLM = 0
-        if (!sampled) {
+        if (!useChain) {
           for (let j = 0; j < S; j++) {
             enc.copyBufferToBuffer(lgAll, j * vocab * 4, lg, 0, vocab * 4)
             const p = enc.beginComputePass()
@@ -1529,7 +1540,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         // acceptance: emit row draws in order while they agree with the drafts; the first
         // disagreement is itself a valid emission (it came from the true distribution)
         const emitted: number[] = []
-        if (!sampled) {
+        if (!useChain) {
           const outs = await readbackU32(idsOut, S)
           for (let j = 0; j < S; j++) {
             const tk = outs[j]
@@ -1686,6 +1697,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // cache resets and `promptTokenIds` is the full prompt. The KV cache lives across calls in Kc/Vc.
   async function generate(promptTokenIds: number[], genOpts: GenerateOptions = {}): Promise<GenerateResult> {
     const sampled = genOpts.temperature != null && genOpts.temperature > 0 && genOpts.temperature !== 1
+    // transformers.js applies repetition_penalty / no_repeat_ngram under greedy search too, so a
+    // greedy turn that requests them routes through the sampler-chain path (which picks the
+    // penalized argmax instead of drawing); the plain GPU-resident greedy loop can't see history.
+    const hasProcessors = (genOpts.repetitionPenalty ?? 1) !== 1 || (genOpts.noRepeatNgramSize ?? 0) > 0
     const reuse = (genOpts.reuseCache ?? false) && fullHistory.length > 0
     if (genOpts.signal?.aborted) {
       // aborted before any work: don't touch fullHistory (the cache still matches it)
@@ -1703,10 +1718,27 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (reuse) fullHistory.push(...promptTokenIds) // the delta is now part of the conversation (last token already present)
     else fullHistory = [...promptTokenIds]
 
+    if (maxTokens < 1) {
+      // maxTokens: 0 - behave like prefill(): write K/V for the prompt (so a later reuseCache
+      // turn continues correctly), record the history above, emit nothing. Previously this
+      // emitted one token anyway.
+      await ensureKvCapacity(posBase + prefillTokens.length)
+      transients = []
+      try {
+        const t0 = performance.now()
+        await runPrefill(prefillTokens, posBase, genOpts.signal)
+        await device.queue.onSubmittedWorkDone()
+        return { tokens: [], prefillMs: performance.now() - t0, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+      } finally {
+        flushTransients()
+        transients = null
+      }
+    }
+
     let r: RawGenResult
     if (genOpts.promptLookup) {
       r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
-    } else if (sampled) {
+    } else if (sampled || hasProcessors) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else {
       // Capture the history array like the sampled/PLD paths do: a resetCache() racing this turn

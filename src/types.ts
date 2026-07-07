@@ -73,7 +73,8 @@ export interface DeviceLostInfo {
  *  to sample; otherwise decoding is greedy (argmax). Sampling matches transformers.js v4.2.0 exactly
  *  (repetition_penalty, no_repeat_ngram, temperature, top_k, multinomial via a Mersenne-Twister RNG). */
 export interface GenerateOptions {
-  /** Maximum number of new tokens to generate. Default `256`. */
+  /** Maximum number of new tokens to generate. Default `256`. `0` prefills the prompt into the
+   *  KV cache and emits nothing (like {@link Engine.prefill}, but composable with `reuseCache`). */
   maxTokens?: number
   /** Reuse the KV cache from the previous turn: treat the passed token ids as the DELTA to append to
    *  the cached conversation (not a full prompt), prefilling only those tokens. Requires a prior
@@ -87,13 +88,16 @@ export interface GenerateOptions {
   signal?: AbortSignal
   /** Softmax temperature. A value other than 0 or 1 enables sampling; 0 or 1 (or unset) is greedy. */
   temperature?: number
-  /** Top-k sampling cutoff (candidate count). Default `20` when sampling. */
+  /** Top-k sampling cutoff (candidate count). Default `20` when sampling; clamped to `[1, vocab]`
+   *  (the GPU reduces the logits to this many candidates, so `0` cannot mean "disabled"). */
   topK?: number
   /** Top-p (nucleus) cutoff. Accepted for API compatibility but not applied (a no-op, matching transformers.js v4.2.0). */
   topP?: number
-  /** Repetition penalty over the deduped prompt+generated id set (`logit<0 ? *p : /p`). Default `1` (off). */
+  /** Repetition penalty over the deduped prompt+generated id set (`logit<0 ? *p : /p`). Default `1`
+   *  (off). Applied under greedy decoding too (the penalized argmax), matching transformers.js. */
   repetitionPenalty?: number
-  /** Block any n-gram of this size from repeating. Default `0` (off). */
+  /** Block any n-gram of this size from repeating. Default `0` (off). Applied under greedy decoding
+   *  too, matching transformers.js. */
   noRepeatNgramSize?: number
   /** Seed for the sampler RNG. Omit to seed from entropy (non-deterministic, like production). */
   seed?: number

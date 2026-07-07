@@ -239,6 +239,36 @@
       log(`  ${prOk ? '[PASS]' : '[FAIL]'} pld reuse turn-2 == cold full-prefill turn-2 (greedy, bit-exact)`);
       engine.resetCache();
 
+      // 6f) greedy with processors: repetition_penalty / no_repeat_ngram apply under greedy search
+      // too (like transformers.js), picking the penalized argmax with NO RNG involvement - so the
+      // output must be deterministic without a seed and identical across the plain and PLD paths.
+      log('\ngreedy-with-processors checks...');
+      const GP = { maxTokens: 24, repetitionPenalty: 1.15, noRepeatNgramSize: 3 };
+      engine.resetCache();
+      const gp1 = await engine.generate(ids, GP);
+      engine.resetCache();
+      const gp2 = await engine.generate(ids, GP);
+      const gpDet = gp1.tokens.length === gp2.tokens.length && gp1.tokens.every((t, i) => t === gp2.tokens[i]);
+      ok = ok && gpDet;
+      log(`  ${gpDet ? '[PASS]' : '[FAIL]'} greedy+penalties deterministic (no RNG, no seed)`);
+      engine.resetCache();
+      const gpPld = await engine.generate(ids, { ...GP, promptLookup: true });
+      const gpPldOk = gpPld.tokens.length === gp1.tokens.length && gpPld.tokens.every((t, i) => t === gp1.tokens[i]);
+      ok = ok && gpPldOk;
+      log(`  ${gpPldOk ? '[PASS]' : '[FAIL]'} pld greedy+penalties == greedy+penalties (bit-exact)`);
+      engine.resetCache();
+
+      // maxTokens: 0 = prefill-only turn: emits nothing, and a reuse turn continues from it
+      // exactly as if the whole sequence had been prefilled cold.
+      const z = await engine.generate(ids, { maxTokens: 0 });
+      const zT2 = await engine.generate(delta, { maxTokens: 8, reuseCache: true });
+      engine.resetCache();
+      const zCold = await engine.generate([...ids, ...delta], { maxTokens: 8 });
+      const zOk = z.tokens.length === 0 && zT2.tokens.length === zCold.tokens.length && zT2.tokens.every((t, i) => t === zCold.tokens[i]);
+      ok = ok && zOk;
+      log(`  ${zOk ? '[PASS]' : '[FAIL]'} maxTokens:0 prefills only (${z.tokens.length} tokens emitted) and reuse continues bit-exact`);
+      engine.resetCache();
+
       // An oversized maxTokens CLAMPS to the window (no throw); only a prompt that itself
       // exceeds maxSeqLen throws, and it must throw BEFORE touching the reuse state.
       let guardOk = false;
