@@ -27,6 +27,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run test:sampler
       - run: npm run test:pld
+      - run: npm run test:chat
       - name: Tag must match package.json version
         run: |
           pkg="v$(npm pkg get version | tr -d '"')"

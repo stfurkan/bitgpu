@@ -26,12 +26,17 @@
   "sideEffects": false,
   "files": [
     "dist",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.md"
   ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./chat": {
+      "types": "./dist/chat.d.ts",
+      "default": "./dist/chat.js"
     }
   },
   "scripts": {
@@ -41,6 +46,7 @@
     "typecheck": "npm run gen:shaders && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
     "test:sampler": "tsx scripts/verify-sampler.ts",
     "test:pld": "tsx scripts/verify-pld.ts",
+    "test:chat": "tsx scripts/verify-chat.ts",
     "verify:headless": "node scripts/headless-verify.mjs",
     "check:publish": "publint --strict && attw --pack . --profile esm-only",
     "prepare": "npm run build",
@@ -48,6 +54,8 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.4",
+    "@huggingface/jinja": "0.5.9",
+    "@huggingface/tokenizers": "0.1.3",
     "@huggingface/transformers": "4.2.0",
     "@types/node": "26.1.0",
     "@webgpu/types": "0.1.71",

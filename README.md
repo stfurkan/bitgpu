@@ -54,24 +54,42 @@ await engine.generate(promptTokenIds, { repetitionPenalty: 1.15, noRepeatNgramSi
 engine.dispose()
 ```
 
-### Tokenization & chat template
+## Chat (`bitgpu/chat`)
 
-Tokenization is intentionally out of scope: the engine operates on token ids, so you can pair it
-with any tokenizer and stay zero-dependency. The model repos ship `tokenizer.json` +
-`tokenizer_config.json`, which pair naturally with `@huggingface/tokenizers` (encode/decode) and
-`@huggingface/jinja` (the chat template):
+The engine is deliberately ids-in/ids-out; `bitgpu/chat` is the batteries-included text layer on
+top of it - messages in, streamed text out, still entirely on-device:
 
 ```ts
-import { Tokenizer } from '@huggingface/tokenizers'
-import { Template } from '@huggingface/jinja'
+import { createEngine } from 'bitgpu'
+import { createChat } from 'bitgpu/chat'
 
-const json = await (await fetch(`${modelUrl}/tokenizer.json`)).json()
-const cfg = await (await fetch(`${modelUrl}/tokenizer_config.json`)).json()
-const tok = new Tokenizer(json, cfg)
-const prompt = new Template(cfg.chat_template).render({ messages, add_generation_prompt: true, ...cfg })
-const result = await engine.generate(tok.encode(prompt).ids, { stopTokens: [cfg.eos_token_id] })
-console.log(tok.decode(result.tokens))
+const engine = await createEngine({ modelUrl })
+const chat = await createChat(engine, { modelUrl }) // tokenizer files live next to the manifest
+
+// Callback streaming:
+const r = await chat.send(
+  [{ role: 'user', content: 'Explain WebGPU in one sentence.' }],
+  { onText: (delta) => ui.append(delta) },
+)
+
+// ...or async-generator streaming (the final result is the generator's return value):
+const it = chat.stream(messages, { temperature: 0.5, topK: 20 })
+for (let n = await it.next(); !n.done; n = await it.next()) ui.append(n.value)
 ```
+
+It owns the whole pipeline the engine leaves to the caller: the model's own Jinja chat template,
+tokenization, UTF-8-safe incremental decode streaming, `<think>` block routing (`think: true`
+streams reasoning to `onThink`, never into the reply), EOS handling, and cross-turn KV-cache
+reuse with exact token bookkeeping (a clean follow-up turn prefills only the delta;
+`chat.prewarm(messages)` warms a static system prompt at load). `chat.reset()` forgets the
+conversation.
+
+The two text libraries (`@huggingface/tokenizers`, `@huggingface/jinja` - pure JS, Apache-2.0,
+see THIRD_PARTY_LICENSES.md) are inlined into `dist/chat.js` at build time, the same way the
+engine inlines its WGSL: the package keeps **zero runtime dependencies**, and importing plain
+`bitgpu` never loads any chat code. Rendering and encoding are verified byte-exact against
+transformers.js (`npm run test:chat`), and the GPU gate proves the reuse path bit-exact on real
+hardware. Prefer your own tokenizer? Skip `bitgpu/chat` entirely - the engine API is unchanged.
 
 ## Bring your own model
 
@@ -152,6 +170,7 @@ npm run build         # tsdown -> dist (ESM + .d.ts)
 npm run typecheck
 npm run test:sampler  # sampler parity vs transformers.js v4.2.0
 npm run test:pld      # prompt-lookup drafter unit checks
+npm run test:chat     # bitgpu/chat: stream logic, orchestration, template/encode parity vs transformers.js
 npm run check:publish # publint + are-the-types-wrong
 ```
 
@@ -181,10 +200,11 @@ The gate is model-parametric: `verify.html?model=<tag>` loads `examples/model-<t
 Fixture sets for all three Bonsai sizes are committed - `forward` (1.7B, hidden 2048),
 `forward-4b` (4B, hidden 2560) and `forward-8b` (8B, hidden 4096, untied lm_head, raised
 device limits) - so engine changes are checked against three geometries; stage the extra
-weights with `ln -s /path/to/bonsai-<size> examples/model-<size>`. To add fixtures for another
-model, run `tools/golden.py` then `tools/reference.py --dump test-fixtures/forward-<tag>` on the
-converted work dir and record the engine's greedy continuation as `known_good` in that set's
-`params.json`.
+weights with `ln -s /path/to/bonsai-<size> examples/model-<size>`. The chat-layer checks need
+`tokenizer.json` + `tokenizer_config.json` in the staged model dir and skip loudly when absent.
+To add fixtures for another model, run `tools/golden.py` then
+`tools/reference.py --dump test-fixtures/forward-<tag>` on the converted work dir and record the
+engine's greedy continuation as `known_good` in that set's `params.json`.
 
 ### Releasing
 

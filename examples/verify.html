@@ -278,7 +278,51 @@
       log(`  ${guardOk ? '[PASS]' : '[FAIL]'} length guard throws when the prompt exceeds maxSeqLen (oversized maxTokens clamps)`);
       engine.resetCache();
 
-      // 7) f16 KV cache mode (kvCache: 'f16'). Within-mode behavior must stay EXACT (determinism,
+      // 7) chat layer (bitgpu/chat): the tokenizer files live next to the manifest; model dirs
+      // without them (e.g. an app that loads its tokenizer from the Hub) skip loudly. Checks:
+      // seeded determinism, stream==send, reuse turn == cold prefill of the exact same token
+      // sequence (proves the delta construction + eos bookkeeping end-to-end on real hardware),
+      // and think-block stripping.
+      const tokHead = await fetch(`${MODEL_DIR}/tokenizer.json`, { method: 'HEAD' });
+      if (!tokHead.ok) {
+        log('\nchat layer checks SKIPPED (no tokenizer.json in the model dir)');
+      } else {
+        log('\nchat layer (bitgpu/chat) checks...');
+        const { createChat } = await import('../dist/chat.js');
+        const chat = await createChat(engine, { modelUrl: MODEL_DIR });
+        const CMSG = [{ role: 'user', content: 'The capital of France is Paris. The capital of Japan is' }];
+        const CSEED = { seed: 42, temperature: 0.5, topK: 20, maxTokens: 24 };
+        chat.reset();
+        const c1 = await chat.send(CMSG, CSEED);
+        chat.reset();
+        const c2 = await chat.send(CMSG, CSEED);
+        const cDet = c1.text.length > 0 && c1.text === c2.text;
+        ok = ok && cDet;
+        log(`  ${cDet ? '[PASS]' : '[FAIL]'} chat seeded determinism (${c1.tokens.length} tokens, ${c1.tokensPerSecond.toFixed(1)} tok/s)`);
+        chat.reset();
+        const cIt = chat.stream(CMSG, CSEED);
+        let cAcc = '', cFin;
+        for (;;) { const n = await cIt.next(); if (n.done) { cFin = n.value; break; } cAcc += n.value; }
+        const cStream = cAcc === cFin.text && cFin.text === c1.text;
+        ok = ok && cStream;
+        log(`  ${cStream ? '[PASS]' : '[FAIL]'} chat stream() deltas == send() text`);
+        chat.reset();
+        const t1 = await chat.send(CMSG, CSEED);
+        const t2 = await chat.send([...CMSG, { role: 'assistant', content: t1.text }, { role: 'user', content: 'And the capital of Germany?' }], CSEED);
+        engine.resetCache();
+        const cCold = await engine.generate([...t1.inputTokenIds, ...t1.tokens, ...t2.inputTokenIds], { ...CSEED, stopTokens: [chat.eosTokenId] });
+        const cReuse = t2.reusedCache && t2.tokens.length === cCold.tokens.length && t2.tokens.every((t, i) => t === cCold.tokens[i]);
+        ok = ok && cReuse;
+        log(`  ${cReuse ? '[PASS]' : '[FAIL]'} chat reuse turn-2 == cold prefill of the same token sequence (bit-exact, reused=${t2.reusedCache})`);
+        chat.reset();
+        const cTh = await chat.send(CMSG, { ...CSEED, maxTokens: 48, think: true });
+        const cThinkOk = !cTh.text.includes('<think>') && !cTh.text.includes('</think>');
+        ok = ok && cThinkOk;
+        log(`  ${cThinkOk ? '[PASS]' : '[FAIL]'} chat think turn keeps tags out of the reply (${cTh.thinkText.length} think chars)`);
+        chat.reset();
+      }
+
+      // 8) f16 KV cache mode (kvCache: 'f16'). Within-mode behavior must stay EXACT (determinism,
       // reuse == cold); vs f32 the outputs may legitimately differ after a divergence point, so
       // agreement with the f32 engine is gated loosely and reported as a measurement.
       const hasF16 = (await navigator.gpu.requestAdapter()).features.has('shader-f16');

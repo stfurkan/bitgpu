@@ -1,10 +1,13 @@
 import { defineConfig } from 'tsdown'
 
 // ESM-only library build (2026 default: Node 23+ can require() ESM, so no CJS).
-// Zero runtime deps -> nothing to externalize; the WGSL is inlined via the
-// generated shaders module (scripts/gen-shaders.ts runs before this).
+// Two entries: the zero-dependency engine (`bitgpu`) and the chat layer (`bitgpu/chat`).
+// The chat entry INLINES @huggingface/tokenizers + @huggingface/jinja (pure JS, Apache-2.0)
+// the same way the engine inlines its WGSL (scripts/gen-shaders.ts runs before this): the
+// published package stays zero-runtime-dependency, and importing plain `bitgpu` never loads
+// or bundles any of the chat code.
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: { index: 'src/index.ts', chat: 'src/chat/index.ts' },
   format: ['esm'],
   target: 'es2023',
   platform: 'browser',
@@ -12,4 +15,5 @@ export default defineConfig({
   clean: true,
   treeshake: true,
   sourcemap: true,
+  noExternal: ['@huggingface/tokenizers', '@huggingface/jinja'],
 })
