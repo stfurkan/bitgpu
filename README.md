@@ -149,6 +149,14 @@ Or open `http://localhost:8000/examples/verify.html` in a WebGPU browser and cli
 gate on real hardware before every release; CI covers only the CPU-checkable parts (types, sampler
 math, drafter, packaging).
 
+The gate is model-parametric: `verify.html?model=<tag>` loads `examples/model-<tag>` against
+`test-fixtures/forward-<tag>`, and the headless driver automatically runs every staged variant.
+A second fixture set (`forward-4b`, Bonsai-4B, hidden 2560) is committed so engine changes are
+checked against two different geometries; stage its weights with
+`ln -s /path/to/bonsai-4b examples/model-4b`. To add fixtures for another model, run
+`tools/golden.py` then `tools/reference.py --dump test-fixtures/forward-<tag>` on the converted
+work dir and record the engine's greedy continuation as `known_good` in that set's `params.json`.
+
 ### Releasing
 
 Publishing runs through GitHub Actions with npm trusted publishing (OIDC + provenance, no token).
