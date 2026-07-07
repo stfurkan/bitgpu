@@ -541,13 +541,32 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   device.pushErrorScope('validation')
   device.pushErrorScope('out-of-memory')
   const W: Record<string, GpuWeight> = {}
+  // Deferred zero-point checks: q2 zp tensors stream with the weights, so their bytes are only
+  // complete after the streaming pass; each closure then validates and installs the real value.
+  const zpChecks: Array<() => void> = []
   for (const [name, t] of Object.entries(T)) {
     if (t.kind === 'q2') {
       const codes = gbuf(t.weight!.len * 2) // 1 byte of q2 data expands to 2 code bytes
       wireQ2(t.weight!, codes)
       const scales = gbuf(t.scales!.len)
       wireRaw(t.scales!, scales)
-      W[name] = { N: t.N!, K: t.K!, nb: t.K! / 128, zp: 2, codes, scales }
+      const w: GpuWeight = { N: t.N!, K: t.K!, nb: t.K! / 128, zp: 2, codes, scales }
+      // The q2 kernels take ONE zero-point for the whole tensor (a uniform, not a per-block
+      // buffer read in the hottest GEMV): the q1 recipe always emits the 2-bit midpoint. Read
+      // the manifest's zp tensor and derive the scalar from it, failing loudly on a non-uniform
+      // export instead of silently dequantizing with the wrong zero-points.
+      if (t.zp) {
+        const zpBytes = wireCpu(t.zp)
+        zpChecks.push(() => {
+          const b0 = zpBytes[0]
+          for (let i = 1; i < zpBytes.length; i++)
+            if (zpBytes[i] !== b0) throw new Error(`bitgpu: tensor ${name} has non-uniform 2-bit zero-points (the q2 kernels assume one zp for the whole tensor)`)
+          const zp = b0 & 3
+          if (b0 !== zp * 0b01010101) throw new Error(`bitgpu: tensor ${name} has non-uniform 2-bit zero-points within a byte (the q2 kernels assume one zp for the whole tensor)`)
+          w.zp = zp
+        })
+      }
+      W[name] = w
     } else if (t.kind === 'f32' && t.weight) {
       const buf = gbuf(t.weight.len)
       wireRaw(t.weight, buf)
@@ -668,6 +687,8 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   }
   if (cursor < needed)
     throw new Error(`bitgpu: the data file ended at ${cursor} bytes but tensors extend to ${needed}; the download is truncated or the manifest does not match it`)
+  for (const check of zpChecks) check()
+  zpChecks.length = 0
   aux = null as unknown as ArrayBuffer
 
   function embedDequant(ids: number[]): Float32Array {

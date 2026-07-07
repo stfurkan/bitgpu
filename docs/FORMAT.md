@@ -69,7 +69,10 @@ its slice), so the manifest keeps them separate.
 `arch` carries `layers, hidden, intermediate, heads, kv_heads, head_dim, rms_eps, vocab, eos,
 act, rope, tie_word_embeddings`. The engine validates what its kernels assume and fails loudly
 otherwise: `act` must be `silu` (SwiGLU), `head_dim` <= 128, every quantized tensor's `block`
-must be 128. In practice that means **Qwen3-family models quantized with the onnx-community
+must be 128, and a `q2` tensor's zero-points must be uniform (one value for the whole tensor;
+the q1 recipe always emits the 2-bit midpoint, 2; the engine reads the zp tensor and derives
+the value from it, so a non-uniform export fails at load instead of dequantizing wrong).
+In practice that means **Qwen3-family models quantized with the onnx-community
 1-bit ("q1") recipe**. A different attention/MLP topology needs kernel work, not just a
 manifest.
 
