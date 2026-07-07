@@ -126,6 +126,19 @@ const eqBytes = (a: Uint8Array, b: Uint8Array): boolean => {
 }
 /** Load a 1-bit model and return an {@link Engine}. Pass a model URL string for defaults. */
 export async function createEngine(options: EngineOptions | string): Promise<Engine> {
+  // Any load failure after the device exists (WGSL compile error, manifest validation, truncated
+  // download, allocation OOM) must destroy the device, or the partially-loaded weights stay
+  // resident until GC collects the GPUDevice - undermining the catch-OOM-and-retry-smaller advice
+  // in errors.ts, since the retry contends with the dead engine's VRAM.
+  const holder: { device?: GPUDevice } = {}
+  try {
+    return await createEngineInner(options, holder)
+  } catch (e) {
+    holder.device?.destroy()
+    throw e
+  }
+}
+async function createEngineInner(options: EngineOptions | string, holder: { device?: GPUDevice }): Promise<Engine> {
   const opts: EngineOptions = typeof options === 'string' ? { modelUrl: options } : options
   const modelDir = opts.modelUrl ? opts.modelUrl.replace(/\/$/, '') : null
   if (!modelDir && !opts.manifestUrl) throw new Error('createEngine: provide modelUrl or manifestUrl')
@@ -186,6 +199,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   if (A.act !== 'silu') throw new Error(`bitgpu: unsupported activation '${A.act}' (kernels implement silu/SwiGLU)`)
   if (A.head_dim > 128) throw new Error(`bitgpu: unsupported head_dim ${A.head_dim} (kernels assume <= 128)`)
   if (!T[FINAL_NORM]) throw new Error(`bitgpu: manifest is missing the final norm tensor '${FINAL_NORM}'`)
+  if (!T.cos_cache || !T.sin_cache) throw new Error('bitgpu: manifest is missing the baked cos_cache/sin_cache RoPE tensors')
   for (const [name, t] of Object.entries(T)) {
     if (t.block !== undefined && t.block !== 128) throw new Error(`bitgpu: tensor ${name} has block ${t.block} (kernels assume 128)`)
   }
@@ -284,6 +298,7 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     requiredFeatures: features,
     requiredLimits: Object.keys(requiredLimits).length ? requiredLimits : undefined,
   })
+  holder.device = device // createEngine destroys it if anything below throws
   // awareness: shared mem <=8KB < 16KB min, WG <=256; binding sizes negotiated above
 
   // Surface device loss (driver reset, OS reclaim) instead of hanging: consumers get a promise +
@@ -617,6 +632,11 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   const tgt4 = tgt4W.cpu
   const cosCache = new Float32Array(cosBytes.buffer)
   const sinCache = new Float32Array(sinBytes.buffer)
+  // The caches are baked per export ([positions, head_dim/2]); positions beyond them would read
+  // undefined -> NaN into every rope buffer, silent garbage. Cap maxSeqLen at load, loudly.
+  const ropePositions = cosCache.length / (A.head_dim / 2)
+  if (maxSeqLen > ropePositions)
+    throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's baked RoPE cache (${ropePositions} positions); lower maxSeqLen or re-export with a longer cache`)
   const embWqG = embW.buf,
     tgt4G = tgt4W.buf,
     embScalesG = embS.buf,
@@ -1038,27 +1058,41 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
 
   async function forward(ids: number[]): Promise<ForwardResult> {
     const S = ids.length
+    if (S === 0) throw new Error('forward: no tokens to process')
+    if (S > maxSeqLen) throw new Error(`forward: sequence length ${S} exceeds maxSeqLen ${maxSeqLen}`)
+    // forward() overwrites K/V at positions 0..S-1 of every layer: whatever conversation the cache
+    // held is gone, so nothing may reuse it. Same rule as an aborted prefill.
+    fullHistory = []
     await ensureKvCapacity(S)
+    const vocab = W.lm_head.N!
+    // Segmented like runPrefill (bit-exact by the same composition the reuse gates prove), so a
+    // long forward() neither dispatches >65535 workgroups in one dimension (S*heads at full
+    // maxSeqLen) nor binds an S x vocab logits buffer beyond the negotiated binding limit.
+    const embed = new Float32Array(S * Hd),
+      layer0 = new Float32Array(S * Hd),
+      finalnorm = new Float32Array(S * Hd),
+      logits = new Float32Array(S * vocab)
     transients = []
     try {
-      const embedOut = upload(embedDequant(ids), S_ | CD | CS)
-      const enc = device.createCommandEncoder()
-      const { fn, layer0 } = stack(enc, embedOut, S, 0)
-      const logits = device.createBuffer({ size: S * W.lm_head.N! * 4, usage: S_ | CS })
-      transients.push(logits)
-      const pass = enc.beginComputePass()
-      lmHead(pass, fn, S, logits)
-      pass.end()
-      device.queue.submit([enc.finish()])
-      await device.queue.onSubmittedWorkDone()
-      return {
-        embed: await readback(embedOut, S * Hd),
-        layer0: await readback(layer0!, S * Hd),
-        finalnorm: await readback(fn, S * Hd),
-        logits: await readback(logits, S * W.lm_head.N!),
-        vocab: W.lm_head.N!,
-        sequenceLength: S,
+      for (let off = 0; off < S; off += PREFILL_SEG) {
+        const seg = ids.slice(off, off + PREFILL_SEG)
+        const embedOut = upload(embedDequant(seg), S_ | CD | CS)
+        const enc = device.createCommandEncoder()
+        const { fn, layer0: l0 } = stack(enc, embedOut, seg.length, off)
+        const lg = device.createBuffer({ size: seg.length * vocab * 4, usage: S_ | CS })
+        transients.push(lg)
+        const pass = enc.beginComputePass()
+        lmHead(pass, fn, seg.length, lg)
+        pass.end()
+        device.queue.submit([enc.finish()])
+        await device.queue.onSubmittedWorkDone()
+        embed.set(await readback(embedOut, seg.length * Hd), off * Hd)
+        layer0.set(await readback(l0!, seg.length * Hd), off * Hd)
+        finalnorm.set(await readback(fn, seg.length * Hd), off * Hd)
+        logits.set(await readback(lg, seg.length * vocab), off * vocab)
+        flushTransients() // this segment's scratch is dead; the peak stays at one segment
       }
+      return { embed, layer0, finalnorm, logits, vocab, sequenceLength: S }
     } finally {
       flushTransients()
       transients = null
@@ -1675,8 +1709,12 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
     } else if (sampled) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else {
+      // Capture the history array like the sampled/PLD paths do: a resetCache() racing this turn
+      // installs a fresh array, and these tokens must land on the OLD one (then next turn falls
+      // back to a clean full prefill) instead of populating the reset history against stale K/V.
+      const hist = fullHistory
       r = await generateImpl(prefillTokens, posBase, maxTokens, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
-      fullHistory.push(...r.tokens) // greedy doesn't touch history; record the generated tokens for the next turn
+      hist.push(...r.tokens) // greedy doesn't touch history; record the generated tokens for the next turn
     }
     return {
       tokens: r.tokens,
