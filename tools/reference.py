@@ -131,7 +131,7 @@ def main() -> None:
         if li == 0:
             ckpt["layer0"] = h.copy()
 
-    h = rmsnorm(h, norm_w("layers.28.final_norm_layernorm"))
+    h = rmsnorm(h, norm_w(f"layers.{L}.final_norm_layernorm"))
     ckpt["finalnorm"] = h.copy()
     logits = h @ dequant("lm_head").T                                   # [S, vocab]
     ckpt["logits"] = logits

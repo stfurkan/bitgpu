@@ -611,18 +611,22 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
   function embedDequant(ids: number[]): Float32Array {
     const Hh = A.hidden,
       out = new Float32Array(ids.length * Hh)
+    // Per-row strides derived from hidden (2048 -> 256/16/8, 2560 -> 320/20/10).
+    const rowBytes = Hh >> 3,
+      scaleRow = Hh >> 7,
+      zpRow = (scaleRow + 1) >> 1
     for (let r = 0; r < ids.length; r++) {
       const id = ids[r]
-      for (let i = 0; i < 256; i++)
+      for (let i = 0; i < rowBytes; i++)
         for (let qd = 0; qd < 4; qd++) {
-          const byte = tgt4[4 * embWq[id * 256 + i] + qd],
+          const byte = tgt4[4 * embWq[id * rowBytes + i] + qd],
             baseK = (i * 4 + qd) * 2
           for (let c = 0; c < 2; c++) {
             const k = baseK + c,
               code = (byte >> (4 * c)) & 15,
               blk = (k / 128) | 0
-            const zp = (embZp[id * 8 + ((blk / 2) | 0)] >> (4 * (blk & 1))) & 15
-            out[r * Hh + k] = (code - zp) * embScales[id * 16 + blk]
+            const zp = (embZp[id * zpRow + ((blk / 2) | 0)] >> (4 * (blk & 1))) & 15
+            out[r * Hh + k] = (code - zp) * embScales[id * scaleRow + blk]
           }
         }
     }

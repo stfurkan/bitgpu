@@ -16,19 +16,24 @@ struct Params { H: u32, srcIdx: u32, _0: u32, _1: u32 };
 @compute @workgroup_size(WG)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let id = tokenId[p.srcIdx];
+  // Per-row strides derived from H: rowBytes source bytes, scaleRow f32 scales,
+  // zpRow packed zero-point bytes (H=2048 -> 256/16/8, H=2560 -> 320/20/10).
+  let rowBytes = p.H >> 3u;
+  let scaleRow = p.H >> 7u;
+  let zpRow = (scaleRow + 1u) >> 1u;
   for (var k = lid.x; k < p.H; k = k + WG) {
     let i = k >> 3u;
     let qd = (k >> 1u) & 3u;
     let c = k & 1u;
-    let wqIdx = id * 256u + i;
+    let wqIdx = id * rowBytes + i;
     let e = (embWq[wqIdx >> 2u] >> (8u * (wqIdx & 3u))) & 0xffu;   // source byte 0..255
     let tIdx = 4u * e + qd;
     let t = (tgt4[tIdx >> 2u] >> (8u * (tIdx & 3u))) & 0xffu;       // expanded byte (2 codes)
     let code = (t >> (4u * c)) & 0xfu;
     let blk = k >> 7u;
-    let zpIdx = id * 8u + (blk >> 1u);
+    let zpIdx = id * zpRow + (blk >> 1u);
     let zpByte = (embZp[zpIdx >> 2u] >> (8u * (zpIdx & 3u))) & 0xffu;
     let zp = (zpByte >> (4u * (blk & 1u))) & 0xfu;
-    out[k] = (f32(code) - f32(zp)) * embScales[id * 16u + blk];
+    out[k] = (f32(code) - f32(zp)) * embScales[id * scaleRow + blk];
   }
 }
