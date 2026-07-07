@@ -96,10 +96,19 @@ def main() -> None:
         scales, zp = n.input[2], n.input[3]
         K = next(a.i for a in n.attribute if a.name == "K")
         N = next(a.i for a in n.attribute if a.name == "N")
+        # The packed-weight initializer is always the scales name with _weight_scales ->
+        # _weight_quant, for the lm_head too: tied exports feed it the embedding stream
+        # (model_embed_tokens_weight_scales -> model_embed_tokens_weight_quant) while untied
+        # ones (e.g. Bonsai-8B) carry their own lm_head_MatMul_weight_quant.
+        wq = scales.replace("_weight_scales", "_weight_quant")
+        if wq not in inits:
+            raise ValueError(f"packed weight initializer {wq} (derived from {scales}) not found in the graph")
         if n.name == "/lm_head/MatMul_Quant":
-            name, kind, wq, lut = "lm_head", "q2", "model_embed_tokens_weight_quant", "tgt2"
+            name, kind, lut = "lm_head", "q2", "tgt2"
+            tied = wq == "model_embed_tokens_weight_quant"
+            if bool(cfg["tie_word_embeddings"]) != tied:
+                raise ValueError(f"lm_head weight {wq} contradicts config tie_word_embeddings={cfg['tie_word_embeddings']}")
         else:
-            wq = scales.replace("_weight_scales", "_weight_quant")
             name, kind, lut = logical_linear(wq), "binary", "tgt2"
         tensors[name] = {"kind": kind, "N": N, "K": K, "block": 128, "bits": 2, "lut": lut,
                          "weight": place(wq), "scales": place(scales), "zp": place(zp)}
