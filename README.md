@@ -47,11 +47,31 @@ console.log(result.tokens, result.tokensPerSecond)
 // Sampling (matches transformers.js v4.2.0 exactly): set a temperature other than 0/1.
 await engine.generate(promptTokenIds, { temperature: 0.5, topK: 20, repetitionPenalty: 1.15 })
 
+// Penalties apply under greedy decoding too (penalized argmax, deterministic, no RNG),
+// exactly like transformers.js greedy search:
+await engine.generate(promptTokenIds, { repetitionPenalty: 1.15, noRepeatNgramSize: 3 })
+
 engine.dispose()
 ```
 
+### Tokenization & chat template
+
 Tokenization is intentionally out of scope: the engine operates on token ids, so you can pair it
-with any tokenizer.
+with any tokenizer and stay zero-dependency. The model repos ship `tokenizer.json` +
+`tokenizer_config.json`, which pair naturally with `@huggingface/tokenizers` (encode/decode) and
+`@huggingface/jinja` (the chat template):
+
+```ts
+import { Tokenizer } from '@huggingface/tokenizers'
+import { Template } from '@huggingface/jinja'
+
+const json = await (await fetch(`${modelUrl}/tokenizer.json`)).json()
+const cfg = await (await fetch(`${modelUrl}/tokenizer_config.json`)).json()
+const tok = new Tokenizer(json, cfg)
+const prompt = new Template(cfg.chat_template).render({ messages, add_generation_prompt: true, ...cfg })
+const result = await engine.generate(tok.encode(prompt).ids, { stopTokens: [cfg.eos_token_id] })
+console.log(tok.decode(result.tokens))
+```
 
 ## Bring your own model
 
@@ -76,9 +96,13 @@ createEngine({
 ```
 
 Compatibility envelope: Qwen3-family models quantized with the onnx-community 1-bit ("q1")
-recipe (silu/SwiGLU, head_dim <= 128, 128-wide scale blocks) - the engine validates the
-manifest loudly at load. Format spec: [docs/FORMAT.md](docs/FORMAT.md); the full pipeline
-including regenerating the verification fixtures for a new model: [tools/README.md](tools/README.md).
+recipe (silu/SwiGLU, head_dim <= 128, 128-wide scale blocks, tied or untied lm_head) - the
+engine validates the manifest loudly at load. The reference exports are
+[onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX),
+[Bonsai-4B-ONNX](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) and
+[Bonsai-8B-ONNX](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` +
+its data file). Format spec: [docs/FORMAT.md](docs/FORMAT.md); the full pipeline including
+regenerating the verification fixtures for a new model: [tools/README.md](tools/README.md).
 
 ## API
 
