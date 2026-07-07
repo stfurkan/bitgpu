@@ -7,10 +7,10 @@ struct Params { H: u32, srcIdx: u32, _0: u32, _1: u32 };
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> tokenId: array<u32>;   // tokenId[p.srcIdx] = the token to embed
-@group(0) @binding(2) var<storage, read> embWq: array<u32>;     // uint8 [vocab*256] packed
+@group(0) @binding(2) var<storage, read> embWq: array<u32>;     // uint8 [vocab * H/8] packed
 @group(0) @binding(3) var<storage, read> tgt4: array<u32>;      // uint8 [256*4] packed (1 src byte -> 4)
-@group(0) @binding(4) var<storage, read> embScales: array<f32>;// [vocab*16]
-@group(0) @binding(5) var<storage, read> embZp: array<u32>;    // uint8 [vocab*8] packed
+@group(0) @binding(4) var<storage, read> embScales: array<f32>;// [vocab * H/128]
+@group(0) @binding(5) var<storage, read> embZp: array<u32>;    // uint8 [vocab * ceil(H/256)] packed
 @group(0) @binding(6) var<storage, read_write> out: array<f32>;// [H]
 
 @compute @workgroup_size(WG)

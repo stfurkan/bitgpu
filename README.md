@@ -3,10 +3,13 @@
 A fast, dependency-free WebGPU runtime for **low-bit LLMs** in the browser.
 
 Today it runs **1-bit (binary-weight)** models.
-Reference target is Bonsai-1.7B (Qwen3 architecture, sign-packed binary linear weights + 2/4-bit tied
-embeddings). Bit-exact with the reference forward, GPU-resident decode (greedy or sampled), streaming,
-EOS stop, `AbortSignal`, and cross-turn KV-cache reuse. Runs the fast subgroup path on Apple / NVIDIA /
+Reference targets are Bonsai **1.7B, 4B and 8B** (Qwen3 architecture, sign-packed binary linear
+weights + 2/4-bit embeddings, tied or untied lm_head) - every size is gated bit-exact against the
+reference forward on real hardware. GPU-resident decode (greedy or sampled), streaming, EOS stop,
+`AbortSignal`, and cross-turn KV-cache reuse. Runs the fast subgroup path on Apple / NVIDIA /
 recent AMD and falls back to a workgroup-reduction path everywhere else WebGPU is available.
+Device limits are negotiated from the manifest, so the 8B's ~148 MiB lm_head binding is requested
+only when that model needs it and smaller models keep running at WebGPU's guaranteed minimums.
 
 ## Install
 
@@ -151,11 +154,13 @@ math, drafter, packaging).
 
 The gate is model-parametric: `verify.html?model=<tag>` loads `examples/model-<tag>` against
 `test-fixtures/forward-<tag>`, and the headless driver automatically runs every staged variant.
-A second fixture set (`forward-4b`, Bonsai-4B, hidden 2560) is committed so engine changes are
-checked against two different geometries; stage its weights with
-`ln -s /path/to/bonsai-4b examples/model-4b`. To add fixtures for another model, run
-`tools/golden.py` then `tools/reference.py --dump test-fixtures/forward-<tag>` on the converted
-work dir and record the engine's greedy continuation as `known_good` in that set's `params.json`.
+Fixture sets for all three Bonsai sizes are committed - `forward` (1.7B, hidden 2048),
+`forward-4b` (4B, hidden 2560) and `forward-8b` (8B, hidden 4096, untied lm_head, raised
+device limits) - so engine changes are checked against three geometries; stage the extra
+weights with `ln -s /path/to/bonsai-<size> examples/model-<size>`. To add fixtures for another
+model, run `tools/golden.py` then `tools/reference.py --dump test-fixtures/forward-<tag>` on the
+converted work dir and record the engine's greedy continuation as `known_good` in that set's
+`params.json`.
 
 ### Releasing
 

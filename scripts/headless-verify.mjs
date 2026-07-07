@@ -20,6 +20,7 @@ if (process.argv[2]) {
 } else {
   urls = []
   if (existsSync(join(root, 'examples/model/manifest.json'))) urls.push(BASE)
+  else console.log('[skip] examples/model not staged: the baseline 1.7B gate WILL NOT RUN')
   for (const d of readdirSync(join(root, 'examples'), { withFileTypes: true })) {
     const m = d.name.match(/^model-(.+)$/)
     if (!m) continue

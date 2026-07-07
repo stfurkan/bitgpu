@@ -1,6 +1,7 @@
 // Tiled register-blocked binary GEMM to 3 outputs (qkv or gate/up), PREFILL (M>1), vec4 K-accum.
-// Weights concatenated along N (N0|N1|N2); each 64-wide tile lies in one range (N0,N1 multiples of 64)
-// so a workgroup routes its whole tile to out0/out1/out2. Same vec4 design as matmul_resid_tiled.
+// Weights concatenated along N (N0|N1|N2); each output element routes individually to
+// out0/out1/out2 by its global column, so N0/N1/N2 need no alignment. Same vec4 design as
+// matmul_resid_tiled.
 const BM: u32 = 64u;
 const BN: u32 = 64u;
 const BKV: u32 = 4u;          // BK / 4  (BK = 16)

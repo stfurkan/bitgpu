@@ -142,8 +142,15 @@ def main() -> None:
         np.asarray(ids, np.int32).tofile(f"{args.dump}/ids.i32.bin")
         for name, arr in ckpt.items():
             arr.astype(np.float32).tofile(f"{args.dump}/{name}.bin")
-        json.dump({"S": int(S), "hidden": A["hidden"], "vocab": A["vocab"], "ids": [int(i) for i in ids]},
-                  open(f"{args.dump}/params.json", "w"), indent=1)
+        params = {"S": int(S), "hidden": A["hidden"], "vocab": A["vocab"], "ids": [int(i) for i in ids]}
+        # Preserve a previously recorded known_good greedy continuation: regenerating fixtures
+        # must not silently strip the verify page's bit-exact id gate.
+        try:
+            params["known_good"] = json.load(open(f"{args.dump}/params.json"))["known_good"]
+        except (FileNotFoundError, KeyError, ValueError):
+            print("NOTE: no known_good in", f"{args.dump}/params.json;",
+                  "record the engine's greedy continuation there (see tools/README.md)")
+        json.dump(params, open(f"{args.dump}/params.json", "w"), indent=1)
         print("dumped checkpoints to", args.dump)
 
     # compare to golden

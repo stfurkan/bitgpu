@@ -1,4 +1,5 @@
-// Bonsai-1.7B-class WebGPU runtime. Loads binary (1-bit) Qwen3 weights via the manifest,
+// WebGPU runtime for 1-bit Qwen3-family models (Bonsai 1.7B/4B/8B and any q1 export whose
+// manifest passes the load-time contract). Loads binary (1-bit) weights via the manifest,
 // runs the forward with the validated kernels, keeps a persistent KV cache, and generates
 // autoregressively. Decode is dispatch-overhead-bound, so the matmuls are fused (q/k/v in one
 // dispatch, gate/up in one, the residual add folded into o_proj/down_proj) and the decode loop
@@ -198,6 +199,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const FINAL_NORM = `layers.${A.layers}.final_norm_layernorm`
   if (A.act !== 'silu') throw new Error(`bitgpu: unsupported activation '${A.act}' (kernels implement silu/SwiGLU)`)
   if (A.head_dim > 128) throw new Error(`bitgpu: unsupported head_dim ${A.head_dim} (kernels assume <= 128)`)
+  if (A.heads % A.kv_heads !== 0) throw new Error(`bitgpu: heads ${A.heads} not divisible by kv_heads ${A.kv_heads} (GQA kernels assume an integer group size)`)
   if (!T[FINAL_NORM]) throw new Error(`bitgpu: manifest is missing the final norm tensor '${FINAL_NORM}'`)
   if (!T.cos_cache || !T.sin_cache) throw new Error('bitgpu: manifest is missing the baked cos_cache/sin_cache RoPE tensors')
   for (const [name, t] of Object.entries(T)) {
@@ -230,8 +232,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const FORCETILE = opts.prefillTiling === 'always' // use tiled even for short prompts (validation)
   const tiledPrefill = (S: number): boolean => FORCETILE || (!NOTILE && S >= 64) // tiled GEMM wins only once it fills its 64-row tiles
   const SYNC_N = Math.max(1, opts.syncSteps ?? 4) // decode: chain N steps per CPU sync
-  const maxSeqLen = Math.max(1, opts.maxSeqLen ?? DEFAULT_MAX_SEQ) // KV-cache length cap (VRAM ~ maxSeqLen x 224KB)
-  const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && !forceNoSG // uniform 16/32/64 (16 = Arm Mali) -> head_dim/SG<=8
+  const maxSeqLen = Math.max(1, opts.maxSeqLen ?? DEFAULT_MAX_SEQ) // KV-cache length cap (VRAM ~ maxSeqLen x layers x kv_heads x head_dim x KVB)
+  // uniform 16/32/64 (16 = Arm Mali) -> head_dim/SG<=8. The subgroup attention kernel covers
+  // dimension lane + t*SG for t in [0, D/SG), so head_dim must divide evenly (128 always does;
+  // an exotic head_dim like 80 takes the strided _wg fallback instead of silently dropping dims).
+  const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && A.head_dim % sgMax === 0 && !forceNoSG
   // f16 KV STORAGE (math stays f32; one rounding at cache-write). 'f16' silently falls back to
   // f32 where shader-f16 is missing, so callers can request it unconditionally.
   const kv16 = opts.kvCache === 'f16' && adapter.features.has('shader-f16' as GPUFeatureName)
@@ -759,7 +764,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     F = A.intermediate
   // The KV cache GROWS on demand (doubling, up to maxSeqLen) instead of pinning the full maxSeqLen
   // up front: a short conversation keeps a small cache (~KV_INITIAL positions), so idle VRAM stays
-  // low on memory-constrained devices (the full 2048-position cache is ~448 MB; 512 is ~112 MB).
+  // low on memory-constrained devices (a full 2048-position f32 cache is ~448 MB at 28 layers,
+  // ~576 MB at 36; the 512 floor is a quarter of that).
   // ensureKvCapacity() reallocates + copies the existing K/V when a turn needs more room.
   const KV_INITIAL = 512
   let kvCapacity = Math.min(maxSeqLen, KV_INITIAL)
