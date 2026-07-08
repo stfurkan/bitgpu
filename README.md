@@ -19,6 +19,32 @@ npm install bitgpu
 
 ESM-only, zero runtime dependencies.
 
+## Quickstart - no conversion, no hosting
+
+Ready-made manifests for all three Bonsai sizes are committed under [`models/`](models/); the
+weights stream straight from the Hugging Face Hub. This runs as-is:
+
+```ts
+import { createEngine } from 'bitgpu'
+import { createChat } from 'bitgpu/chat'
+
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.7.0/models/bonsai-1.7b'
+const HF = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
+const engine = await createEngine({
+  manifestUrl: `${REPO}/manifest.json`,
+  auxUrl: `${REPO}/bonsai.aux.bin`,
+  dataUrl: `${HF}/onnx/model_q1.onnx_data`,
+})
+const chat = await createChat(engine, {
+  tokenizerJsonUrl: `${HF}/tokenizer.json`,
+  tokenizerConfigUrl: `${HF}/tokenizer_config.json`,
+})
+await chat.send([{ role: 'user', content: 'Hi!' }], { onText: (t) => process.stdout.write(t) })
+```
+
+Or just open the single-file demo: [`examples/chat.html`](examples/chat.html) - model picker,
+streaming chat, and guaranteed-valid JSON mode, entirely on-device.
+
 ## Usage
 
 ```ts
