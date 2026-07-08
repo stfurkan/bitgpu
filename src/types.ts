@@ -122,7 +122,9 @@ export interface GenerateResult {
   decodeMs: number
   /** Decode throughput (tokens / second), excluding prefill. */
   tokensPerSecond: number
-  /** Per-token decode timing breakdown, in milliseconds. */
+  /** Per-token decode timing breakdown, in milliseconds. In sampled mode the GPU wait and the
+   *  readback map share one sync, so the wait is attributed to `gpuMs` and `readbackMs` covers
+   *  only the post-map CPU work (near zero). */
   timing: { recordMs: number; gpuMs: number; readbackMs: number }
   /** Present when prompt-lookup decoding ran: verify steps taken, tokens drafted, drafts accepted. */
   speculation?: { steps: number; drafted: number; accepted: number }

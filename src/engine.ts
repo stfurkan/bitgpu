@@ -1308,10 +1308,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       encP.copyBufferToBuffer(candIds, 0, rbBuf, 0, K * 4)
       encP.copyBufferToBuffer(candVals, 0, rbBuf, K * 4, K * 4)
       device.queue.submit([encP.finish()])
-      await device.queue.onSubmittedWorkDone()
-      const first = await readCands()
+      const first = await readCands() // mapAsync waits for the submitted work; no separate sync needed
       const firstTok = pick(first.ci, first.cv)
-      flushTransients() // the last segment's scratch is dead now
+      flushTransients() // the last segment's scratch is dead now (the map wait proved the GPU is done with it)
       const prefillMs = performance.now() - t0
 
       const gen: number[] = []
@@ -1349,12 +1348,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         device.queue.submit([enc.finish()])
         recMs += performance.now() - t
         t = performance.now()
-        await device.queue.onSubmittedWorkDone()
+        // ONE sync per token: mapAsync on the readback buffer already waits for the submitted
+        // work its copy depends on, so a separate onSubmittedWorkDone is a second full CPU-GPU
+        // round-trip for nothing. The map wait is dominated by GPU time, so it is attributed to
+        // gpuMs; the post-map array slicing is microseconds (rbMs stays for API stability).
+        const { ci, cv } = await readCands()
         gpuMs += performance.now() - t
         t = performance.now()
-        const { ci, cv } = await readCands()
-        rbMs += performance.now() - t
         const tk = pick(ci, cv)
+        rbMs += performance.now() - t
         total += 1
         if (stopSet?.has(tk)) { stopped = true; break } // EOS: stop without emitting the stop token
         gen.push(tk)
