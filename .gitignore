@@ -3,3 +3,4 @@ node_modules
 src/shaders.generated.ts
 examples/model
 examples/model-*
+examples/staged-*

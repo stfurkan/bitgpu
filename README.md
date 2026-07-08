@@ -187,13 +187,16 @@ model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~
 ```sh
 ln -s /path/to/bonsai-model examples/model   # or copy the files in
 npm run build
-python3 -m http.server 8000                  # serve the repo root
-npm run verify:headless                      # drives system Chrome headlessly (WebGPU/Metal)
+npm run verify:headless                      # serves the repo itself + drives system Chrome headlessly
 ```
 
-Or open `http://localhost:8000/examples/verify.html` in a WebGPU browser and click Run. Run this
-gate on real hardware before every release; CI covers only the CPU-checkable parts (types, sampler
-math, drafter, packaging).
+Or serve the repo root (`python3 -m http.server 8000`) and open
+`http://localhost:8000/examples/verify.html` in a WebGPU browser and click Run. Run this gate on
+real hardware before every release; CI covers only the CPU-checkable parts (types, sampler math,
+drafter, chat, packaging). The headless driver also runs the baseline model once with
+`?nosg=1` (the no-subgroup workgroup-reduction fallback used on Firefox and older adapters), so
+that path is release-gated too - it is bit-identical to the subgroup path on the committed
+known-good ids.
 
 The gate is model-parametric: `verify.html?model=<tag>` loads `examples/model-<tag>` against
 `test-fixtures/forward-<tag>`, and the headless driver automatically runs every staged variant.
