@@ -156,6 +156,7 @@ function mockEngine(tk: ChatTokenizer): Engine & {
     resetCache(): void {
       m.resets++
     },
+    capabilities: { maxSeqLen: 128 },
   }
   return m as never
 }
@@ -256,6 +257,49 @@ await (async () => {
   check('prewarm prefix ends at eos (trailing newline stripped)', warmIds[warmIds.length - 1] === tk.eosTokenId)
   const rw = await chat.send([sys, { role: 'user', content: 'hello' }])
   check('turn after prewarm reuses the cache with a newline-led delta', rw.reusedCache && tk.decode(rw.inputTokenIds, false).startsWith('\n<|im_start|>user'))
+
+  // countTokens == encode(render) length
+  const ctMsgs: ChatMessage[] = [sys, { role: 'user', content: 'How long is this?' }]
+  const ctWant = tk.encode(tk.applyChatTemplate(ctMsgs, { addGenerationPrompt: true, enableThinking: false }), false).length
+  check('countTokens == rendered prompt token count', chat.countTokens(ctMsgs) === ctWant, `${chat.countTokens(ctMsgs)} vs ${ctWant}`)
+
+  // stopSequences: matched across token boundaries (byte-level mock emits one char per token),
+  // the stop text never emitted, finishReason 'stop', and the cache dropped (no stale reuse)
+  engine.script(['Hello STOP world', 'later reply'])
+  let stopStreamed = ''
+  const rs = await chat.send([{ role: 'user', content: 'stop test' }], { stopSequences: ['STOP'], onText: (d) => (stopStreamed += d) })
+  check('stopSequences cuts the text exactly and reports stop', rs.text === 'Hello ' && stopStreamed === rs.text && rs.finishReason === 'stop', JSON.stringify(rs.text))
+  const rsNext = await chat.send([{ role: 'user', content: 'stop test' }, { role: 'assistant', content: rs.text }, { role: 'user', content: 'next' }])
+  check('stop-sequence turn drops the cache (token overrun never reused)', !rsNext.reusedCache)
+
+  // onOverflow: first attempt throws the engine's maxSeqLen error; the trimmed retry succeeds
+  {
+    let calls = 0
+    let overflowInfo: { promptTokenCount: number; maxSeqLen: number } | null = null
+    const ofEngine = {
+      async generate(ids: number[], o2: GenerateOptions = {}): Promise<GenerateResult> {
+        calls++
+        if (calls === 1) throw new Error(`generate: prompt length ${ids.length} exceeds maxSeqLen 128; trim history or raise maxSeqLen`)
+        const reply = tk.encode('trimmed reply', false)
+        for (const t of reply) o2.onToken?.(t)
+        return { tokens: reply, prefillMs: 1, decodeMs: 1, tokensPerSecond: 1, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+      },
+      async prefill() { return { prefillMs: 1 } },
+      resetCache() {},
+      capabilities: { maxSeqLen: 128 },
+    } as never as Engine
+    const ofChat = await createChat(ofEngine, { tokenizer: { json, config } })
+    const long: ChatMessage[] = [sys, { role: 'user', content: 'old turn' }, { role: 'assistant', content: 'old reply' }, { role: 'user', content: 'new question' }]
+    const rOf = await ofChat.send(long, {
+      onOverflow: (info) => {
+        overflowInfo = info
+        return [sys, long[long.length - 1]] // drop the middle turns, keep system + latest question
+      },
+    })
+    check('onOverflow retries once with the trimmed transcript', rOf.text === 'trimmed reply' && calls === 2)
+    const oi = overflowInfo as { promptTokenCount: number; maxSeqLen: number } | null // TS cannot see the callback assignment
+    check('onOverflow receives prompt token count + maxSeqLen', oi !== null && oi.promptTokenCount > 0 && oi.maxSeqLen === 128)
+  }
 })()
 
 // ── (D) JSON constrained decoding: machine, byte table, filter, mock-engine e2e ──────────────

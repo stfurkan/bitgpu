@@ -66,3 +66,37 @@ export class ThinkSplitter {
     return r
   }
 }
+
+/** Stream-safe stop-sequence scanner: emits visible text up to (excluding) the earliest match of
+ *  any stop string, holding back chunk-edge suffixes that could begin one (stops can straddle
+ *  token boundaries). Once matched, everything further is swallowed. */
+export class StopScanner {
+  matched = false
+  private hold = ''
+  constructor(private readonly stops: readonly string[]) {}
+
+  push(text: string): string {
+    if (this.matched) return ''
+    const s = this.hold + text
+    let mi = -1
+    for (const st of this.stops) {
+      const i = s.indexOf(st)
+      if (i !== -1 && (mi === -1 || i < mi)) mi = i
+    }
+    if (mi !== -1) {
+      this.matched = true
+      this.hold = ''
+      return s.slice(0, mi)
+    }
+    let safe = s.length
+    for (const st of this.stops) safe = Math.min(safe, holdback(s, st))
+    this.hold = s.slice(safe)
+    return s.slice(0, safe)
+  }
+
+  flush(): string {
+    const r = this.matched ? '' : this.hold
+    this.hold = ''
+    return r
+  }
+}

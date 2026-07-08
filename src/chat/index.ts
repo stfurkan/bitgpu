@@ -11,12 +11,12 @@
 // `bitgpu` stays a zero-dependency package, and importing plain `bitgpu` never loads chat code.
 import type { Engine, GenerateOptions, GenerateResult } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
-import { ThinkSplitter } from './think'
+import { ThinkSplitter, StopScanner } from './think'
 import { makeJsonFilter, TokenByteTable } from './json'
 
 export { ChatTokenizer } from './tokenizer'
 export type { ChatMessage, DecoderStream } from './tokenizer'
-export { ThinkSplitter } from './think'
+export { ThinkSplitter, StopScanner } from './think'
 export { JsonMachine } from './json'
 
 /** Options for {@link createChat}. Point it at the model directory (which already hosts
@@ -48,6 +48,15 @@ export interface ChatSendOptions {
   promptLookup?: GenerateOptions['promptLookup']
   /** Extra stop token ids, in addition to the model's eos. */
   stopTokens?: number[]
+  /** Stop STRINGS: generation ends when the visible reply contains one (matched across token
+   *  boundaries); the stop text and anything after it is never emitted, and `finishReason` is
+   *  'stop'. A stop-sequence turn drops the KV cache afterwards (the cache holds a short token
+   *  overrun past the cut). */
+  stopSequences?: string[]
+  /** Called when the prompt alone exceeds the engine's KV window (maxSeqLen). Return a trimmed
+   *  message list to retry ONCE with (a clean full prefill), or null to rethrow the error. Pair
+   *  with {@link Chat.countTokens} to implement the trim policy. */
+  onOverflow?: (info: { promptTokenCount: number; maxSeqLen: number }) => ChatMessage[] | null
   signal?: AbortSignal
   /** Render the template with enable_thinking and let the model reason. Think content streams to
    *  `onThink` and lands in `result.thinkText`; it never appears in the visible reply. A think
@@ -98,6 +107,9 @@ export interface Chat {
   /** Prefill a message prefix (e.g. the static system prompt) into the KV cache without decoding,
    *  so the first real turn is a cheap cache-append instead of a cold full prefill. */
   prewarm(messages: ChatMessage[]): Promise<void>
+  /** Token count of the rendered prompt for a message list (chat template applied) - use for
+   *  window budgeting against `engine.capabilities.maxSeqLen`, e.g. in an onOverflow policy. */
+  countTokens(messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean }): number
   /** Forget the conversation: clears the engine's KV cache and the chat's committed transcript.
    *  Use this (not engine.resetCache()) so the two stay in sync. */
   reset(): void
@@ -227,12 +239,22 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
 
     const decoder: DecoderStream = tk.createDecoderStream(true)
     const splitter = new ThinkSplitter()
+    // Stop sequences scan the VISIBLE channel; on a match the engine is aborted via an internal
+    // signal (a few overrun tokens may generate before the per-step abort check lands - the text
+    // is cut exactly, and the cache is dropped afterwards so the overrun can never be reused).
+    const stops = o.stopSequences?.length ? new StopScanner(o.stopSequences) : null
+    const stopCtl = stops ? new AbortController() : null
+    const signal = stopCtl ? (o.signal ? AbortSignal.any([o.signal, stopCtl.signal]) : stopCtl.signal) : o.signal
     let text = ''
     let thinkText = ''
     const emit = (chunk: { text: string; think: string }): void => {
       if (chunk.text) {
-        text += chunk.text
-        o.onText?.(chunk.text)
+        const visible = stops ? stops.push(chunk.text) : chunk.text
+        if (visible) {
+          text += visible
+          o.onText?.(visible)
+        }
+        if (stops?.matched) stopCtl?.abort()
       }
       if (chunk.think) {
         thinkText += chunk.think
@@ -259,7 +281,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         promptLookup: json ? false : o.promptLookup,
         stopTokens: [tk.eosTokenId, ...(o.stopTokens ?? [])],
         reuseCache: canReuse,
-        signal: o.signal,
+        signal,
         candidateFilter: jf ? (ids) => jf.filter(ids) : undefined,
         onToken: (id) => {
           jf?.advance(id)
@@ -267,9 +289,17 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         },
       })
     } catch (err) {
-      // A prompt past maxSeqLen throws BEFORE the engine mutates any state, so the cache is still
-      // valid; every other failure leaves the KV state unknown - drop it.
-      if (!/maxSeqLen/.test((err as Error).message)) dropCache()
+      if (/maxSeqLen/.test((err as Error).message)) {
+        // Thrown BEFORE the engine mutates any state, so the cache is still valid. Offer the
+        // app one shot at recovery: onOverflow returns a trimmed transcript to retry with.
+        if (o.onOverflow) {
+          const trimmed = o.onOverflow({ promptTokenCount: inputTokenIds.length, maxSeqLen: engine.capabilities.maxSeqLen })
+          if (trimmed && trimmed.length > 0) {
+            dropCache() // the trimmed transcript is a different conversation; start clean
+            return await sendImpl(trimmed, { ...o, onOverflow: undefined, reuseCache: false })
+          }
+        }
+      } else dropCache() // every other failure leaves the KV state unknown
       throw err
     }
     emit(splitter.push(decoder.flush()))
@@ -277,8 +307,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
 
     // ── cache bookkeeping ──
     const aborted = o.signal?.aborted ?? false
-    if (aborted) {
-      dropCache() // barge-in mid-generation: the cache holds a partial turn
+    if (aborted || stops?.matched) {
+      dropCache() // barge-in, or a stop-sequence cut (the cache holds a token overrun past it)
     } else if (think) {
       dropCache() // the cached tokens contain reasoning the stripped reply won't reproduce
     } else if (wrap !== null && text.trim() && resetEpoch === epoch0) {
@@ -293,7 +323,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       thinkText,
       tokens: result.tokens,
       inputTokenIds,
-      finishReason: aborted ? 'abort' : result.tokens.length >= maxTokens ? 'length' : 'stop',
+      finishReason: aborted ? 'abort' : stops?.matched ? 'stop' : result.tokens.length >= maxTokens ? 'length' : 'stop',
       reusedCache: canReuse,
       prefillMs: result.prefillMs,
       decodeMs: result.decodeMs,
@@ -364,6 +394,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       return gen()
     },
     prewarm: serialize(prewarmImpl),
+    countTokens: (messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean }): number =>
+      tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: opts?.addGenerationPrompt ?? true, enableThinking: opts?.think ?? false }), false).length,
     reset: (): void => {
       // Synchronous like engine.resetCache(); a turn in flight sees the epoch bump and will not
       // commit, so the next turn starts from the cleared transcript (a clean full prefill).
