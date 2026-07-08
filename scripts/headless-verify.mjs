@@ -115,11 +115,20 @@ try {
     console.log('[gpu]', gpu)
     if (gpu.startsWith('NO')) process.exit(2)
     await page.click('#run')
-    await page.waitForFunction(
-      () => /PACKAGE OK|REGRESSION|^ERROR:|\nERROR:/.test(document.getElementById('out').textContent),
-      undefined,
-      { timeout: 900000, polling: 1000 },
-    )
+    try {
+      await page.waitForFunction(
+        () => /PACKAGE OK|REGRESSION|^ERROR:|\nERROR:/.test(document.getElementById('out').textContent),
+        undefined,
+        { timeout: 900000, polling: 1000 },
+      )
+    } catch (e) {
+      // Timeout: dump the partial transcript so the stall point is visible, then fail the gate.
+      const partial = await page.evaluate(() => document.getElementById('out').textContent).catch(() => '(page unresponsive)')
+      console.log(`TIMED OUT after 900s; partial transcript:\n${partial}`)
+      allOk = false
+      await page.close()
+      continue
+    }
     const transcript = await page.evaluate(() => document.getElementById('out').textContent)
     console.log(transcript)
     if (!/PACKAGE OK/.test(transcript)) allOk = false

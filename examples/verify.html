@@ -347,7 +347,7 @@
         let jParsed = null; try { jParsed = JSON.parse(j1.text); } catch { /* jParsed stays null */ }
         const jOk = jParsed !== null && typeof jParsed === 'object' && j1.finishReason === 'stop' && j1.text === j2.text;
         ok = ok && jOk;
-        log(`  ${jOk ? '[PASS]' : '[FAIL]'} chat json mode parses + complete + deterministic (${j1.tokens.length} tokens)`);
+        log(`  ${jOk ? '[PASS]' : '[FAIL]'} chat json mode parses + complete + deterministic (${j1.tokens.length} tokens, ${j1.tokensPerSecond.toFixed(1)} tok/s vs sampled ${s1.tokensPerSecond.toFixed(1)})`);
         log(`    json: ${j1.text.slice(0, 120)}`);
         const jp = await chat.send([{ role: 'user', content: 'Tell me about your day.' }], { format: 'json', seed: 7, temperature: 0.5, maxTokens: 96 });
         chat.reset();

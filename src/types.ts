@@ -163,6 +163,9 @@ export interface EngineCapabilities {
   subgroupSize: number
   /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16). */
   kvCache: 'f32' | 'f16'
+  /** The engine's KV window in positions (the resolved maxSeqLen option): prompt + generated
+   *  tokens per conversation must fit inside it. */
+  maxSeqLen: number
   /** Adapter identification, when the browser exposes it. */
   adapter: { vendor?: string; architecture?: string; device?: string; description?: string }
   /** Relevant adapter limits the engine codes against. */

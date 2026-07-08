@@ -333,7 +333,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     pipelines[name] = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main', constants } })
   }
   const ROWS_MR = 4 // output rows per workgroup in the multi-row GEMV
-  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['sampler_penalty'], ['argmax_masked']]
+  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked']]
   if (useSG) {
     for (const n of ['rmsnorm_sg', 'attention_sg', 'matmul_split_sg', 'matmul_q2_sg', 'rmsnorm_rope_sg']) specs.push([n, { SG: sgMax }])
     for (const n of ['matmul_split_sm', 'matmul_resid_sm', 'matmul_q2_sm']) specs.push([n, { SG: sgMax }]) // small-batch (M=2..9) verify-pass GEMVs
@@ -540,23 +540,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     )
     return dst
   }
-  const wireCpuGpu = (ref: Ref): { cpu: Uint8Array; buf: GPUBuffer } => {
-    const buf = gbuf(ref.len)
-    const s = gpuSink(buf, 0)
-    const dst = new Uint8Array(ref.len)
-    let w = 0
-    wire(
-      ref,
-      (b) => {
-        dst.set(b, w)
-        w += b.length
-        s.push(b)
-      },
-      s.finish,
-    )
-    return { cpu: dst, buf }
-  }
-
   // WebGPU allocation errors are DEFERRED: without an error scope the ~300 MB of weight buffers
   // "succeed" as invalid buffers on VRAM-poor devices and every later generate returns garbage.
   // The validation scope backstops the limits negotiation above: any load-time validation error
@@ -625,19 +608,21 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
-  // Embedding tables live on BOTH sides: CPU (embedDequant of prompt rows) and GPU (the on-GPU
-  // embed gather in the async decode loop; uint8 arrays are uploaded as bytes and read as u32,
-  // byte-extracted, in embed_gather.wgsl - ~49MB VRAM). cos/sin caches are CPU-only.
-  const embW = wireCpuGpu(T.embed_tokens.weight!)
-  const embS = wireCpuGpu(T.embed_tokens.scales!)
-  const embZ = wireCpuGpu(T.embed_tokens.zp!)
-  const tgt4W = wireCpuGpu(manifest.luts.tgt4)
+  // Embedding tables are GPU-ONLY: decode gathers one token (embed_gather.wgsl) and prefill
+  // gathers a whole segment (embed_gather_batch.wgsl) straight from the packed tables, so no
+  // CPU copy exists (~50-100 MB RAM saved per model; uint8 arrays are uploaded as bytes and
+  // read as u32, byte-extracted). cos/sin caches are CPU-only.
+  const wireGpu = (ref: Ref): GPUBuffer => {
+    const buf = gbuf(ref.len)
+    wireRaw(ref, buf)
+    return buf
+  }
+  const embWqG = wireGpu(T.embed_tokens.weight!)
+  const embScalesG = wireGpu(T.embed_tokens.scales!)
+  const embZpG = wireGpu(T.embed_tokens.zp!)
+  const tgt4G = wireGpu(manifest.luts.tgt4)
   const cosBytes = wireCpu(T.cos_cache as Ref)
   const sinBytes = wireCpu(T.sin_cache as Ref)
-  const embWq = embW.cpu
-  const embScales = new Float32Array(embS.cpu.buffer)
-  const embZp = embZ.cpu
-  const tgt4 = tgt4W.cpu
   const cosCache = new Float32Array(cosBytes.buffer)
   const sinCache = new Float32Array(sinBytes.buffer)
   // The caches are baked per export ([positions, head_dim/2]); positions beyond them would read
@@ -645,10 +630,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const ropePositions = cosCache.length / (A.head_dim / 2)
   if (maxSeqLen > ropePositions)
     throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's baked RoPE cache (${ropePositions} positions); lower maxSeqLen or re-export with a longer cache`)
-  const embWqG = embW.buf,
-    tgt4G = tgt4W.buf,
-    embScalesG = embS.buf,
-    embZpG = embZ.buf
 
   // ONE sequential pass of the data file through the routes. Tied tensors (e.g. lm_head sharing
   // the embedding bytes) produce EXACT-duplicate ranges: those fan out to every consumer; partial
@@ -719,28 +700,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   zpChecks.length = 0
   aux = null as unknown as ArrayBuffer
 
-  function embedDequant(ids: number[]): Float32Array {
-    const Hh = A.hidden,
-      out = new Float32Array(ids.length * Hh)
-    // Per-row strides derived from hidden (2048 -> 256/16/8, 2560 -> 320/20/10).
-    const rowBytes = Hh >> 3,
-      scaleRow = Hh >> 7,
-      zpRow = (scaleRow + 1) >> 1
-    for (let r = 0; r < ids.length; r++) {
-      const id = ids[r]
-      for (let i = 0; i < rowBytes; i++)
-        for (let qd = 0; qd < 4; qd++) {
-          const byte = tgt4[4 * embWq[id * rowBytes + i] + qd],
-            baseK = (i * 4 + qd) * 2
-          for (let c = 0; c < 2; c++) {
-            const k = baseK + c,
-              code = (byte >> (4 * c)) & 15,
-              blk = (k / 128) | 0
-            const zp = (embZp[id * zpRow + ((blk / 2) | 0)] >> (4 * (blk & 1))) & 15
-            out[r * Hh + k] = (code - zp) * embScales[id * scaleRow + blk]
-          }
-        }
-    }
+  // GPU embedding gather for a batch of prompt tokens: upload S u32 ids (bytes, not S*H floats)
+  // and dequantize the rows on the GPU (embed_gather_batch.wgsl - same math as the decode
+  // gather). The returned activation holds [S, H] and belongs to the caller's transient scope.
+  function embedBatch(enc: GPUCommandEncoder, ids: number[]): GPUBuffer {
+    const idBuf = upload(new Uint32Array(ids))
+    const out = actBuf(ids.length * Hd)
+    const pass = enc.beginComputePass()
+    run(pass, 'embed_gather_batch', [['u', ids.length], ['u', Hd], ['u', 0], ['u', 0]], [idBuf, embWqG, tgt4G, embScalesG, embZpG], out, ids.length * Hd)
+    pass.end()
     return out
   }
   function ropeBufs(posBase: number, S: number): { cos: GPUBuffer; sin: GPUBuffer } {
@@ -847,7 +815,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // diagnostic: FULL = null -> every kernel at real size; FULL = Set(names) -> only those at real size,
   // all others dispatched as 1 workgroup. Lets us measure each kernel type's true in-context cost.
   let FULL: Set<string> | null = null
-  const isFull = (name: string): boolean => FULL === null || FULL.has(name)
+  // embed_gather_batch is exempt from profiling skeletons: it produces the PREFILL INPUT (the
+  // CPU used to), and skeleton-skipping it feeds NaN/garbage activations into every profiled
+  // kernel - numerically meaningless and, on GPUs with slow non-finite handling, much slower.
+  const isFull = (name: string): boolean => FULL === null || FULL.has(name) || name === 'embed_gather_batch'
   // differential debug: FORCE_SLOW routes S=1 through the prefill (known-good) path; DBG0 collects
   // layer-0 checkpoint buffers so a fused step and a slow step can be compared kernel by kernel.
   let FORCE_SLOW = false
@@ -1085,8 +1056,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     try {
       for (let off = 0; off < S; off += PREFILL_SEG) {
         const seg = ids.slice(off, off + PREFILL_SEG)
-        const embedOut = upload(embedDequant(seg), S_ | CD | CS)
         const enc = device.createCommandEncoder()
+        const embedOut = embedBatch(enc, seg)
         const { fn, layer0: l0 } = stack(enc, embedOut, seg.length, off)
         const lg = device.createBuffer({ size: seg.length * vocab * 4, usage: S_ | CS })
         transients.push(lg)
@@ -1127,7 +1098,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       }
       const seg = ids.slice(off, off + PREFILL_SEG)
       const enc = device.createCommandEncoder()
-      fn = stack(enc, upload(embedDequant(seg), S_ | CD), seg.length, posBase + off).fn
+      fn = stack(enc, embedBatch(enc, seg), seg.length, posBase + off).fn
       lastRow = seg.length - 1
       device.queue.submit([enc.finish()])
       if (off + PREFILL_SEG < ids.length) {
@@ -1457,8 +1428,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const affBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
     const banBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
     const rbAll = device.createBuffer({ size: (maxDraft + 1) * K * 8, usage: GPUBufferUsage.MAP_READ | CD })
-    // Step input embeddings, written per step (never re-created: the pooled bind groups cache
-    // buffer identities, so a per-step upload would go stale the moment it was destroyed).
+    // Step input token ids + their gathered embeddings, written per step (never re-created: the
+    // pooled bind groups cache buffer identities, so a per-step upload would go stale the moment
+    // it was destroyed). The embeddings are gathered ON the GPU (embed_gather_batch) from the
+    // uploaded ids - only S u32s cross the bus per step, and no CPU embedding tables exist.
+    const pldIds = device.createBuffer({ size: (maxDraft + 1) * 4, usage: S_ | CD })
     const embIn = device.createBuffer({ size: (maxDraft + 1) * Hd * 4, usage: S_ | CD })
 
     const writeAffBan = (h: number[]): { affLen: number; banLen: number } => {
@@ -1547,12 +1521,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         if (S === 1) poolUse('pld1')
         else if (useSG && S <= 9) poolUse('pldm', S, 9)
         else poolUse(null)
-        device.queue.writeBuffer(embIn, 0, embedDequant([tLast, ...drafts]))
+        device.queue.writeBuffer(pldIds, 0, new Uint32Array([tLast, ...drafts]))
         // shared forward: [tLast, ...drafts] at pos -> K/V for pos..pos+S-1 + logits for every row.
         // Routed through the small-batch kernels (weights read once for all S rows); S=1 keeps
         // the fused decode path via the S===1 branches.
         SMALLM = useSG && S >= 2 && S <= 9 ? S : 0
         const enc = device.createCommandEncoder()
+        const gp = enc.beginComputePass()
+        run(gp, 'embed_gather_batch', [['u', S], ['u', Hd], ['u', 0], ['u', 0]], [pldIds, embWqG, tgt4G, embScalesG, embZpG], embIn, S * Hd)
+        gp.end()
         const r = stack(enc, embIn, S, pos)
         pass = enc.beginComputePass()
         lmHead(pass, r.fn, S, lgAll)
@@ -1644,7 +1621,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       poolUse(null)
       flushTransients()
       transients = null
-      for (const b of [lg, lgAll, idsOut, candIds, candVals, affBuf, banBuf, rbAll, embIn]) b.destroy()
+      for (const b of [lg, lgAll, idsOut, candIds, candVals, affBuf, banBuf, rbAll, embIn, pldIds]) b.destroy()
     }
   }
 
@@ -1654,7 +1631,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   async function debugDecode(prefillIds: number[]): Promise<{ fast: Record<string, Float32Array>; slow: Record<string, Float32Array> }> {
     await ensureKvCapacity(prefillIds.length + 1)
     const encP = device.createCommandEncoder()
-    stack(encP, upload(embedDequant(prefillIds), S_ | CD), prefillIds.length, 0)
+    stack(encP, embedBatch(encP, prefillIds), prefillIds.length, 0)
     device.queue.submit([encP.finish()])
     await device.queue.onSubmittedWorkDone()
     const pos = prefillIds.length,
@@ -1663,7 +1640,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       FORCE_SLOW = forceSlow
       DBG0 = {}
       const enc = device.createCommandEncoder()
-      const r = stack(enc, upload(embedDequant([tok]), S_ | CD), 1, pos)
+      const r = stack(enc, embedBatch(enc, [tok]), 1, pos)
       const lg = device.createBuffer({ size: W.lm_head.N! * 4, usage: S_ | CS })
       const pass = enc.beginComputePass()
       lmHead(pass, r.fn, 1, lg)
@@ -1707,7 +1684,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const banBuf = upload(ban.length ? Uint32Array.from(ban) : new Uint32Array(1), S_ | CD)
     // pass 1: prefill -> lm_head -> base logits
     const enc1 = device.createCommandEncoder()
-    const { fn } = stack(enc1, upload(embedDequant(ids), S_ | CD), ids.length, 0)
+    const { fn } = stack(enc1, embedBatch(enc1, ids), ids.length, 0)
     const lastP = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
     enc1.copyBufferToBuffer(fn, (ids.length - 1) * Hd * 4, lastP, 0, Hd * 4)
     let pass = enc1.beginComputePass()
@@ -1735,6 +1712,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     useSubgroups: useSG,
     subgroupSize: sgMax,
     kvCache: kv16 ? 'f16' : 'f32',
+    maxSeqLen,
     adapter: { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description },
     limits: {
       // the DEVICE limits (what dispatches are actually validated against), not the adapter's maximums
