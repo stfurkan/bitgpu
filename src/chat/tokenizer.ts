@@ -67,6 +67,16 @@ export class ChatTokenizer {
     return this.tok.decode(ids, { skip_special_tokens: skipSpecialTokens })
   }
 
+  /** The raw vocab string for a token id (byte-alias space for byte-level BPE). */
+  idToToken(id: number): string | undefined {
+    return this.tok.id_to_token(id)
+  }
+
+  /** Ids of all added tokens (ChatML markers, <think>, etc.) - never plain content. */
+  addedTokenIds(): Set<number> {
+    return new Set(this.tok.get_added_tokens_decoder().keys())
+  }
+
   get hasChatTemplate(): boolean {
     return this.template !== null
   }

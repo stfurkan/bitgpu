@@ -101,6 +101,15 @@ export interface GenerateOptions {
   noRepeatNgramSize?: number
   /** Seed for the sampler RNG. Omit to seed from entropy (non-deterministic, like production). */
   seed?: number
+  /** EXPERIMENTAL. Per-step constrained-decoding hook: receives the top-K candidate token ids
+   *  (rank order, penalized logits alongside) and returns the PERMITTED subset (any order).
+   *  Greedy picks the best permitted candidate; sampling renormalizes the draw over them. When
+   *  it permits none, the engine walks the full vocabulary in logit order (rare; the step costs
+   *  a full logits readback) and throws if no token at all is permitted. Must be deterministic
+   *  and synchronous; the engine calls it once per emitted token, in order. Incompatible with
+   *  `promptLookup` (speculation is disabled while a filter is set). Used by bitgpu/chat's
+   *  `format: 'json'`. */
+  candidateFilter?: (candidateIds: Uint32Array, candidateLogits: Float32Array) => number[]
   /** EXPERIMENTAL. Prompt-lookup speculative decoding: draft the continuation from an n-gram
    *  match in the sequence so far and verify every draft in ONE batched forward. Output is
    *  identical to normal decoding, greedy AND sampled (each emitted token still comes from its

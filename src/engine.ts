@@ -1293,6 +1293,46 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
     // candidates are descending, so ci[0] is the argmax of the penalized logits (greedy+processors)
     const pick = (ci: Uint32Array, cv: Float32Array): number => (sampled ? sampleFromCandidates(ci, cv, temperature, rng) : ci[0])
+    const filter = genOpts.candidateFilter
+    // Constrained pick (candidateFilter): keep the permitted subset in rank order and pick within
+    // it - greedy takes the best permitted, sampling renormalizes the draw over them (exactly one
+    // RNG draw per emitted token, like the unconstrained path). When the whole top-K is rejected,
+    // walk the FULL vocabulary in logit order (rare: valid grammars almost always admit a top-K
+    // token) and rebuild up to K permitted candidates; a grammar that admits nothing is a bug in
+    // the filter and fails loudly.
+    const chooseToken = async (ci: Uint32Array, cv: Float32Array): Promise<number> => {
+      if (!filter) return pick(ci, cv)
+      const perm = new Set(filter(ci, cv))
+      if (perm.size > 0) {
+        const pIds: number[] = []
+        const pVals: number[] = []
+        for (let i = 0; i < ci.length; i++)
+          if (perm.has(ci[i])) {
+            pIds.push(ci[i])
+            pVals.push(cv[i])
+          }
+        return sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+      }
+      const all = await readback(lg, vocab) // penalized logits (already-rejected top-K entries may be masked; they resort to the tail)
+      const order = Array.from(all.keys()).sort((a, b) => all[b] - all[a] || a - b)
+      const pIds: number[] = []
+      const pVals: number[] = []
+      const B = 512
+      for (let i = 0; i < order.length && pIds.length < K; i += B) {
+        if (all[order[i]] === -Infinity) break // sorted: only masked/banned entries remain
+        const batch = order.slice(i, i + B).filter((id) => all[id] !== -Infinity)
+        const ok = new Set(filter(Uint32Array.from(batch), Float32Array.from(batch.map((id) => all[id]))))
+        for (const id of batch) {
+          if (ok.has(id)) {
+            pIds.push(id)
+            pVals.push(all[id])
+            if (pIds.length >= K) break
+          }
+        }
+      }
+      if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
+      return sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+    }
 
     transients = [] // track prefill scratch so it can be destroyed once the prefill completes
     try {
@@ -1312,7 +1352,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       encP.copyBufferToBuffer(candVals, 0, rbBuf, K * 4, K * 4)
       device.queue.submit([encP.finish()])
       const first = await readCands() // mapAsync waits for the submitted work; no separate sync needed
-      const firstTok = pick(first.ci, first.cv)
+      const firstTok = await chooseToken(first.ci, first.cv)
       flushTransients() // the last segment's scratch is dead now (the map wait proved the GPU is done with it)
       const prefillMs = performance.now() - t0
 
@@ -1358,7 +1398,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         const { ci, cv } = await readCands()
         gpuMs += performance.now() - t
         t = performance.now()
-        const tk = pick(ci, cv)
+        const tk = await chooseToken(ci, cv)
         rbMs += performance.now() - t
         total += 1
         if (stopSet?.has(tk)) { stopped = true; break } // EOS: stop without emitting the stop token
@@ -1747,8 +1787,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       }
     }
 
+    // A candidateFilter needs the per-step sampler-chain path (candidates on the CPU every
+    // token) and cannot speculate (draft verification has no per-row filter state) - so it
+    // forces that path and disables promptLookup, as documented on the option.
+    const hasFilter = !!genOpts.candidateFilter
     let r: RawGenResult
-    if (genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+    if (!hasFilter && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
       // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
       // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
       // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
@@ -1795,9 +1839,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           },
         }
       }
-    } else if (genOpts.promptLookup) {
+    } else if (!hasFilter && genOpts.promptLookup) {
       r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
-    } else if (sampled || hasProcessors) {
+    } else if (sampled || hasProcessors || hasFilter) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else {
       // Capture the history array like the sampled/PLD paths do: a resetCache() racing this turn

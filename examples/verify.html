@@ -335,6 +335,26 @@
         ok = ok && cThinkOk;
         log(`  ${cThinkOk ? '[PASS]' : '[FAIL]'} chat think turn keeps tags out of the reply (${cTh.thinkText.length} think chars)`);
         chat.reset();
+        // format:'json' - constrained decoding on real hardware: the reply must parse, be
+        // complete (finishReason 'stop'), and be seed-deterministic. Two prompts: one that asks
+        // for JSON (filter mostly confirms the model), one that invites PROSE (the filter must
+        // force structure from the first token - this exercises the full-vocab fallback path).
+        const jq = [{ role: 'user', content: 'Describe France as JSON with keys capital (string) and population_millions (number).' }];
+        const j1 = await chat.send(jq, { format: 'json', seed: 42, temperature: 0.5, maxTokens: 96 });
+        chat.reset();
+        const j2 = await chat.send(jq, { format: 'json', seed: 42, temperature: 0.5, maxTokens: 96 });
+        chat.reset();
+        let jParsed = null; try { jParsed = JSON.parse(j1.text); } catch { /* jParsed stays null */ }
+        const jOk = jParsed !== null && typeof jParsed === 'object' && j1.finishReason === 'stop' && j1.text === j2.text;
+        ok = ok && jOk;
+        log(`  ${jOk ? '[PASS]' : '[FAIL]'} chat json mode parses + complete + deterministic (${j1.tokens.length} tokens)`);
+        log(`    json: ${j1.text.slice(0, 120)}`);
+        const jp = await chat.send([{ role: 'user', content: 'Tell me about your day.' }], { format: 'json', seed: 7, temperature: 0.5, maxTokens: 96 });
+        chat.reset();
+        let jpParsed = null; try { jpParsed = JSON.parse(jp.text); } catch { /* stays null */ }
+        const jpOk = jpParsed !== null && jp.finishReason === 'stop';
+        ok = ok && jpOk;
+        log(`  ${jpOk ? '[PASS]' : '[FAIL]'} chat json mode forces structure on a prose prompt (${jp.tokens.length} tokens)`);
       }
 
       // 8) f16 KV cache mode (kvCache: 'f16'). Within-mode behavior must stay EXACT (determinism,

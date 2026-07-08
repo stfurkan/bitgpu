@@ -84,6 +84,24 @@ reuse with exact token bookkeeping (a clean follow-up turn prefills only the del
 `chat.prewarm(messages)` warms a static system prompt at load). `chat.reset()` forgets the
 conversation.
 
+### Guaranteed-valid JSON (`format: 'json'`)
+
+```ts
+const r = await chat.send(
+  [{ role: 'user', content: 'Describe France as JSON: capital (string), population_millions (number).' }],
+  { format: 'json' },
+)
+JSON.parse(r.text) // never throws when finishReason === 'stop'
+```
+
+Constrained decoding: every candidate token is validated against an incremental byte-level JSON
+machine before it can be sampled, so the reply is structurally guaranteed to be one complete,
+valid JSON value (object or array root) - small 1-bit models free-form JSON unreliably, and this
+removes that failure class entirely. Generation ends when the root value closes
+(`finishReason: 'length'` means `maxTokens` cut it short - raise it). The constraint is
+structural, not semantic: prompt for the shape you want. Built on the engine's generic
+`candidateFilter` hook (see `GenerateOptions`), which is open for custom grammars.
+
 The two text libraries (`@huggingface/tokenizers`, `@huggingface/jinja` - pure JS, Apache-2.0,
 see THIRD_PARTY_LICENSES.md) are inlined into `dist/chat.js` at build time, the same way the
 engine inlines its WGSL: the package keeps **zero runtime dependencies**, and importing plain

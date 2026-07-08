@@ -15,6 +15,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createChat, ChatTokenizer, ThinkSplitter, type ChatMessage } from '../src/chat/index'
+import { JsonMachine, TokenByteTable } from '../src/chat/json'
 import type { Engine, GenerateOptions, GenerateResult } from '../src/types'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -257,6 +258,114 @@ await (async () => {
   check('turn after prewarm reuses the cache with a newline-led delta', rw.reusedCache && tk.decode(rw.inputTokenIds, false).startsWith('\n<|im_start|>user'))
 })()
 
+// ── (D) JSON constrained decoding: machine, byte table, filter, mock-engine e2e ──────────────
+console.log('(D) JSON constrained decoding')
+{
+  const enc = new TextEncoder()
+  const feed = (s: string, byByte = false): { ok: boolean; complete: boolean } => {
+    const m = new JsonMachine()
+    const bytes = enc.encode(s)
+    let ok = true
+    if (byByte) {
+      for (const b of bytes) if (!m.feed(new Uint8Array([b]))) { ok = false; break }
+    } else ok = m.feed(bytes)
+    return { ok, complete: ok && m.complete }
+  }
+  const COMPLETE = [
+    '{}', '[]', '{"a":1}', '[1,2,3]', '{"a":[1,2,{"b":null}],"c":true,"d":false}',
+    ' { "a" : 1 , "b" : [ true , false ] } ', '[[],{}]', '{"n":-1.5e+10,"z":0,"f":0.25,"E":2E3}',
+    '{"s":"esc \\" \\\\ \\/ \\b \\f \\n \\r \\t \\u00e9 ok"}', '{"unicode":"héllo 👍🏽 中文"}',
+    '[1]', '{"a":{"b":{"c":[]}}}', '{} ',
+  ]
+  const VALID_PREFIX = ['{', '{"a"', '{"a":', '{"a":1', '[1', '[1,', '{"a":tru', '{"s":"half', '{"s":"\\u00', '[-']
+  const INVALID = [
+    'true', '1', '"s"', 'null', // JSON mode requires an object/array root
+    '{,}', '{"a"}', '{"a":}', '{1:2}', '[1,]', '{"a":1,}', '[,]', '{]', '[}', '{}{', '{} x',
+    '{"a":01}', '{"a":1.}', '{"a":.5}', '{"a":-}', '{"a":1e}', '{"a":1e+}', '{"a":+1}', '{"a":--1}',
+    '{"a":"\\x"}', '{"a":"raw\ntab"}', '{"a":true1}', '{"a":nul}',
+  ]
+  let mOk = true
+  for (const s of COMPLETE) {
+    const whole = feed(s)
+    const single = feed(s, true)
+    if (!whole.ok || !whole.complete || !single.ok || !single.complete) { mOk = false; console.log(`    machine FAILED to accept: ${JSON.stringify(s)}`) }
+  }
+  check(`machine accepts + completes ${COMPLETE.length} valid docs (whole and byte-by-byte)`, mOk)
+  mOk = true
+  for (const s of VALID_PREFIX) {
+    const r = feed(s, true)
+    if (!r.ok || r.complete) { mOk = false; console.log(`    machine mis-judged prefix: ${JSON.stringify(s)}`) }
+  }
+  check(`machine holds ${VALID_PREFIX.length} valid prefixes open`, mOk)
+  mOk = true
+  for (const s of INVALID) {
+    const r = feed(s, true)
+    const whole = feed(s)
+    if (r.ok || whole.ok) { mOk = false; console.log(`    machine ACCEPTED invalid: ${JSON.stringify(s)}`) }
+  }
+  check(`machine rejects ${INVALID.length} invalid docs`, mOk)
+  // UTF-8 byte-sequence enforcement inside strings
+  const m1 = new JsonMachine()
+  check('utf8: split multi-byte char across feeds', m1.feed(enc.encode('{"a":"')) && m1.feed(new Uint8Array([0xc3])) && m1.feed(new Uint8Array([0xa9])) && m1.feed(enc.encode('"}')) && m1.complete)
+  const m2 = new JsonMachine()
+  check('utf8: lead byte followed by ascii rejected', m2.feed(enc.encode('{"a":"')) && m2.feed(new Uint8Array([0xc3])) && !m2.feed(new Uint8Array([0x61])))
+  const m3 = new JsonMachine()
+  check('utf8: stray continuation byte rejected', m3.feed(enc.encode('{"a":"')) && !m3.feed(new Uint8Array([0x80])))
+  const m4 = new JsonMachine()
+  check('utf8: string cannot close mid-sequence', m4.feed(enc.encode('{"a":"')) && m4.feed(new Uint8Array([0xe4])) && !m4.feed(enc.encode('"')))
+
+  // byte table + filter + full chat e2e on the hermetic tokenizer with a candidate-driven mock
+  const { json: tj, config: tc } = miniTokenizer()
+  const tk = new ChatTokenizer(tj, tc)
+  const table = new TokenByteTable(tk)
+  const id = (ch: string): number => tk.encode(ch, false)[0]
+  check('byte table: ascii token bytes', String.fromCharCode(...(table.bytes(id('{')) ?? [])) === '{')
+  const eBytes = table.bytes(tk.encode('é', false)[0])
+  check('byte table: multi-byte lead token', eBytes !== null && eBytes![0] === 0xc3)
+  check('byte table: added tokens are null', table.bytes(tk.eosTokenId) === null)
+
+  // candidate-driven mock engine: per step, present scripted rank-ordered candidates, apply the
+  // filter in chunks of 4 (exercising multi-batch), emit the first permitted (greedy semantics)
+  const candEngine = (steps: number[][]): Engine => {
+    return {
+      async generate(_ids: number[], o: GenerateOptions = {}): Promise<GenerateResult> {
+        const tokens: number[] = []
+        for (const step of steps) {
+          if (tokens.length >= (o.maxTokens ?? 256)) break
+          let chosen: number | null = null
+          for (let i = 0; i < step.length && chosen === null; i += 4) {
+            const batch = step.slice(i, i + 4)
+            const perm = o.candidateFilter ? o.candidateFilter(Uint32Array.from(batch), new Float32Array(batch.length)) : batch
+            for (const b of batch) if (perm.includes(b)) { chosen = b; break }
+          }
+          if (chosen === null) throw new Error('no permitted token')
+          if (o.stopTokens?.includes(chosen)) break
+          tokens.push(chosen)
+          o.onToken?.(chosen)
+        }
+        return { tokens, prefillMs: 1, decodeMs: 1, tokensPerSecond: tokens.length, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+      },
+      async prefill() { return { prefillMs: 1 } },
+      resetCache() {},
+    } as never
+  }
+  // the "model" wants prose ('h','e','y'), then structure; the filter must force valid JSON:
+  // step lists put invalid candidates FIRST so any filter mistake changes the output.
+  const steps = [
+    [id('h'), id('e'), id('{')], // -> {
+    [id('}'), id('"')], // -> } would close root|wait root open: '}' IS valid (empty obj)... use it
+    [id('a'), tk.eosTokenId], // root complete -> only eos permitted -> stops
+  ]
+  const jEngine = candEngine(steps)
+  const jChat = await createChat(jEngine, { tokenizer: { json: tj, config: tc } })
+  const jr = await jChat.send([{ role: 'user', content: 'json please' }], { format: 'json', maxTokens: 8 })
+  check('mock e2e: filter forces valid JSON and stops at completion', jr.text === '{}' && jr.finishReason === 'stop', JSON.stringify(jr.text))
+  // think tags are structurally impossible in json mode: <think> is an added token -> always rejected
+  const steps3 = [[tk.encode('<think>', false)[0], id('[')], [id(']')], [tk.eosTokenId]]
+  const jr3 = await (await createChat(candEngine(steps3), { tokenizer: { json: tj, config: tc } })).send([{ role: 'user', content: 'x' }], { format: 'json' })
+  check('mock e2e: added tokens (e.g. <think>) never enter JSON output', jr3.text === '[]', JSON.stringify(jr3.text))
+}
+
 // ── (C) parity vs transformers.js on a real model (auto-skips when not staged) ───────────────
 console.log('(C) parity vs @huggingface/transformers (real model tokenizer)')
 const staged = ['model', 'model-4b', 'model-8b'].find((d) => existsSync(join(root, 'examples', d, 'tokenizer.json')))
@@ -303,6 +412,26 @@ if (!staged) {
   for (const id of ids) acc += st.push(id)
   acc += st.flush()
   check('decoder stream == full decode (real vocab)', acc === tk.decode(ids), JSON.stringify(acc.slice(0, 40)))
+
+  // JSON constrained decoding against the real vocabulary: token bytes must reconstruct the
+  // exact UTF-8 of the text, and a real-tokenized JSON doc must drive the machine to complete.
+  const table = new TokenByteTable(tk)
+  const doc = '{"name":"Ayşe 👍🏽","n":-1.5e+3,"list":[true,null,{"k":"v"}],"note":"esc \\" \\u00e9 done"}'
+  const docIds = tk.encode(doc, false)
+  const encBytes = new TextEncoder().encode(doc)
+  const gathered: number[] = []
+  for (const tid of docIds) {
+    const b = table.bytes(tid)
+    if (b) gathered.push(...b)
+  }
+  check('token bytes reconstruct exact UTF-8 (real vocab)', gathered.length === encBytes.length && gathered.every((v, i) => v === encBytes[i]), `${gathered.length}/${encBytes.length} bytes`)
+  const jm = new JsonMachine()
+  let jmOk = true
+  for (const tid of docIds) {
+    const b = table.bytes(tid)
+    if (!b || !jm.feed(b)) { jmOk = false; break }
+  }
+  check('machine accepts a real-tokenized JSON doc token-by-token', jmOk && jm.complete)
 }
 
 console.log(failures === 0 ? '\nALL CHAT CHECKS PASSED' : `\n${failures} CHAT CHECK(S) FAILED`)
