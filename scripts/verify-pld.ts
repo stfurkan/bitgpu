@@ -1,6 +1,6 @@
 // Headless checks for the prompt-lookup drafter (the CPU half of speculative decoding).
 // The GPU half (batched verify + acceptance) is gated in examples/verify.html.
-import { draftNgram } from '../src/pld'
+import { draftNgram, pldWorthIt } from '../src/pld'
 
 let failures = 0
 function check(name: string, got: number[], want: number[]): void {
@@ -21,6 +21,19 @@ check('no match', draftNgram([1, 2, 3, 4, 5], 3, 8), [])
 check('maxDraft 0', draftNgram([1, 2, 1, 2], 2, 0), [])
 check('tiny sequence', draftNgram([7], 3, 8), [])
 check('maxDraft caps the draft', draftNgram([1, 2, 3, 4, 5, 6, 2, 3], 3, 2), [4, 5])
+
+// promptLookup:'auto' bail decision (pldWorthIt): mode-aware break-even in tokens-per-step
+function checkB(name: string, got: boolean, want: boolean): void {
+  const ok = got === want
+  if (!ok) failures++
+  console.log(`  [${ok ? 'PASS' : 'FAIL'}] ${name}  got=${got} want=${want}`)
+}
+checkB('greedy: 1.45 tok/step bails (plain greedy chains syncs)', pldWorthIt(32, 22, false), false)
+checkB('greedy: 2.0 tok/step keeps', pldWorthIt(48, 24, false), true)
+checkB('sampled: 1.0 tok/step bails', pldWorthIt(24, 24, true), false)
+checkB('sampled: 1.5 tok/step keeps', pldWorthIt(36, 24, true), true)
+checkB('sampled: 1.45 tok/step bails (below 1.5)', pldWorthIt(29, 20, true), false)
+checkB('zero steps never keeps', pldWorthIt(0, 0, true), false)
 
 if (failures) {
   console.error(`${failures} FAILURE(S)`)

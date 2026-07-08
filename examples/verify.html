@@ -238,6 +238,21 @@
       ok = ok && prOk;
       log(`  ${prOk ? '[PASS]' : '[FAIL]'} pld reuse turn-2 == cold full-prefill turn-2 (greedy, bit-exact)`);
       engine.resetCache();
+      // promptLookup:'auto': probation then keep-or-bail; output must be IDENTICAL to plain
+      // decoding either way. The fixture content is below both break-evens, so these exercise
+      // the bail + continuation paths (greedy handoff, and the sampled RNG mid-stream handoff).
+      const ag = await engine.generate(ids, { maxTokens: 32, promptLookup: 'auto' });
+      const agOk = ag.tokens.length === g.tokens.length && ag.tokens.every((t, i) => t === g.tokens[i]);
+      ok = ok && agOk;
+      log(`  ${agOk ? '[PASS]' : '[FAIL]'} pld auto greedy == greedy  (bailed=${ag.speculation?.bailed}, ${ag.tokensPerSecond.toFixed(2)} vs ${g.tokensPerSecond.toFixed(2)} tok/s)`);
+      engine.resetCache();
+      const as = await engine.generate(ids, { ...SOPT, maxTokens: 32, seed: 42, promptLookup: 'auto' });
+      engine.resetCache();
+      const asPlain = await engine.generate(ids, { ...SOPT, maxTokens: 32, seed: 42 });
+      const asOk = as.tokens.length === asPlain.tokens.length && as.tokens.every((t, i) => t === asPlain.tokens[i]);
+      ok = ok && asOk;
+      log(`  ${asOk ? '[PASS]' : '[FAIL]'} pld auto sampled (seed 42) == sampled  (bailed=${as.speculation?.bailed}, ${as.tokensPerSecond.toFixed(2)} vs ${asPlain.tokensPerSecond.toFixed(2)} tok/s)`);
+      engine.resetCache();
 
       // 6f) greedy with processors: repetition_penalty / no_repeat_ngram apply under greedy search
       // too (like transformers.js), picking the penalized argmax with NO RNG involvement - so the

@@ -105,11 +105,15 @@ export interface GenerateOptions {
    *  match in the sequence so far and verify every draft in ONE batched forward. Output is
    *  identical to normal decoding, greedy AND sampled (each emitted token still comes from its
    *  true penalized distribution, and the RNG advances one draw per emitted token, in order).
-   *  INCOMPATIBLE with `noRepeatNgramSize`: a prompt-lookup draft is the continuation of a
-   *  repeated n-gram, which is exactly what the ngram ban forbids, so acceptance is ~zero when
-   *  both are on (measured 0/320). Use with greedy decoding or ngram-ban-free sampling. No
-   *  draft model, no extra VRAM. `true` = `{ ngramSize: 3, maxDraft: 8 }`. Default `false`. */
-  promptLookup?: boolean | { ngramSize?: number; maxDraft?: number }
+   *  `'auto'` speculates for a short probation window, then keeps PLD only when the measured
+   *  acceptance actually beats plain decoding for this content - and falls back to the plain
+   *  path otherwise (output still identical; `speculation.bailed` reports the decision). Use
+   *  `'auto'` unless you know the content repeats (quoting, lists, code), where `true` skips
+   *  the probation. INCOMPATIBLE with `noRepeatNgramSize`: a prompt-lookup draft is the
+   *  continuation of a repeated n-gram, which is exactly what the ngram ban forbids, so
+   *  acceptance is ~zero when both are on (measured 0/320). No draft model, no extra VRAM.
+   *  `true`/`'auto'` = `{ ngramSize: 3, maxDraft: 8 }`. Default `false`. */
+  promptLookup?: boolean | 'auto' | { ngramSize?: number; maxDraft?: number }
 }
 
 /** Result of a {@link Engine.generate} call. */
@@ -126,8 +130,10 @@ export interface GenerateResult {
    *  readback map share one sync, so the wait is attributed to `gpuMs` and `readbackMs` covers
    *  only the post-map CPU work (near zero). */
   timing: { recordMs: number; gpuMs: number; readbackMs: number }
-  /** Present when prompt-lookup decoding ran: verify steps taken, tokens drafted, drafts accepted. */
-  speculation?: { steps: number; drafted: number; accepted: number }
+  /** Present when prompt-lookup decoding ran: verify steps taken, tokens drafted, drafts
+   *  accepted. With `promptLookup: 'auto'`, `bailed` reports whether the probation decided to
+   *  stop speculating for the rest of the turn. */
+  speculation?: { steps: number; drafted: number; accepted: number; bailed?: boolean }
 }
 
 /** Diagnostic result of {@link Engine.forward}: hidden states + logits for a single forward pass. */

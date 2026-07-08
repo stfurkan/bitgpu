@@ -18,3 +18,18 @@ export function draftNgram(seq: readonly number[], ngramSize: number, maxDraft: 
   }
   return []
 }
+
+/** Number of tokens promptLookup:'auto' emits through the PLD path before deciding whether
+ *  speculating actually pays on this content. */
+export const PLD_PROBATION = 24
+
+/** The auto-bail decision after the probation window: keep speculating only when the measured
+ *  tokens-per-verify-step clears the break-even against PLAIN decoding, which differs by mode.
+ *  Each PLD step costs one batched verify forward plus a per-step CPU sync; plain GREEDY chains
+ *  several steps per sync (GPU-resident argmax), so its break-even is high (~2.0 tokens/step,
+ *  measured), while plain SAMPLED syncs every token anyway (~1.5). Below the bar, the rest of
+ *  the turn runs the plain path - output is identical either way, only speed changes. */
+export function pldWorthIt(emitted: number, steps: number, sampled: boolean): boolean {
+  if (steps <= 0) return false
+  return emitted / steps >= (sampled ? 1.5 : 2.0)
+}

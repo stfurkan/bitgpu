@@ -10,7 +10,7 @@
 // (now typed options, not URL params), and the public surface differ.
 import { SHADERS } from './shaders.generated'
 import { GpuOutOfMemoryError, WebGPUUnavailableError } from './errors'
-import { draftNgram } from './pld'
+import { draftNgram, pldWorthIt, PLD_PROBATION } from './pld'
 import { MT19937, affectedIds, ngramBans, sampleFromCandidates } from './sampler'
 import type {
   DeviceLostInfo,
@@ -87,7 +87,10 @@ interface RawGenResult {
   recMs: number
   gpuMs: number
   rbMs: number
-  spec?: { steps: number; drafted: number; accepted: number }
+  spec?: { steps: number; drafted: number; accepted: number; bailed?: boolean }
+  /** The sampler RNG as it stands after this call - promptLookup:'auto' hands it to the plain
+   *  continuation so the draw stream continues exactly where the probation left off. */
+  rng?: MT19937
 }
 
 /** Internal engine handle: the public {@link Engine} surface plus diagnostics used by the
@@ -1237,7 +1240,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // step's embed gather. A GREEDY turn with processors (repetition_penalty / no_repeat_ngram) also
   // runs here - the chain filters, then pick() takes the penalized argmax without touching the RNG.
   // Plain greedy decode (generateImpl) is the separate, untouched GPU-resident path.
-  async function generateSampledImpl(ids: number[], posBase: number, nTokens: number, genOpts: GenerateOptions, history: number[]): Promise<RawGenResult> {
+  async function generateSampledImpl(ids: number[], posBase: number, nTokens: number, genOpts: GenerateOptions, history: number[], rngIn?: MT19937): Promise<RawGenResult> {
     await ensureKvCapacity(posBase + ids.length + nTokens)
     // `ids` = the tokens to prefill this turn (the whole prompt, or [lastToken, ...delta] on reuse).
     // `history` = the FULL conversation token sequence (shared, mutated): the sampler's penalty/ngram
@@ -1251,7 +1254,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
     const signal = genOpts.signal
-    const rng = new MT19937(genOpts.seed)
+    const rng = rngIn ?? new MT19937(genOpts.seed)
 
     // persistent buffers (stable across steps for bind-group caching; not via actBuf)
     const tokBuf = device.createBuffer({ size: Math.max(1, nTokens) * 4, usage: S_ | CS | CD })
@@ -1296,7 +1299,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const t0 = performance.now()
       // prefill (segmented) -> last hidden -> lm_head -> sampler chain, CPU samples the first token
       const pfx = await runPrefill(ids, posBase, signal)
-      if (!pfx) return { prefillMs: performance.now() - t0, decodeMs: 0, tokPerSec: 0, tokens: [], firstArgmax: -1, recMs: 0, gpuMs: 0, rbMs: 0 }
+      if (!pfx) return { prefillMs: performance.now() - t0, decodeMs: 0, tokPerSec: 0, tokens: [], firstArgmax: -1, recMs: 0, gpuMs: 0, rbMs: 0, rng }
       const encP = device.createCommandEncoder()
       const lastP = actBuf(Hd)
       encP.copyBufferToBuffer(pfx.fn, pfx.lastRow * Hd * 4, lastP, 0, Hd * 4)
@@ -1366,7 +1369,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       }
       const decodeMs = performance.now() - t1
       const nd = Math.max(1, gen.length - 1)
-      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd }
+      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd, rng }
     } finally {
       // Restore the shared flags even when a step throws, and release this call's GPU buffers.
       poolUse(null)
@@ -1387,7 +1390,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // the sampler draws sequentially on the CPU, so the MT19937 stream advances exactly one draw
   // per EMITTED token, in order - the output equals non-speculative decoding for the same seed.
   // With no match the step degenerates to a normal single-token pass (S=1 keeps the fused path).
-  async function generatePldImpl(ids: number[], posBase: number, nTokens: number, genOpts: GenerateOptions, history: number[]): Promise<RawGenResult> {
+  async function generatePldImpl(ids: number[], posBase: number, nTokens: number, genOpts: GenerateOptions, history: number[], rngIn?: MT19937): Promise<RawGenResult> {
     await ensureKvCapacity(posBase + ids.length + nTokens)
     const sampled = genOpts.temperature != null && genOpts.temperature > 0 && genOpts.temperature !== 1
     const vocab = W.lm_head.N!
@@ -1401,7 +1404,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
     const signal = genOpts.signal
-    const rng = new MT19937(genOpts.seed)
+    const rng = rngIn ?? new MT19937(genOpts.seed)
     // Greedy with processors (repetition_penalty / no_repeat_ngram) also needs the per-row sampler
     // chain - the penalties see each row's history - but picks the penalized argmax, no RNG draw.
     const useChain = sampled || penalty !== 1 || ngramN > 0
@@ -1445,7 +1448,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const t0 = performance.now()
       // prefill (segmented) -> last hidden -> lm_head -> argmax (greedy) or sampler chain (sampled)
       const pfx = await runPrefill(ids, posBase, signal)
-      if (!pfx) return { prefillMs: performance.now() - t0, decodeMs: 0, tokPerSec: 0, tokens: [], firstArgmax: -1, recMs: 0, gpuMs: 0, rbMs: 0, spec: { steps: 0, drafted: 0, accepted: 0 } }
+      if (!pfx) return { prefillMs: performance.now() - t0, decodeMs: 0, tokPerSec: 0, tokens: [], firstArgmax: -1, recMs: 0, gpuMs: 0, rbMs: 0, spec: { steps: 0, drafted: 0, accepted: 0 }, rng }
       const encP = device.createCommandEncoder()
       const lastP = actBuf(Hd)
       encP.copyBufferToBuffer(pfx.fn, pfx.lastRow * Hd * 4, lastP, 0, Hd * 4)
@@ -1594,6 +1597,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         gpuMs: gpuMs / nd,
         rbMs: rbMs / nd,
         spec: { steps: specSteps, drafted, accepted },
+        rng,
       }
     } finally {
       SMALLM = 0 // encode-time flag; a throw mid-encode must not leak it into other paths
@@ -1744,7 +1748,54 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
 
     let r: RawGenResult
-    if (genOpts.promptLookup) {
+    if (genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+      // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
+      // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
+      // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
+      // the continuation re-feeds the last emitted token at its position (the composition the
+      // reuse gates prove bit-exact), and a sampled continuation takes over the probation's
+      // RNG mid-stream, so the draw sequence is exactly a single run's.
+      const r1 = await generatePldImpl(prefillTokens, posBase, PLD_PROBATION, genOpts, fullHistory)
+      const E = r1.tokens.length
+      if (E < PLD_PROBATION) {
+        r = r1 // stopped or aborted inside the window: nothing left to decide
+      } else {
+        const keep = pldWorthIt(E, r1.spec?.steps ?? 0, sampled || hasProcessors)
+        const ids2 = [r1.tokens[E - 1]] // re-feed the last emitted token (its K/V is unwritten)
+        const pos2 = posBase + prefillTokens.length + E - 1
+        const n2 = maxTokens - E
+        let r2: RawGenResult
+        if (keep) {
+          r2 = await generatePldImpl(ids2, pos2, n2, genOpts, fullHistory, r1.rng)
+        } else if (sampled || hasProcessors) {
+          r2 = await generateSampledImpl(ids2, pos2, n2, genOpts, fullHistory, r1.rng)
+        } else {
+          const hist = fullHistory
+          r2 = await generateImpl(ids2, pos2, n2, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
+          hist.push(...r2.tokens) // plain greedy does not touch history; the PLD/sampled impls push their own
+        }
+        const total = E + r2.tokens.length
+        const decodeMs = r1.decodeMs + r2.prefillMs + r2.decodeMs // the 1-token re-feed is decode work
+        const w1 = Math.max(1, E - 1)
+        const w2 = Math.max(0, r2.tokens.length)
+        r = {
+          prefillMs: r1.prefillMs,
+          decodeMs,
+          tokPerSec: Math.max(1, total - 1) / (decodeMs / 1000),
+          tokens: [...r1.tokens, ...r2.tokens],
+          firstArgmax: r1.firstArgmax,
+          recMs: (r1.recMs * w1 + r2.recMs * w2) / (w1 + w2),
+          gpuMs: (r1.gpuMs * w1 + r2.gpuMs * w2) / (w1 + w2),
+          rbMs: (r1.rbMs * w1 + r2.rbMs * w2) / (w1 + w2),
+          spec: {
+            steps: (r1.spec?.steps ?? 0) + (r2.spec?.steps ?? 0),
+            drafted: (r1.spec?.drafted ?? 0) + (r2.spec?.drafted ?? 0),
+            accepted: (r1.spec?.accepted ?? 0) + (r2.spec?.accepted ?? 0),
+            bailed: !keep,
+          },
+        }
+      }
+    } else if (genOpts.promptLookup) {
       r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else if (sampled || hasProcessors) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
