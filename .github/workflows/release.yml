@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-      contents: read
+      contents: write # npm publish needs only read; the GitHub Release step below needs write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -34,3 +34,9 @@ jobs:
           [ "$pkg" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match package version $pkg"; exit 1; }
       # prepublishOnly runs the build + publint/attw before the actual publish.
       - run: npm publish
+      # Mirror the npm release as a GitHub Release (auto-generated notes from the commit log),
+      # so the repo's Releases page always matches what is on npm.
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "bitgpu ${GITHUB_REF_NAME#v}" --generate-notes
