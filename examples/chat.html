@@ -64,6 +64,10 @@
     input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
     .storage { font-size: 12px; color: var(--muted); display: flex; gap: 10px; align-items: center; padding-top: 6px; }
     .storage button { font-size: 12px; padding: 3px 8px; }
+    #schemaBox { display: none; padding: 8px 0 2px; }
+    #schemaBox.show { display: block; }
+    #schemaBox .hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    #schema { width: 100%; min-height: 96px; font: 12.5px/1.5 ui-monospace, monospace; border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--fg); padding: 8px 10px; resize: vertical; }
   </style>
 </head>
 <body>
@@ -87,6 +91,14 @@
       <div class="right">
         <button id="clear" disabled>Clear chat</button>
       </div>
+    </div>
+    <div id="schemaBox">
+      <div class="hint">Optional JSON Schema (subset: type, properties, required, additionalProperties, items, minItems/maxItems, enum) - the reply <b>cannot</b> violate it. Clear to allow any valid JSON.</div>
+      <textarea id="schema" spellcheck="false">{
+  "type": "array", "minItems": 5, "maxItems": 5,
+  "items": { "type": "object", "required": ["name", "population"], "additionalProperties": false,
+             "properties": { "name": { "type": "string" }, "population": { "type": "number" } } }
+}</textarea>
     </div>
     <div id="status">idle - pick a model and press Load. The model runs on <b>your</b> GPU; nothing leaves this page.</div>
     <progress id="prog" value="0" max="1" hidden></progress>
@@ -231,9 +243,9 @@
 
     // ── chat ──
     const setPlaceholder = () => {
-      $('prompt').placeholder = $('jsonMode').checked
-        ? 'Ask for data + shape: "the 5 largest cities in Turkey as {name, population} objects"'
-        : 'Say something...';
+      const on = $('jsonMode').checked;
+      $('prompt').placeholder = on ? 'Ask for data: "the 5 largest cities in Turkey with populations"' : 'Say something...';
+      $('schemaBox').classList.toggle('show', on);
     };
     $('jsonMode').onchange = setPlaceholder;
 
@@ -270,10 +282,18 @@
       out.classList.add('pending');
       try {
         const json = $('jsonMode').checked;
+        let format;
+        if (json) {
+          const st = $('schema').value.trim();
+          if (st) {
+            try { format = { json: { schema: JSON.parse(st) } }; }
+            catch { throw new Error('the schema box does not contain valid JSON'); }
+          } else format = 'json';
+        }
         const r = await chat.send(messages, {
           temperature: 0.5, topK: 20, repetitionPenalty: 1.1,
           maxTokens: json ? 320 : 512,
-          format: json ? 'json' : undefined,
+          format,
           promptLookup: json ? undefined : 'auto',
           signal: abort.signal,
           onText: (d) => { out.textContent += d; out.scrollIntoView({ block: 'end' }); },

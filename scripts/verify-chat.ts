@@ -15,7 +15,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createChat, ChatTokenizer, ThinkSplitter, type ChatMessage } from '../src/chat/index'
-import { JsonMachine, TokenByteTable } from '../src/chat/json'
+import { JsonMachine, TokenByteTable, validateJsonSchema } from '../src/chat/json'
 import type { Engine, GenerateOptions, GenerateResult } from '../src/types'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -408,6 +408,82 @@ console.log('(D) JSON constrained decoding')
   const steps3 = [[tk.encode('<think>', false)[0], id('[')], [id(']')], [tk.eosTokenId]]
   const jr3 = await (await createChat(candEngine(steps3), { tokenizer: { json: tj, config: tc } })).send([{ role: 'user', content: 'x' }], { format: 'json' })
   check('mock e2e: added tokens (e.g. <think>) never enter JSON output', jr3.text === '[]', JSON.stringify(jr3.text))
+
+  // ── (E) JSON Schema enforcement ──
+  console.log('(E) JSON Schema enforcement')
+  const throws = (fn: () => void): string | null => {
+    try { fn(); return null } catch (e) { return (e as Error).message }
+  }
+  check('schema: unsupported keyword throws', /unsupported JSON Schema keyword.*pattern/.test(throws(() => validateJsonSchema({ type: 'object', pattern: 'x' } as never)) ?? ''))
+  check('schema: scalar root throws', /root must be an object or array/.test(throws(() => validateJsonSchema({ type: 'string' })) ?? ''))
+  check('schema: enum needing escapes throws', /require JSON escaping/.test(throws(() => validateJsonSchema({ type: 'object', properties: { a: { enum: ['ok', 'not "ok"'] } } })) ?? ''))
+  check('schema: required key missing from properties throws', /missing from properties/.test(throws(() => validateJsonSchema({ type: 'object', required: ['x'], properties: { y: {} } })) ?? ''))
+  check('schema: minItems > maxItems throws', /minItems > maxItems/.test(throws(() => validateJsonSchema({ type: 'array', minItems: 3, maxItems: 1 })) ?? ''))
+
+  const enc2 = new TextEncoder()
+  const feedS = (schema: import('../src/chat/json').JsonSchema, s: string): { ok: boolean; complete: boolean } => {
+    const m = new JsonMachine(schema)
+    const ok = m.feed(enc2.encode(s))
+    return { ok, complete: ok && m.complete }
+  }
+  const TURKEY: import('../src/chat/json').JsonSchema = {
+    type: 'array', minItems: 5, maxItems: 5,
+    items: { type: 'object', required: ['name', 'population'], additionalProperties: false, properties: { name: { type: 'string' }, population: { type: 'number' } } },
+  }
+  const item = (n: string, p: number): string => `{"name":${JSON.stringify(n)},"population":${p}}`
+  check('schema: object root rejected when root is array', !feedS(TURKEY, '{').ok)
+  check('schema: 5-item conforming doc completes', feedS(TURKEY, `[${[1, 2, 3, 4, 5].map((i) => item('c' + i, i)).join(',')}]`).complete)
+  check('schema: closing at 4 items rejected (minItems)', !feedS(TURKEY, `[${[1, 2, 3, 4].map((i) => item('c' + i, i)).join(',')}]`).ok)
+  check('schema: a 6th item rejected (maxItems)', !feedS(TURKEY, `[${[1, 2, 3, 4, 5].map((i) => item('c' + i, i)).join(',')},`).ok)
+  check('schema: unknown key rejected at first byte (additionalProperties false)', !feedS(TURKEY, '[{"x').ok)
+  check('schema: duplicate key rejected', !feedS(TURKEY, '[{"name":"a","name').ok)
+  check('schema: object close without required keys rejected', !feedS(TURKEY, '[{"name":"a"}').ok)
+  check('schema: wrong value type rejected (string where number)', !feedS(TURKEY, '[{"name":"a","population":"').ok)
+  check('schema: comma after all allowed keys present rejected', !feedS(TURKEY, '[{"name":"a","population":1,').ok)
+  check('schema: maxItems 0 keeps the array empty', feedS({ type: 'array', maxItems: 0 }, '[]').complete && !feedS({ type: 'array', maxItems: 0 }, '[1').ok)
+  const INT = { type: 'object' as const, required: ['n'], properties: { n: { type: 'integer' as const } } }
+  check('schema: integer bans fraction and exponent', feedS(INT, '{"n":42}').complete && !feedS(INT, '{"n":4.').ok && !feedS(INT, '{"n":4e').ok)
+  const ENUM = { type: 'object' as const, required: ['mood'], additionalProperties: false, properties: { mood: { enum: ['positive', 'negative', 'neutral'] } } }
+  check('schema: enum accepts a listed literal', feedS(ENUM, '{"mood":"neutral"}').complete)
+  check('schema: enum rejects a non-prefix first byte', !feedS(ENUM, '{"mood":"x').ok)
+  check('schema: enum rejects closing on an incomplete literal', !feedS(ENUM, '{"mood":"neg"').ok)
+  check('schema: enum diverging past a shared prefix rejected', !feedS(ENUM, '{"mood":"negx').ok)
+  check('schema: enum string rejects escapes', !feedS(ENUM, '{"mood":"\\\\').ok)
+  const NEST = { type: 'object' as const, required: ['tags'], properties: { tags: { type: 'array' as const, minItems: 1, items: { enum: ['a', 'b'] } } } }
+  check('schema: nested array of enums enforced', feedS(NEST, '{"tags":["a","b"]}').complete && !feedS(NEST, '{"tags":[]').ok && !feedS(NEST, '{"tags":["c').ok)
+  check('schema: booleans and null typed', feedS({ type: 'object' as const, properties: { b: { type: 'boolean' as const } } }, '{"b":true}').complete && !feedS({ type: 'object' as const, properties: { b: { type: 'boolean' as const } } }, '{"b":n').ok)
+  // structural-whitespace run cap: a model denied prose must not be able to loop on whitespace
+  // (the 8B did exactly that on real hardware and burned its whole budget producing "[ ")
+  check('ws cap: pretty-printing survives', feedS({ type: 'array' as const }, '[\n  {\n    "a": 1\n  },\n  2\n]').complete)
+  check('ws cap: a 17-byte structural whitespace run is rejected', !feedS({ type: 'array' as const }, '[' + ' '.repeat(17)).ok)
+  check('ws cap: spaces inside strings are content, not capped', feedS({ type: 'array' as const }, `["${' '.repeat(40)}"]`).complete)
+  check('ws cap: run resets after a structural byte', feedS({ type: 'array' as const }, '[' + ' '.repeat(10) + '1,' + ' '.repeat(10) + '2]').complete)
+
+  // e2e: the model "wants" the Ankara failure (open '{', close after 1 item) - the schema forbids
+  // both. Candidates put the wrong choice FIRST at every decision point.
+  const CITY = { type: 'array' as const, minItems: 2, maxItems: 2, items: { type: 'object' as const, required: ['name'], additionalProperties: false, properties: { name: { type: 'string' as const } } } }
+  const chars = (s: string): number[][] => [...s].map((ch) => [id(ch)]) // one single-byte token per step
+  const oneItem = (n: string): number[][] => [
+    [id('{')],
+    [id('}'), id('"')], // wants to close the empty object -> the required key is forced
+    ...chars('name'),
+    [id('"')], [id(':')], [id('"')], [id(n)], [id('"')],
+    [id(']'), id('}')], // wants to end the array from inside the item -> } forced
+  ]
+  const stepsCity: number[][] = [
+    [id('{'), id('[')], // wants an object root (the Ankara failure) -> [ forced
+    ...oneItem('A'),
+    [id(']'), id(',')], // wants to close at 1 item -> , forced (minItems 2)
+    ...oneItem('B'),
+    [id(','), id(']')], // wants a 3rd item -> ] forced (maxItems 2)
+    [id('x'), tk.eosTokenId], // complete -> only eos permitted
+  ]
+  const cChat = await createChat(candEngine(stepsCity), { tokenizer: { json: tj, config: tc } })
+  const cr = await cChat.send([{ role: 'user', content: 'cities' }], { format: { json: { schema: CITY } } })
+  let cParsed: unknown = null
+  try { cParsed = JSON.parse(cr.text) } catch { /* fail below */ }
+  check('schema e2e: forced [ root, forced 2nd item, forced ] at max - parses to 2 items', Array.isArray(cParsed) && (cParsed as unknown[]).length === 2 && cr.finishReason === 'stop', JSON.stringify(cr.text))
+  check('schema e2e: unsupported schema throws at send', /unsupported JSON Schema keyword/.test((await cChat.send([{ role: 'user', content: 'x' }], { format: { json: { schema: { type: 'object', oneOf: [] } as never } } }).catch((e) => e.message))))
 }
 
 // ── (C) parity vs transformers.js on a real model (auto-skips when not staged) ───────────────

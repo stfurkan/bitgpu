@@ -12,12 +12,13 @@
 import type { Engine, GenerateOptions, GenerateResult } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
 import { ThinkSplitter, StopScanner } from './think'
-import { makeJsonFilter, TokenByteTable } from './json'
+import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
 
 export { ChatTokenizer } from './tokenizer'
 export type { ChatMessage, DecoderStream } from './tokenizer'
 export { ThinkSplitter, StopScanner } from './think'
-export { JsonMachine } from './json'
+export { JsonMachine, validateJsonSchema } from './json'
+export type { JsonSchema } from './json'
 
 /** Options for {@link createChat}. Point it at the model directory (which already hosts
  *  tokenizer.json + tokenizer_config.json next to the manifest), at explicit URLs, or at
@@ -73,10 +74,14 @@ export interface ChatSendOptions {
   /** Constrained decoding. `'json'` guarantees the reply is one complete, valid JSON value with
    *  an object or array root: every generated token is validated against an incremental JSON
    *  machine (invalid candidates are never sampled), and generation ends when the root value
-   *  closes. Check `finishReason === 'stop'` - `'length'` means maxTokens cut the value short.
-   *  Forces `think: false` and disables `promptLookup`. Constraint is structural, not semantic:
-   *  prompt for the shape you want; this makes the output PARSE, not make sense. */
-  format?: 'json'
+   *  closes. `{ json: { schema } }` additionally enforces a JSON Schema SUBSET token-by-token -
+   *  value types, `properties`/`required`/`additionalProperties: false`, `items`,
+   *  `minItems`/`maxItems`, string `enum`, `integer` - so the reply cannot even be shaped wrong
+   *  (an array that must hold 5 items cannot close at 1). Unsupported schema keywords throw
+   *  loudly up front. Check `finishReason === 'stop'` - `'length'` means maxTokens cut the value
+   *  short. Forces `think: false` and disables `promptLookup`. The guarantee is structural, not
+   *  semantic: a schema makes the output parse into the right shape, not be true. */
+  format?: 'json' | { json: { schema?: JsonSchema } }
 }
 
 export interface ChatResult {
@@ -219,7 +224,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
 
   async function sendImpl(messages: ChatMessage[], o: ChatSendOptions = {}): Promise<ChatResult> {
     if (messages.length === 0) throw new Error('bitgpu/chat: no messages')
-    const json = o.format === 'json'
+    const json = o.format !== undefined
+    const schema = typeof o.format === 'object' ? (o.format.json.schema ?? null) : null
+    if (schema) validateJsonSchema(schema) // throws on anything outside the enforceable subset
     const think = !json && (o.think ?? false) // a think block cannot be valid JSON; format wins
     const canReuse = (o.reuseCache ?? true) && !think && wrap !== null && isCleanAppend(committed, messages)
 
@@ -267,7 +274,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // format:'json' - the candidate filter permits only tokens that keep the text a valid JSON
     // prefix; once the root value completes it permits only eos, so generation ends naturally
     // through the normal stop path. advance() moves the real machine on each emitted token.
-    const jf = json ? makeJsonFilter((byteTable ??= new TokenByteTable(tk)), tk.eosTokenId) : null
+    const jf = json ? makeJsonFilter((byteTable ??= new TokenByteTable(tk)), tk.eosTokenId, schema) : null
     let result: GenerateResult
     try {
       result = await engine.generate(inputTokenIds, {

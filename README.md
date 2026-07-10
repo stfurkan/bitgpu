@@ -124,9 +124,27 @@ Constrained decoding: every candidate token is validated against an incremental 
 machine before it can be sampled, so the reply is structurally guaranteed to be one complete,
 valid JSON value (object or array root) - small 1-bit models free-form JSON unreliably, and this
 removes that failure class entirely. Generation ends when the root value closes
-(`finishReason: 'length'` means `maxTokens` cut it short - raise it). The constraint is
-structural, not semantic: prompt for the shape you want. Built on the engine's generic
-`candidateFilter` hook (see `GenerateOptions`), which is open for custom grammars.
+(`finishReason: 'length'` means `maxTokens` cut it short - raise it).
+
+Pass a **schema** and the shape is enforced token-by-token too - the model cannot open an object
+where an array is required, stop at 1 item when 5 are demanded, invent keys, drift a type, or
+answer outside an enum:
+
+```ts
+await chat.send(messages, { format: { json: { schema: {
+  type: 'array', minItems: 5, maxItems: 5,
+  items: { type: 'object', required: ['name', 'population'], additionalProperties: false,
+           properties: { name: { type: 'string' }, population: { type: 'number' } } },
+} } } })
+// or guaranteed classification:  { properties: { mood: { enum: ['positive', 'negative', 'neutral'] } } }
+```
+
+Enforceable subset: `type` (incl. `integer`), `properties` / `required` /
+`additionalProperties: false`, `items`, `minItems` / `maxItems`, string `enum`, nested to any
+depth. Anything else (`pattern`, `minimum`, `oneOf`, `$ref`, ...) **throws up front** - never
+silently ignored. The guarantee is structural, not semantic: a schema makes the output parse
+into the right shape, not be true. Built on the engine's generic `candidateFilter` hook (see
+`GenerateOptions`), which is open for custom grammars.
 
 The two text libraries (`@huggingface/tokenizers`, `@huggingface/jinja` - pure JS, Apache-2.0,
 see THIRD_PARTY_LICENSES.md) are inlined into `dist/chat.js` at build time, the same way the

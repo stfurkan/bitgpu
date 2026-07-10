@@ -355,6 +355,17 @@
         const jpOk = jpParsed !== null && jp.finishReason === 'stop';
         ok = ok && jpOk;
         log(`  ${jpOk ? '[PASS]' : '[FAIL]'} chat json mode forces structure on a prose prompt (${jp.tokens.length} tokens)`);
+        // schema enforcement on real hardware: exactly 3 {name: string, population: number}
+        // items - the model CANNOT return one object, stop early, or drift keys/types.
+        const CITY_SCHEMA = { type: 'array', minItems: 3, maxItems: 3, items: { type: 'object', required: ['name', 'population'], additionalProperties: false, properties: { name: { type: 'string' }, population: { type: 'number' } } } };
+        // greedy: deterministic per model (the plain json checks above cover the sampled path)
+        const js = await chat.send([{ role: 'user', content: 'The 3 largest cities in Turkey with their populations.' }], { format: { json: { schema: CITY_SCHEMA } }, maxTokens: 256 });
+        chat.reset();
+        let jsParsed = null; try { jsParsed = JSON.parse(js.text); } catch { /* stays null */ }
+        const jsOk = Array.isArray(jsParsed) && jsParsed.length === 3 && jsParsed.every((x) => typeof x === 'object' && typeof x.name === 'string' && typeof x.population === 'number' && Object.keys(x).length === 2) && js.finishReason === 'stop';
+        ok = ok && jsOk;
+        log(`  ${jsOk ? '[PASS]' : '[FAIL]'} chat json schema enforced (3 items, exact keys/types, ${js.tokens.length} tokens, ${js.tokensPerSecond.toFixed(1)} tok/s)`);
+        log(`    schema'd: ${js.text.replace(/\s+/g, ' ').slice(0, 110)}`);
       }
 
       // 8) f16 KV cache mode (kvCache: 'f16'). Within-mode behavior must stay EXACT (determinism,
