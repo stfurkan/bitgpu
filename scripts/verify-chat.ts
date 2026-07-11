@@ -467,6 +467,54 @@ console.log('(D) JSON constrained decoding')
   check('ws cap: spaces inside strings are content, not capped', feedS({ type: 'array' as const }, `["${' '.repeat(40)}"]`).complete)
   check('ws cap: run resets after a structural byte', feedS({ type: 'array' as const }, '[' + ' '.repeat(10) + '1,' + ' '.repeat(10) + '2]').complete)
 
+  // enum implies string: a type-less enum property must not admit any other value shape
+  check('enum value cannot open an object', !feedS(ENUM, '{"mood":{').ok)
+  check('enum value cannot be a number', !feedS(ENUM, '{"mood":1').ok)
+
+  // oneOf: discriminated unions (validation)
+  const BULLETS = { type: 'object' as const, required: ['type', 'title'], additionalProperties: false, properties: { type: { enum: ['bullets'] }, title: { type: 'string' as const }, bullets: { type: 'array' as const, items: { type: 'string' as const } } } }
+  const QUOTE = { type: 'object' as const, required: ['type', 'quote'], additionalProperties: false, properties: { type: { enum: ['quote'] }, quote: { type: 'string' as const }, title: { type: 'string' as const } } }
+  const SLIDE = { oneOf: [BULLETS, QUOTE] }
+  check('oneOf: valid discriminated union validates', throws(() => validateJsonSchema(SLIDE)) === null)
+  check('oneOf: combining with other keywords throws', /cannot combine/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, QUOTE], type: 'object' } as never)) ?? ''))
+  check('oneOf: single branch throws', /at least 2 branches/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS] })) ?? ''))
+  check('oneOf: non-strict branch throws', /additionalProperties: false/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, { type: 'object', properties: { type: { enum: ['x'] } }, required: ['type'] }] })) ?? ''))
+  check('oneOf: missing discriminator throws', /DISCRIMINATED/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, { ...QUOTE, required: ['quote'] }] })) ?? ''))
+  check('oneOf: conflicting shared property throws', /must be identical/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, { ...QUOTE, properties: { ...QUOTE.properties, title: { type: 'number' } } }] } as never)) ?? ''))
+
+  // oneOf: machine enforcement
+  check('oneOf: bullets branch completes', feedS(SLIDE, '{"type":"bullets","title":"T"}').complete)
+  check('oneOf: quote branch completes', feedS(SLIDE, '{"type":"quote","quote":"Q"}').complete)
+  check('oneOf: shared key before the discriminator allowed', feedS(SLIDE, '{"title":"T","type":"quote","quote":"Q"}').complete)
+  check('oneOf: cross-branch key after the discriminator rejected', !feedS(SLIDE, '{"type":"quote","b').ok)
+  check('oneOf: branch-unique key prunes before the discriminator', !feedS(SLIDE, '{"bullets":[],"type":"q').ok && feedS(SLIDE, '{"bullets":[],"type":"bullets","title":"T"}').complete)
+  check('oneOf: close without the live branch required keys rejected', !feedS(SLIDE, '{"type":"bullets"}').ok)
+  check('oneOf: discriminator outside the enum rejected', !feedS(SLIDE, '{"type":"x').ok)
+  check('oneOf: non-object root rejected', !feedS(SLIDE, '[').ok)
+
+  // integer minimum/maximum: prefix feasibility (the machine can never get stuck mid-number)
+  const RNG = (minimum: number, maximum: number): import('../src/chat/json').JsonSchema => ({ type: 'object', required: ['n'], properties: { n: { type: 'integer', minimum, maximum } } })
+  check('range: bounds validate on integers only', /require type 'integer'/.test(throws(() => validateJsonSchema({ type: 'object', properties: { n: { type: 'number', minimum: 1 } } })) ?? ''))
+  check('range: minimum > maximum throws', /minimum > maximum/.test(throws(() => validateJsonSchema({ type: 'object', properties: { n: { type: 'integer', minimum: 5, maximum: 1 } } })) ?? ''))
+  check('range: in-range values complete', feedS(RNG(1, 10), '{"n":5}').complete && feedS(RNG(1, 10), '{"n":10}').complete && feedS(RNG(1, 10), '{"n":1}').complete)
+  check('range: digit that overshoots rejected immediately', !feedS(RNG(1, 10), '{"n":11').ok)
+  check('range: infeasible zero rejected', !feedS(RNG(1, 10), '{"n":0').ok)
+  check('range: too-short number cannot terminate but can grow', !feedS(RNG(100, 999), '{"n":5}').ok && feedS(RNG(100, 999), '{"n":555}').complete)
+  check('range: negative bounds enforced', feedS(RNG(-50, -2), '{"n":-7}').complete && !feedS(RNG(-50, -2), '{"n":7').ok && !feedS(RNG(-50, -2), '{"n":-0').ok && !feedS(RNG(-50, -2), '{"n":-100').ok)
+  check('range: minus sign needs an attainable negative', !feedS(RNG(1, 10), '{"n":-').ok && feedS(RNG(-3, 10), '{"n":-3}').complete)
+
+  // string minLength/maxLength: code points, not bytes
+  const LEN = { type: 'object' as const, required: ['s'], properties: { s: { type: 'string' as const, minLength: 2, maxLength: 4 } } }
+  check('length: bounds validate on strings only', /require type 'string'/.test(throws(() => validateJsonSchema({ type: 'object', properties: { s: { type: 'integer', maxLength: 3 } } } as never)) ?? ''))
+  check('length: enum + length throws', /cannot combine with enum/.test(throws(() => validateJsonSchema({ type: 'object', properties: { s: { type: 'string', enum: ['a'], maxLength: 3 } } } as never)) ?? ''))
+  check('length: in-range strings complete', feedS(LEN, '{"s":"ab"}').complete && feedS(LEN, '{"s":"abcd"}').complete)
+  check('length: too short cannot close', !feedS(LEN, '{"s":"a"').ok)
+  check('length: character past maxLength rejected', !feedS(LEN, '{"s":"abcde').ok)
+  check('length: multi-byte characters count once', feedS(LEN, '{"s":"éé"}').complete && !feedS(LEN, '{"s":"ééééé').ok)
+  check('length: escapes count once', feedS(LEN, '{"s":"\\n\\t"}').complete && !feedS(LEN, '{"s":"\\n"').ok)
+  const LEN0 = { type: 'object' as const, properties: { s: { type: 'string' as const, maxLength: 0 } } }
+  check('length: maxLength 0 admits only the empty string', feedS(LEN0, '{"s":""}').complete && !feedS(LEN0, '{"s":"a').ok)
+
   // e2e: the model "wants" the Ankara failure (open '{', close after 1 item) - the schema forbids
   // both. Candidates put the wrong choice FIRST at every decision point.
   const CITY = { type: 'array' as const, minItems: 2, maxItems: 2, items: { type: 'object' as const, required: ['name'], additionalProperties: false, properties: { name: { type: 'string' as const } } } }
@@ -491,7 +539,7 @@ console.log('(D) JSON constrained decoding')
   let cParsed: unknown = null
   try { cParsed = JSON.parse(cr.text) } catch { /* fail below */ }
   check('schema e2e: forced [ root, forced 2nd item, forced ] at max - parses to 2 items', Array.isArray(cParsed) && (cParsed as unknown[]).length === 2 && cr.finishReason === 'stop', JSON.stringify(cr.text))
-  check('schema e2e: unsupported schema throws at send', /unsupported JSON Schema keyword/.test((await cChat.send([{ role: 'user', content: 'x' }], { format: { json: { schema: { type: 'object', oneOf: [] } as never } } }).catch((e) => e.message))))
+  check('schema e2e: unsupported schema throws at send', /unsupported JSON Schema keyword/.test((await cChat.send([{ role: 'user', content: 'x' }], { format: { json: { schema: { type: 'object', $ref: '#/x' } as never } } }).catch((e) => e.message))))
 
   // ── (F) tool calling ──
   console.log('(F) tool calling')

@@ -20,6 +20,7 @@ import type {
   ForwardResult,
   GenerateOptions,
   GenerateResult,
+  TokenLogprobs,
 } from './types'
 
 type Field = ['f' | 'u', number]
@@ -91,6 +92,8 @@ interface RawGenResult {
   /** The sampler RNG as it stands after this call - promptLookup:'auto' hands it to the plain
    *  continuation so the draw stream continues exactly where the probation left off. */
   rng?: MT19937
+  /** Per-emitted-token logprob records (sampled path only, when GenerateOptions.logprobs set). */
+  lp?: TokenLogprobs[]
 }
 
 /** Internal engine handle: the public {@link Engine} surface plus diagnostics used by the
@@ -333,7 +336,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     pipelines[name] = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main', constants } })
   }
   const ROWS_MR = 4 // output rows per workgroup in the multi-row GEMV
-  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked']]
+  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked'], ['logsumexp']]
   if (useSG) {
     for (const n of ['rmsnorm_sg', 'attention_sg', 'matmul_split_sg', 'matmul_q2_sg', 'rmsnorm_rope_sg']) specs.push([n, { SG: sgMax }])
     for (const n of ['matmul_split_sm', 'matmul_resid_sm', 'matmul_q2_sm']) specs.push([n, { SG: sgMax }]) // small-batch (M=2..9) verify-pass GEMVs
@@ -1219,6 +1222,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const sampled = genOpts.temperature != null && genOpts.temperature > 0 && genOpts.temperature !== 1
     const vocab = W.lm_head.N!
     const K = Math.max(1, Math.min(genOpts.topK ?? 20, vocab))
+    // logprobs: run extra argmax rounds when N exceeds the sampling top-K, but NEVER let it widen
+    // the sampling pool - the draw stays over the first K candidates, bit-identical with or
+    // without logprobs on.
+    const lpN = Math.max(0, Math.min(Math.floor(genOpts.logprobs ?? 0), 32, vocab))
+    const KT = Math.max(K, lpN)
     const temperature = genOpts.temperature ?? 1
     const penalty = genOpts.repetitionPenalty ?? 1
     const ngramN = genOpts.noRepeatNgramSize ?? 0
@@ -1230,11 +1238,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // persistent buffers (stable across steps for bind-group caching; not via actBuf)
     const tokBuf = device.createBuffer({ size: Math.max(1, nTokens) * 4, usage: S_ | CS | CD })
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS })
-    const candIds = device.createBuffer({ size: K * 4, usage: S_ | CS })
-    const candVals = device.createBuffer({ size: K * 4, usage: S_ | CS })
+    const candIds = device.createBuffer({ size: KT * 4, usage: S_ | CS })
+    const candVals = device.createBuffer({ size: KT * 4, usage: S_ | CS })
+    const lseBuf = device.createBuffer({ size: 4, usage: S_ | CS }) // log-sum-exp normalizer (logprobs)
     const affBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD }) // upper bound = full vocab can't exceed seq len
     const banBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD })
-    const rbBuf = device.createBuffer({ size: K * 8, usage: GPUBufferUsage.MAP_READ | CD })
+    const rbBuf = device.createBuffer({ size: KT * 8 + (lpN ? 4 : 0), usage: GPUBufferUsage.MAP_READ | CD })
     const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
 
     // upload the CPU-computed deduped id set + ngram bans for the current history; return their lengths
@@ -1245,25 +1254,54 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       if (ban.length) device.queue.writeBuffer(banBuf, 0, Uint32Array.from(ban))
       return { affLen: aff.length, banLen: ban.length }
     }
-    // penalty pre-filter + K masked-argmax, all in the given pass (after lm_head wrote lg)
+    // penalty pre-filter (+ logprobs normalizer) + KT masked-argmax, all in the given pass (after
+    // lm_head wrote lg). The log-sum-exp runs BEFORE the argmax rounds: those mask their winners
+    // in lg in place, which would corrupt the sum.
     const samplerChain = (pass: GPUComputePassEncoder, affLen: number, banLen: number): void => {
       setup(pass, 'sampler_penalty', [['u', affLen], ['u', banLen], ['f', penalty], ['u', 0xff800000]], [affBuf, banBuf], [lg])
       pass.dispatchWorkgroups(1)
-      for (let r = 0; r < K; r++) {
+      if (lpN) {
+        setup(pass, 'logsumexp', [['u', vocab], ['u', 0], ['u', 0], ['u', 0]], [lg], [lseBuf])
+        pass.dispatchWorkgroups(1)
+      }
+      for (let r = 0; r < KT; r++) {
         setup(pass, 'argmax_masked', [['u', vocab], ['u', r], ['u', 0], ['u', 0]], [lg], [candIds, candVals])
         pass.dispatchWorkgroups(1)
       }
     }
-    const readCands = async (): Promise<{ ci: Uint32Array; cv: Float32Array }> => {
+    const copyCands = (enc: GPUCommandEncoder): void => {
+      enc.copyBufferToBuffer(candIds, 0, rbBuf, 0, KT * 4)
+      enc.copyBufferToBuffer(candVals, 0, rbBuf, KT * 4, KT * 4)
+      if (lpN) enc.copyBufferToBuffer(lseBuf, 0, rbBuf, KT * 8, 4)
+    }
+    const readCands = async (): Promise<{ ci: Uint32Array; cv: Float32Array; lse: number }> => {
       await rbBuf.mapAsync(GPUMapMode.READ)
       const mapped = rbBuf.getMappedRange()
-      const ci = new Uint32Array(mapped.slice(0, K * 4))
-      const cv = new Float32Array(mapped.slice(K * 4, K * 8))
+      const ci = new Uint32Array(mapped.slice(0, KT * 4))
+      const cv = new Float32Array(mapped.slice(KT * 4, KT * 8))
+      const lse = lpN ? new Float32Array(mapped.slice(KT * 8, KT * 8 + 4))[0] : 0
       rbBuf.unmap()
-      return { ci, cv }
+      return { ci, cv, lse }
     }
-    // candidates are descending, so ci[0] is the argmax of the penalized logits (greedy+processors)
-    const pick = (ci: Uint32Array, cv: Float32Array): number => (sampled ? sampleFromCandidates(ci, cv, temperature, rng) : ci[0])
+    // logprobs bookkeeping: the chosen token's logit (set by every chooseToken path) and the
+    // per-emitted-token records (aligned with the returned tokens)
+    let chosenLogit = 0
+    const lpOut: TokenLogprobs[] | null = lpN ? [] : null
+    const recordLp = (ci: Uint32Array, cv: Float32Array, lse: number): void => {
+      if (!lpOut) return
+      const top: { id: number; logprob: number }[] = []
+      for (let i = 0; i < lpN; i++) top.push({ id: ci[i], logprob: cv[i] - lse })
+      lpOut.push({ logprob: chosenLogit - lse, top })
+    }
+    // candidates are descending, so ci[0] is the argmax of the penalized logits (greedy+processors);
+    // sampling and filtering see only the first K candidates (KT > K rounds exist for logprobs only)
+    const pick = (ciAll: Uint32Array, cvAll: Float32Array): number => {
+      const ci = ciAll.subarray(0, K)
+      const cv = cvAll.subarray(0, K)
+      const tk = sampled ? sampleFromCandidates(ci, cv, temperature, rng) : ci[0]
+      chosenLogit = cv[ci.indexOf(tk)]
+      return tk
+    }
     const filter = genOpts.candidateFilter
     // Constrained pick (candidateFilter): keep the permitted subset in rank order and pick within
     // it - greedy takes the best permitted, sampling renormalizes the draw over them (exactly one
@@ -1271,8 +1309,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // walk the FULL vocabulary in logit order (rare: valid grammars almost always admit a top-K
     // token) and rebuild up to K permitted candidates; a grammar that admits nothing is a bug in
     // the filter and fails loudly.
-    const chooseToken = async (ci: Uint32Array, cv: Float32Array): Promise<number> => {
-      if (!filter) return pick(ci, cv)
+    const chooseToken = async (ciAll: Uint32Array, cvAll: Float32Array): Promise<number> => {
+      if (!filter) return pick(ciAll, cvAll)
+      const ci = ciAll.subarray(0, K)
+      const cv = cvAll.subarray(0, K)
       const perm = new Set(filter(ci, cv))
       if (perm.size > 0) {
         const pIds: number[] = []
@@ -1282,9 +1322,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             pIds.push(ci[i])
             pVals.push(cv[i])
           }
-        return sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+        const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+        chosenLogit = pVals[pIds.indexOf(tk)]
+        return tk
       }
-      const all = await readback(lg, vocab) // penalized logits (already-rejected top-K entries may be masked; they resort to the tail)
+      const all = await readback(lg, vocab) // penalized logits; every argmax round masked its winner in place
+      // Restore the masked entries from the candidates already read back: the filter-rejected
+      // top-K re-check and fail again (filters are deterministic), and the extra logprobs-only
+      // rounds (K..KT) must stay reachable or logprobs would change constrained output.
+      for (let i = 0; i < ciAll.length; i++) all[ciAll[i]] = cvAll[i]
       const order = Array.from(all.keys()).sort((a, b) => all[b] - all[a] || a - b)
       const pIds: number[] = []
       const pVals: number[] = []
@@ -1302,7 +1348,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         }
       }
       if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
-      return sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+      const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+      chosenLogit = pVals[pIds.indexOf(tk)]
+      return tk
     }
 
     transients = [] // track prefill scratch so it can be destroyed once the prefill completes
@@ -1319,8 +1367,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       lmHead(pass, lastP, 1, lg)
       samplerChain(pass, pf.affLen, pf.banLen)
       pass.end()
-      encP.copyBufferToBuffer(candIds, 0, rbBuf, 0, K * 4)
-      encP.copyBufferToBuffer(candVals, 0, rbBuf, K * 4, K * 4)
+      copyCands(encP)
       device.queue.submit([encP.finish()])
       const first = await readCands() // mapAsync waits for the submitted work; no separate sync needed
       const firstTok = await chooseToken(first.ci, first.cv)
@@ -1332,6 +1379,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       if (!stopped) {
         gen.push(firstTok) // a stop token is never emitted or recorded, even at position 0
         history.push(firstTok)
+        recordLp(first.ci, first.cv, first.lse)
         onToken?.(firstTok)
         device.queue.writeBuffer(tokBuf, 0, new Uint32Array([firstTok]))
       }
@@ -1357,8 +1405,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         lmHead(p2, last, 1, lg)
         samplerChain(p2, affLen, banLen)
         p2.end()
-        enc.copyBufferToBuffer(candIds, 0, rbBuf, 0, K * 4)
-        enc.copyBufferToBuffer(candVals, 0, rbBuf, K * 4, K * 4)
+        copyCands(enc)
         device.queue.submit([enc.finish()])
         recMs += performance.now() - t
         t = performance.now()
@@ -1366,7 +1413,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         // work its copy depends on, so a separate onSubmittedWorkDone is a second full CPU-GPU
         // round-trip for nothing. The map wait is dominated by GPU time, so it is attributed to
         // gpuMs; the post-map array slicing is microseconds (rbMs stays for API stability).
-        const { ci, cv } = await readCands()
+        const { ci, cv, lse } = await readCands()
         gpuMs += performance.now() - t
         t = performance.now()
         const tk = await chooseToken(ci, cv)
@@ -1375,18 +1422,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         if (stopSet?.has(tk)) { stopped = true; break } // EOS: stop without emitting the stop token
         gen.push(tk)
         history.push(tk)
+        recordLp(ci, cv, lse)
         onToken?.(tk)
         device.queue.writeBuffer(tokBuf, idxOut * 4, new Uint32Array([tk])) // feed the next step's embed gather
       }
       const decodeMs = performance.now() - t1
       const nd = Math.max(1, gen.length - 1)
-      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd, rng }
+      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd, rng, ...(lpOut ? { lp: lpOut } : {}) }
     } finally {
       // Restore the shared flags even when a step throws, and release this call's GPU buffers.
       poolUse(null)
       flushTransients()
       transients = null
-      for (const b of [tokBuf, lg, candIds, candVals, affBuf, banBuf, rbBuf, embG]) b.destroy()
+      for (const b of [tokBuf, lg, candIds, candVals, lseBuf, affBuf, banBuf, rbBuf, embG]) b.destroy()
     }
   }
 
@@ -1767,8 +1815,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
     // A candidateFilter needs the per-step sampler-chain path (candidates on the CPU every
     // token) and cannot speculate (draft verification has no per-row filter state) - so it
-    // forces that path and disables promptLookup, as documented on the option.
-    const hasFilter = !!genOpts.candidateFilter
+    // forces that path and disables promptLookup, as documented on the option. logprobs need
+    // the same per-step candidate readback, so they route identically.
+    const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
     let r: RawGenResult
     if (!hasFilter && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
       // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
@@ -1836,6 +1885,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       tokensPerSecond: r.tokPerSec,
       timing: { recordMs: r.recMs, gpuMs: r.gpuMs, readbackMs: r.rbMs },
       ...(r.spec ? { speculation: r.spec } : {}),
+      ...(r.lp ? { logprobs: r.lp } : {}),
     }
   }
 

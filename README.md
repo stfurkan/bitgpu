@@ -144,11 +144,31 @@ await chat.send(messages, { format: { json: { schema: {
 ```
 
 Enforceable subset: `type` (incl. `integer`), `properties` / `required` /
-`additionalProperties: false`, `items`, `minItems` / `maxItems`, string `enum`, nested to any
-depth. Anything else (`pattern`, `minimum`, `oneOf`, `$ref`, ...) **throws up front** - never
-silently ignored. The guarantee is structural, not semantic: a schema makes the output parse
-into the right shape, not be true. Built on the engine's generic `candidateFilter` hook (see
-`GenerateOptions`), which is open for custom grammars.
+`additionalProperties: false`, `items`, `minItems` / `maxItems`, string `enum`,
+`minLength` / `maxLength` (code points), integer `minimum` / `maximum` (with prefix
+feasibility, so the model can never be trapped mid-number), and `oneOf` as a **discriminated
+union** - object branches sharing one required property whose single-value `enum` differs per
+branch, e.g. a slide that is either `{type: 'bullets', ...}` or `{type: 'quote', ...}`; the
+machine tracks the live branches until the discriminator commits. All nested to any depth.
+Anything else (`pattern`, float ranges, general `oneOf`, `$ref`, ...) **throws up front** -
+never silently ignored. The guarantee is structural, not semantic: a schema makes the output
+parse into the right shape, not be true. Built on the engine's generic `candidateFilter` hook
+(see `GenerateOptions`), which is open for custom grammars.
+
+### Confidence (`logprobs`)
+
+Pass `logprobs: N` (engine or chat options) and every emitted token comes back with its TRUE
+logprob plus the top-N alternatives - log-softmax over the full vocabulary, computed exactly via
+a GPU log-sum-exp (one extra f32 readback per step, not a top-K approximation):
+
+```ts
+const r = await chat.send(messages, { logprobs: 5 })
+const confidence = Math.exp(r.logprobs[0].logprob) // p of the first token; low = the model is guessing
+```
+
+Use it to flag low-confidence answers, build "are you sure?" UX, or detect when a
+schema/tool filter had to force a token the model ranked poorly. Greedy output is bit-identical
+with or without it; `promptLookup` is disabled for the turn.
 
 ### Tool calling (`tools`)
 
@@ -259,6 +279,11 @@ WebGPU with compute is required (a clear `WebGPUUnavailableError` is thrown othe
 | Safari 26+ (macOS/iOS) | subgroups on Apple GPUs | Metal; low dispatch overhead |
 | Firefox | workgroup fallback | WebGPU shipped, but per-dispatch overhead is high; expect low throughput |
 | Android Chrome | device-dependent | works where WebGPU is exposed; VRAM limits apply |
+
+The engine has no DOM dependencies and WebGPU is available in workers, so the whole stack runs
+off the main thread: [examples/worker.html](examples/worker.html) is a complete copy-paste
+pattern (module worker + a four-message protocol) whose page stays at full frame rate through
+load, prefill, and decode.
 
 ## CDN usage
 

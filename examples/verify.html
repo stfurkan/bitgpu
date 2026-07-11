@@ -293,6 +293,42 @@
       log(`  ${guardOk ? '[PASS]' : '[FAIL]'} length guard throws when the prompt exceeds maxSeqLen (oversized maxTokens clamps)`);
       engine.resetCache();
 
+      // 6g) logprobs: true log-softmax over the full vocab (GPU logsumexp normalizer). A greedy
+      // run with logprobs must emit the exact same tokens as plain greedy (the sampler-path
+      // routing may not change output), every record must be internally consistent (aligned,
+      // descending, chosen == top-1 under greedy, probabilities summing < 1), and the numbers
+      // must be deterministic.
+      const lpRef = await engine.generate(ids, { maxTokens: 16 });
+      engine.resetCache();
+      const lp1 = await engine.generate(ids, { maxTokens: 16, logprobs: 5 });
+      engine.resetCache();
+      const lpTok = lp1.tokens.length === lpRef.tokens.length && lp1.tokens.every((t, i) => t === lpRef.tokens[i]);
+      ok = ok && lpTok;
+      log(`  ${lpTok ? '[PASS]' : '[FAIL]'} logprobs greedy == plain greedy (bit-exact tokens)`);
+      const lpArr = lp1.logprobs ?? [];
+      let lpCons = lpArr.length === lp1.tokens.length;
+      let lpPSum = 0;
+      for (let i = 0; i < lpArr.length && lpCons; i++) {
+        const e = lpArr[i];
+        lpCons = e.top.length === 5 && e.top[0].id === lp1.tokens[i] && Math.abs(e.logprob - e.top[0].logprob) < 1e-6 && e.logprob <= 1e-6;
+        for (let j = 1; j < e.top.length && lpCons; j++) lpCons = e.top[j].logprob <= e.top[j - 1].logprob;
+        lpPSum = e.top.reduce((s, x) => s + Math.exp(x.logprob), 0);
+        lpCons = lpCons && lpPSum > 0 && lpPSum <= 1 + 1e-5;
+      }
+      ok = ok && lpCons;
+      log(`  ${lpCons ? '[PASS]' : '[FAIL]'} logprobs consistent (aligned, descending, chosen==top1, sum(p) ${lpPSum.toFixed(4)} <= 1; top1 p=${lpArr.length ? Math.exp(lpArr[0].logprob).toFixed(3) : '?'})`);
+      const lp2 = await engine.generate(ids, { maxTokens: 16, logprobs: 5 });
+      engine.resetCache();
+      const lpDet = JSON.stringify(lp1.logprobs) === JSON.stringify(lp2.logprobs);
+      ok = ok && lpDet;
+      log(`  ${lpDet ? '[PASS]' : '[FAIL]'} logprobs deterministic across runs`);
+      // sampled turns record the CHOSEN token (not necessarily top-1), still aligned
+      const lpS = await engine.generate(ids, { maxTokens: 16, logprobs: 3, temperature: 0.7, topK: 20, seed: 42 });
+      engine.resetCache();
+      const lpSOk = (lpS.logprobs ?? []).length === lpS.tokens.length && (lpS.logprobs ?? []).every((e) => e.top.length === 3 && e.logprob <= 1e-6);
+      ok = ok && lpSOk;
+      log(`  ${lpSOk ? '[PASS]' : '[FAIL]'} sampled logprobs aligned with emitted tokens`);
+
       // 7) chat layer (bitgpu/chat): the tokenizer files live next to the manifest; model dirs
       // without them (e.g. an app that loads its tokenizer from the Hub) skip loudly. Checks:
       // seeded determinism, stream==send, reuse turn == cold prefill of the exact same token

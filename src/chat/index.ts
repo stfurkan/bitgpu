@@ -9,7 +9,7 @@
 // The two text libraries (@huggingface/tokenizers, @huggingface/jinja - pure JS, Apache-2.0)
 // are inlined into dist/chat.js at build time, the same way the engine inlines its WGSL:
 // `bitgpu` stays a zero-dependency package, and importing plain `bitgpu` never loads chat code.
-import type { Engine, GenerateOptions, GenerateResult } from '../types'
+import type { Engine, GenerateOptions, GenerateResult, TokenLogprobs } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
 import { ThinkSplitter, StopScanner } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
@@ -50,6 +50,10 @@ export interface ChatSendOptions {
   noRepeatNgramSize?: number
   seed?: number
   promptLookup?: GenerateOptions['promptLookup']
+  /** Per-token TRUE logprobs, N top alternatives per step (see GenerateOptions.logprobs) -
+   *  surface model confidence: a low top-1 logprob or a flat top-N is the model guessing.
+   *  Disables promptLookup for the turn. */
+  logprobs?: number
   /** Extra stop token ids, in addition to the model's eos. */
   stopTokens?: number[]
   /** Stop STRINGS: generation ends when the visible reply contains one (matched across token
@@ -119,6 +123,8 @@ export interface ChatResult {
   finishReason: 'stop' | 'length' | 'abort' | 'tool_calls'
   /** True when this turn extended the KV cache instead of a full prefill. */
   reusedCache: boolean
+  /** Per-token logprob records aligned with `tokens` (present when options.logprobs was set). */
+  logprobs?: TokenLogprobs[]
   prefillMs: number
   decodeMs: number
   tokensPerSecond: number
@@ -398,6 +404,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         repetitionPenalty: o.repetitionPenalty,
         noRepeatNgramSize: o.noRepeatNgramSize,
         seed: o.seed,
+        logprobs: o.logprobs,
         promptLookup: json || prep ? false : o.promptLookup,
         stopTokens: [tk.eosTokenId, ...(o.stopTokens ?? [])],
         reuseCache: canReuse,
@@ -462,6 +469,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         : toolCalls.length > 0 ? 'tool_calls'
         : 'stop',
       reusedCache: canReuse,
+      ...(result.logprobs ? { logprobs: result.logprobs } : {}),
       prefillMs: result.prefillMs,
       decodeMs: result.decodeMs,
       tokensPerSecond: result.tokensPerSecond,

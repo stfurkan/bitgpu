@@ -123,6 +123,24 @@ export interface GenerateOptions {
    *  acceptance is ~zero when both are on (measured 0/320). No draft model, no extra VRAM.
    *  `true`/`'auto'` = `{ ngramSize: 3, maxDraft: 8 }`. Default `false`. */
   promptLookup?: boolean | 'auto' | { ngramSize?: number; maxDraft?: number }
+  /** Per-token TRUE logprobs (log-softmax over the full vocabulary, after penalties): set to N
+   *  (1..32) to receive the emitted token's logprob plus the top-N alternatives each step in
+   *  {@link GenerateResult.logprobs}. Exact, not a top-K approximation - the normalizer is a GPU
+   *  log-sum-exp over all logits (one extra f32 readback per step). Routes greedy turns through
+   *  the per-step sampler path and disables `promptLookup` (a verified draft step has no
+   *  per-token candidate readback); sampled turns pay nothing extra. Use it to expose model
+   *  confidence: a low top-1 logprob or a flat top-N is the model guessing. Default off. */
+  logprobs?: number
+}
+
+/** One emitted token's logprob record (see {@link GenerateOptions.logprobs}). */
+export interface TokenLogprobs {
+  /** The emitted token's logprob (log-softmax over the full vocab, post-penalty). Under a
+   *  candidateFilter this is the logprob of the token actually chosen, which the filter may
+   *  have forced far below the top alternatives. */
+  logprob: number
+  /** The top-N (id, logprob) pairs in descending order, independent of what was emitted. */
+  top: { id: number; logprob: number }[]
 }
 
 /** Result of a {@link Engine.generate} call. */
@@ -143,6 +161,9 @@ export interface GenerateResult {
    *  accepted. With `promptLookup: 'auto'`, `bailed` reports whether the probation decided to
    *  stop speculating for the rest of the turn. */
   speculation?: { steps: number; drafted: number; accepted: number; bailed?: boolean }
+  /** Present when {@link GenerateOptions.logprobs} was set: one record per emitted token,
+   *  aligned with `tokens`. */
+  logprobs?: TokenLogprobs[]
 }
 
 /** Diagnostic result of {@link Engine.forward}: hidden states + logits for a single forward pass. */

@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- bitgpu off the main thread: the engine runs inside examples/worker.js (a module Worker), and
+     this page only renders messages. The spinning square is driven by requestAnimationFrame on
+     the MAIN thread - it keeps spinning at full frame rate through model load, prefill, and
+     decode, which is the whole point of the demo. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bitgpu - Web Worker example</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9881;</text></svg>" />
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    #spin { width: 28px; height: 28px; background: #4f7cff; display: inline-block; vertical-align: middle; border-radius: 6px; margin-right: .6rem; }
+    #out { white-space: pre-wrap; border: 1px solid #8884; border-radius: 8px; padding: .8rem; min-height: 8rem; margin-top: 1rem; }
+    textarea { width: 100%; box-sizing: border-box; min-height: 4rem; margin-top: 1rem; font: inherit; padding: .5rem; }
+    button { font: inherit; padding: .4rem 1rem; margin-right: .5rem; }
+    #status { color: #888; }
+  </style>
+</head>
+<body>
+  <h1><span id="spin"></span>bitgpu in a Web Worker</h1>
+  <p>The model loads, prefills, and decodes in a worker; this square is animated by the main
+     thread and never stutters. Bonsai 1.7B (~290 MB) streams from the Hugging Face Hub.</p>
+  <p id="status">worker idle</p>
+  <button id="load">Load model</button>
+  <button id="stop" disabled>Stop</button>
+  <textarea id="prompt">Explain in two sentences why running an LLM in a Web Worker keeps a page responsive.</textarea>
+  <button id="send" disabled>Send</button>
+  <div id="out"></div>
+  <script type="module">
+    const $ = (id) => document.getElementById(id)
+    // main-thread liveness: rAF-driven rotation; any main-thread stall would freeze it
+    let a = 0
+    const tick = () => { $('spin').style.transform = `rotate(${(a += 3)}deg)`; requestAnimationFrame(tick) }
+    tick()
+
+    const worker = new Worker('./worker.js', { type: 'module' })
+    const history = []
+    worker.onmessage = ({ data: m }) => {
+      if (m.type === 'progress') {
+        $('status').textContent = m.phase === 'ready' ? 'model ready'
+          : m.phase === 'weights' && m.total ? `downloading weights ${(m.loaded / 1048576).toFixed(0)} / ${(m.total / 1048576).toFixed(0)} MB`
+          : `loading: ${m.phase}`
+        if (m.phase === 'ready') $('send').disabled = false
+      } else if (m.type === 'delta') {
+        $('out').textContent += m.delta
+      } else if (m.type === 'result') {
+        history.push({ role: 'assistant', content: m.text })
+        $('status').textContent = `done (${m.tokensPerSecond.toFixed(1)} tok/s, ${m.finishReason})`
+        $('send').disabled = false
+        $('stop').disabled = true
+      } else if (m.type === 'error') {
+        $('status').textContent = `error: ${m.message}`
+        $('send').disabled = false
+        $('stop').disabled = true
+      }
+    }
+    $('load').onclick = () => { $('load').disabled = true; $('status').textContent = 'loading...'; worker.postMessage({ type: 'load' }) }
+    $('send').onclick = () => {
+      history.push({ role: 'user', content: $('prompt').value })
+      $('out').textContent = ''
+      $('send').disabled = true
+      $('stop').disabled = false
+      $('status').textContent = 'generating...'
+      worker.postMessage({ type: 'send', messages: [...history] })
+    }
+    $('stop').onclick = () => worker.postMessage({ type: 'stop' })
+  </script>
+</body>
+</html>

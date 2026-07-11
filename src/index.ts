@@ -9,4 +9,5 @@ export type {
   GenerateResult,
   ForwardResult,
   LoadProgress,
+  TokenLogprobs,
 } from './types'
