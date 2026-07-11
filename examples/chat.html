@@ -54,6 +54,8 @@
     .msg.user { background: var(--user); align-self: flex-end; max-width: 85%; border-bottom-right-radius: 4px; }
     .msg.assistant { align-self: flex-start; max-width: 95%; border-bottom-left-radius: 4px; }
     .msg.assistant.pending::after { content: '▍'; color: var(--accent); animation: blink 1s steps(1) infinite; }
+    .msg.toolcall { align-self: flex-start; max-width: 95%; font: 12.5px/1.6 ui-monospace, monospace; color: var(--muted); background: transparent; box-shadow: none; border-style: dashed; }
+    .msg.toolcall b { color: var(--fg); font-weight: 600; }
     @keyframes blink { 50% { opacity: 0; } }
     .msg .meta { display: block; font-size: 11px; color: var(--muted); margin-top: 6px; }
     .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 48px 24px; }
@@ -88,12 +90,13 @@
       </select>
       <button id="load" class="primary">Load model</button>
       <label class="chk"><input type="checkbox" id="jsonMode" /> JSON mode</label>
+      <label class="chk" title="The model can call a calculator and a clock that run inside this page - the call format is grammar-enforced, so it can never be malformed."><input type="checkbox" id="toolMode" /> Tools</label>
       <div class="right">
         <button id="clear" disabled>Clear chat</button>
       </div>
     </div>
     <div id="schemaBox">
-      <div class="hint">Optional JSON Schema (subset: type, properties, required, additionalProperties, items, minItems/maxItems, enum) - the reply <b>cannot</b> violate it. Clear to allow any valid JSON.</div>
+      <div class="hint">Optional JSON Schema (subset: type, properties, required, additionalProperties, items, minItems/maxItems, enum, minLength/maxLength, integer minimum/maximum, discriminated oneOf) - the reply <b>cannot</b> violate it. Clear to allow any valid JSON.</div>
       <textarea id="schema" spellcheck="false">{
   "type": "array", "minItems": 5, "maxItems": 5,
   "items": { "type": "object", "required": ["name", "population"], "additionalProperties": false,
@@ -115,7 +118,11 @@
       offline-capable, private by construction.<br /><br />
       Try <i>"Explain WebGPU in two sentences"</i> - or flip on <b>JSON mode</b> and ask for
       <i>"the 5 largest cities in Turkey as an array of {name, population} objects"</i> -
-      the output is structurally guaranteed to parse.
+      the output is structurally guaranteed to parse.<br /><br />
+      Or flip on <b>Tools</b> and ask <i>"What is 12.5% of 4,832? Use the calculator."</i> -
+      the model calls a calculator that runs inside this page, and the call is grammar-enforced
+      so it can never be malformed. Every reply also shows a <b>confidence</b> score computed
+      from the model's own token probabilities.
     </div>
   </div></div></main>
 
@@ -241,13 +248,46 @@
       }
     };
 
+    // ── demo tools: executed by THIS PAGE (the engine only returns a validated call) ──
+    const DEMO_TOOLS = [
+      { type: 'function', function: {
+        name: 'calculate',
+        description: 'Evaluate a pure arithmetic expression using only numbers and + - * / ( ). Example: for 12.5% of 4832 pass "4832 * 0.125".',
+        parameters: { type: 'object', required: ['expression'], additionalProperties: false,
+                      properties: { expression: { type: 'string', minLength: 1, maxLength: 80 } } },
+      } },
+      { type: 'function', function: {
+        name: 'get_time',
+        description: 'Get the current local date and time.',
+        parameters: { type: 'object', additionalProperties: false, properties: {} },
+      } },
+    ];
+    function runDemoTool(call) {
+      if (call.name === 'get_time') return new Date().toString();
+      if (call.name === 'calculate') {
+        let ex = String(call.arguments.expression ?? '').replace(/,/g, '');
+        // accept the common "X% of Y" phrasing, then require pure arithmetic
+        ex = ex.replace(/([\d.]+)\s*%\s*(?:of\s*)?/gi, '($1/100)*').replace(/\*\s*$/, '');
+        if (!/^[\d\s+\-*/().]+$/.test(ex)) return 'error: only numbers, + - * / and parentheses are allowed';
+        try {
+          const v = Function(`"use strict"; return (${ex})`)();
+          return Number.isFinite(v) ? String(v) : 'error: not a finite number';
+        } catch { return 'error: could not evaluate the expression'; }
+      }
+      return `error: unknown tool ${call.name}`;
+    }
+
     // ── chat ──
     const setPlaceholder = () => {
-      const on = $('jsonMode').checked;
-      $('prompt').placeholder = on ? 'Ask for data: "the 5 largest cities in Turkey with populations"' : 'Say something...';
-      $('schemaBox').classList.toggle('show', on);
+      const json = $('jsonMode').checked, tools = $('toolMode').checked;
+      $('prompt').placeholder = json ? 'Ask for data: "the 5 largest cities in Turkey with populations"'
+        : tools ? 'Try: "What is 12.5% of 4,832? Use the calculator."'
+        : 'Say something...';
+      $('schemaBox').classList.toggle('show', json);
     };
-    $('jsonMode').onchange = setPlaceholder;
+    // JSON mode and tools are mutually exclusive (a constrained-JSON reply has no room for calls)
+    $('jsonMode').onchange = () => { if ($('jsonMode').checked) $('toolMode').checked = false; setPlaceholder(); };
+    $('toolMode').onchange = () => { if ($('toolMode').checked) $('jsonMode').checked = false; setPlaceholder(); };
 
     const bubble = (cls, text) => {
       $('empty')?.remove();
@@ -267,6 +307,10 @@
       status('<span class="ok">chat cleared</span> - the model forgot the conversation (KV cache reset).');
     };
 
+    // geometric-mean token probability from the per-token logprobs: an honest "how sure was the
+    // model", straight from its own distribution (100% = every token was the obvious choice)
+    const confidenceOf = (r) => (r.logprobs?.length ? Math.exp(r.logprobs.reduce((s, e) => s + e.logprob, 0) / r.logprobs.length) : null);
+
     $('form').onsubmit = async (ev) => {
       ev.preventDefault();
       if (!chat) return;
@@ -277,11 +321,13 @@
       busy = true; $('send').textContent = 'Stop';
       abort = new AbortController();
       bubble('user', q);
+      const base = messages.length; // rollback point: error/early-abort unwinds to before this turn
       messages.push({ role: 'user', content: q });
-      const out = bubble('assistant', '');
+      let out = bubble('assistant', '');
       out.classList.add('pending');
       try {
         const json = $('jsonMode').checked;
+        const toolsOn = $('toolMode').checked;
         let format;
         if (json) {
           const st = $('schema').value.trim();
@@ -290,11 +336,13 @@
             catch { throw new Error('the schema box does not contain valid JSON'); }
           } else format = 'json';
         }
-        const r = await chat.send(messages, {
+        const sendOnce = () => chat.send(messages, {
           temperature: 0.5, topK: 20, repetitionPenalty: 1.1,
           maxTokens: json ? 320 : 512,
           format,
-          promptLookup: json ? undefined : 'auto',
+          tools: toolsOn ? DEMO_TOOLS : undefined,
+          logprobs: 5, // powers the confidence readout; the demo always samples, so this is ~free
+          promptLookup: json || toolsOn ? undefined : 'auto',
           signal: abort.signal,
           onText: (d) => { out.textContent += d; out.scrollIntoView({ block: 'end' }); },
           onOverflow: () => {
@@ -304,19 +352,46 @@
             return msgs;
           },
         });
+        let r = await sendOnce();
+        // Tool round trips: the ENGINE only returns a validated call (name locked to the
+        // declared tools, arguments locked to their schema); executing it and continuing the
+        // conversation is this page's code. Cap the rounds so a chatty model cannot loop.
+        let calls = 0;
+        while (toolsOn && r.finishReason === 'tool_calls' && calls < 3 && !abort.signal.aborted) {
+          if (!out.textContent) out.remove(); // a pure call turn has no visible reply
+          else out.classList.remove('pending');
+          messages.push({ role: 'assistant', content: r.text, tool_calls: r.toolCalls });
+          for (const call of r.toolCalls) {
+            const result = runDemoTool(call);
+            const tb = bubble('toolcall', '');
+            tb.innerHTML = `⚙ <b></b> → `;
+            tb.querySelector('b').textContent = `${call.name}(${JSON.stringify(call.arguments)})`;
+            tb.appendChild(document.createTextNode(result));
+            messages.push({ role: 'tool', content: result });
+          }
+          calls++;
+          out = bubble('assistant', '');
+          out.classList.add('pending');
+          r = await sendOnce(); // extends the KV cache: no re-prefill of the conversation
+        }
         if (r.finishReason === 'abort') {
-          messages.pop();
+          if (calls === 0) messages.length = base; // nothing committed yet: forget the question too
           out.textContent += ' [stopped]';
         } else {
-          messages.push({ role: 'assistant', content: r.text });
+          messages.push({ role: 'assistant', content: r.text, ...(r.toolCalls.length ? { tool_calls: r.toolCalls } : {}) });
+          const conf = confidenceOf(r);
           const meta = document.createElement('span');
           meta.className = 'meta';
-          meta.textContent = `${r.tokens.length} tokens · ${r.tokensPerSecond.toFixed(1)} tok/s · prefill ${r.prefillMs.toFixed(0)} ms${r.reusedCache ? ' · cache reused' : ''}${json ? ` · ${r.finishReason === 'stop' ? 'valid JSON' : 'cut by maxTokens'}` : ''}`;
+          meta.textContent = `${r.tokens.length} tokens · ${r.tokensPerSecond.toFixed(1)} tok/s · prefill ${r.prefillMs.toFixed(0)} ms`
+            + (r.reusedCache ? ' · cache reused' : '')
+            + (conf !== null ? ` · confidence ${(conf * 100).toFixed(0)}%` : '')
+            + (calls ? ` · ${calls} tool round${calls > 1 ? 's' : ''}` : '')
+            + (json ? ` · ${r.finishReason === 'stop' ? 'valid JSON' : 'cut by maxTokens'}` : '');
           out.appendChild(meta);
         }
       } catch (e) {
         out.textContent = `error: ${e.message}`;
-        messages.pop();
+        messages.length = base; // unwind the whole turn, including any tool round-trip messages
       }
       out.classList.remove('pending');
       busy = false; abort = null;
