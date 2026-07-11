@@ -32,8 +32,18 @@ const chat = await createChat(engine, {
 })
 ```
 
-Or copy a directory next to your app and pass `modelUrl` (serve the tokenizer files alongside
-and the whole thing is first-party, no third-party requests at all).
+Or copy a directory into your app's static assets and own the files (they are just static
+files - your repo becomes their source control). Two variants:
 
-These files are static and versioned with the engine; regenerating them from the exports
-reproduces them byte-for-byte (`python tools/convert.py --model <dir>`).
+- copy **manifest + aux only** and keep `dataUrl` pointed at the Hub: two small first-party
+  files, weights still stream from HF;
+- also download the data file (and tokenizer files) into the same directory for a **fully
+  first-party, offline-capable** setup with no third-party requests - then the single-URL form
+  works, since the manifest names its data/aux files and the engine resolves them relative to
+  the directory: `createEngine({ modelUrl: '/models/bonsai-1.7b' })`.
+
+These files are intentionally **not** shipped in the npm package: bitgpu stays a lean,
+model-neutral engine - hotlink the pinned CDN URLs above, or copy the files and own them.
+They are static and versioned with the engine; regenerating them from the exports reproduces
+them byte-for-byte (`python tools/convert.py --model <dir>`, full pipeline in
+[tools/README.md](../tools/README.md)).
