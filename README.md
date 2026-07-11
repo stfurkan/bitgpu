@@ -11,8 +11,8 @@ recent AMD and falls back to a workgroup-reduction path everywhere else WebGPU i
 Device limits are negotiated from the manifest, so the 8B's ~148 MiB lm_head binding is requested
 only when that model needs it and smaller models keep running at WebGPU's guaranteed minimums.
 
-**Try it now: [stfurkan.github.io/bitgpu/examples/chat.html](https://stfurkan.github.io/bitgpu/examples/chat.html)** -
-pick a model, weights stream once from the Hugging Face Hub, then everything runs on your GPU.
+**[DEMO](https://stfurkan.github.io/bitgpu/examples/chat.html)**: pick a model, let the weights
+stream once from the Hugging Face Hub, and chat with it on your own GPU.
 
 ## Install
 
@@ -45,9 +45,9 @@ const chat = await createChat(engine, {
 await chat.send([{ role: 'user', content: 'Hi!' }], { onText: (t) => process.stdout.write(t) })
 ```
 
-Or try it right now, no install: **[the live demo](https://stfurkan.github.io/bitgpu/examples/chat.html)**
-([source](examples/chat.html)) - model picker, streaming chat, guaranteed-valid JSON mode with a
-schema editor, and real model caching, entirely on-device.
+The [demo](https://stfurkan.github.io/bitgpu/examples/chat.html) ([source](examples/chat.html))
+is this quickstart as a single HTML file: model picker, streaming chat, JSON mode with a schema
+editor, and cached downloads.
 
 ## Usage
 
