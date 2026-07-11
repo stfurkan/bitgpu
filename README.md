@@ -150,12 +150,53 @@ silently ignored. The guarantee is structural, not semantic: a schema makes the 
 into the right shape, not be true. Built on the engine's generic `candidateFilter` hook (see
 `GenerateOptions`), which is open for custom grammars.
 
+### Tool calling (`tools`)
+
+The model's own protocol (Qwen3-family templates render a `tools` list and emit
+`<tool_call>` blocks), with the same enforcement guarantee as schema mode: a bitgpu tool call
+**cannot be malformed** - once the model opens a call, the name is forced to one of your
+declared tools and the arguments are forced through that tool's `parameters` schema,
+token-by-token.
+
+```ts
+const tools = [{
+  type: 'function',
+  function: {
+    name: 'get_weather',
+    description: 'Get the current weather for a city.',
+    parameters: { type: 'object', required: ['city'], additionalProperties: false,
+                  properties: { city: { type: 'string' }, unit: { enum: ['celsius', 'fahrenheit'] } } },
+  },
+}]
+
+const r = await chat.send(messages, { tools })
+if (r.finishReason === 'tool_calls') {
+  const call = r.toolCalls[0]                       // { name, arguments } - always valid
+  const result = await runMyTool(call)              // executing is YOUR code, on YOUR terms
+  const r2 = await chat.send([
+    ...messages,
+    { role: 'assistant', content: r.text, tool_calls: r.toolCalls },
+    { role: 'tool', content: JSON.stringify(result) },
+  ], { tools })                                     // extends the KV cache - no re-prefill
+}
+```
+
+`toolChoice: { name: 'get_weather' }` **forces** a call to that tool as the entire reply - fully
+enforced end to end, and the reliable way to use tools with small models. `'auto'` (the default)
+lets the model decide, which is where model judgment comes in: a 1-bit model can call when it
+should answer, or answer when it should call. Enforcement guarantees the call's *shape*, never
+its *judgment* - keep tool sets small (2-3 tools), prefer forced calls when the UI knows one is
+needed, and validate argument *values* in your executor. The engine never executes anything,
+never loops, never retries: it returns a validated call and the app stays in charge (there is
+deliberately no agent framework in here).
+
 The two text libraries (`@huggingface/tokenizers`, `@huggingface/jinja` - pure JS, Apache-2.0,
 see THIRD_PARTY_LICENSES.md) are inlined into `dist/chat.js` at build time, the same way the
 engine inlines its WGSL: the package keeps **zero runtime dependencies**, and importing plain
-`bitgpu` never loads any chat code. Rendering and encoding are verified byte-exact against
-transformers.js (`npm run test:chat`), and the GPU gate proves the reuse path bit-exact on real
-hardware. Prefer your own tokenizer? Skip `bitgpu/chat` entirely - the engine API is unchanged.
+`bitgpu` never loads any chat code. Rendering and encoding (including tool declarations, calls,
+and responses) are verified byte-exact against transformers.js (`npm run test:chat`), and the
+GPU gate proves the reuse paths bit-exact on real hardware. Prefer your own tokenizer? Skip
+`bitgpu/chat` entirely - the engine API is unchanged.
 
 ## Bring your own model
 

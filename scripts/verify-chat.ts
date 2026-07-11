@@ -14,7 +14,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createChat, ChatTokenizer, ThinkSplitter, type ChatMessage } from '../src/chat/index'
+import { createChat, ChatTokenizer, ThinkSplitter, ToolBodyMachine, ToolCallSplitter, parseToolCall, validateTools, type ChatMessage, type ChatTool } from '../src/chat/index'
 import { JsonMachine, TokenByteTable, validateJsonSchema } from '../src/chat/json'
 import type { Engine, GenerateOptions, GenerateResult } from '../src/types'
 
@@ -78,8 +78,16 @@ function bytesToUnicode(): Map<number, string> {
   return new Map(bs.map((b, i) => [b, String.fromCharCode(cs[i])]))
 }
 
+// Mirrors the Qwen3 template's structure: an optional <tools> system block, per-message tool_calls
+// rendering, tool-role messages wrapped as <tool_response> user turns, ChatML everywhere else.
 const CHATML_TEMPLATE = [
-  "{%- for message in messages %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}{%- endfor %}",
+  "{%- if tools %}{{ '<|im_start|>system\\n<tools>' }}{%- for tool in tools %}{{ '\\n' }}{{ tool | tojson }}{%- endfor %}",
+  "{{ '\\n</tools>\\nWrap each call in <tool_call></tool_call> tags.<|im_end|>\\n' }}{%- endif %}",
+  "{%- for message in messages %}",
+  "{%- if message.role == 'tool' %}{{ '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}",
+  "{%- else %}{{ '<|im_start|>' + message.role + '\\n' + message.content }}",
+  "{%- if message.tool_calls %}{%- for tc in message.tool_calls %}{{ '\\n<tool_call>\\n{\"name\": \"' + tc.name + '\", \"arguments\": ' }}{{ tc.arguments | tojson }}{{ '}\\n</tool_call>' }}{%- endfor %}{%- endif %}",
+  "{{ '<|im_end|>' + '\\n' }}{%- endif %}{%- endfor %}",
   "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if not enable_thinking %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
 ].join('')
 
@@ -90,7 +98,7 @@ function miniTokenizer(): { json: unknown; config: Record<string, unknown> } {
   // Specialness mirrors the real Qwen3 tokenizer: the ChatML markers are special (stripped from
   // decoded text) while <think>/</think> are NOT (they reach the decoder stream, where the
   // ThinkSplitter routes them - exactly how the real model behaves).
-  const specials = ['<|im_start|>', '<|im_end|>', '<think>', '</think>', '<|endoftext|>']
+  const specials = ['<|im_start|>', '<|im_end|>', '<think>', '</think>', '<tool_call>', '</tool_call>', '<|endoftext|>']
   const added = specials.map((content, i) => ({
     id: 256 + i,
     content,
@@ -484,6 +492,166 @@ console.log('(D) JSON constrained decoding')
   try { cParsed = JSON.parse(cr.text) } catch { /* fail below */ }
   check('schema e2e: forced [ root, forced 2nd item, forced ] at max - parses to 2 items', Array.isArray(cParsed) && (cParsed as unknown[]).length === 2 && cr.finishReason === 'stop', JSON.stringify(cr.text))
   check('schema e2e: unsupported schema throws at send', /unsupported JSON Schema keyword/.test((await cChat.send([{ role: 'user', content: 'x' }], { format: { json: { schema: { type: 'object', oneOf: [] } as never } } }).catch((e) => e.message))))
+
+  // ── (F) tool calling ──
+  console.log('(F) tool calling')
+  const TOOLS: ChatTool[] = [{ type: 'function', function: { name: 'get', description: 'lookup', parameters: { type: 'object', required: ['q'], additionalProperties: false, properties: { q: { enum: ['x'] } } } } }]
+  const OTHER: ChatTool = { type: 'function', function: { name: 'go' } }
+  const msg = (s: string): ChatMessage[] => [{ role: 'user', content: s }]
+
+  // declaration validation
+  check('tools: empty list throws', (throws(() => validateTools([], 'auto')) ?? '').includes('tools is empty'))
+  check('tools: bad shape throws', (throws(() => validateTools([{ type: 'function', function: {} } as never], 'auto')) ?? '').includes('must be'))
+  check('tools: duplicate names throw', (throws(() => validateTools([OTHER, OTHER], 'auto')) ?? '').includes('duplicate tool name'))
+  check('tools: escape-y name throws', (throws(() => validateTools([{ type: 'function', function: { name: 'a"b' } }], 'auto')) ?? '').includes('JSON escaping'))
+  check('tools: array parameters throw', (throws(() => validateTools([{ type: 'function', function: { name: 'a', parameters: { type: 'array' } } }] as ChatTool[], 'auto')) ?? '').includes('must describe an object'))
+  check('tools: unknown forced name throws', (throws(() => validateTools(TOOLS, { name: 'nope' })) ?? '').includes("unknown tool 'nope'"))
+
+  // body grammar machine
+  const B_SCHEMAS = new Map([
+    [ToolBodyMachine.bytesOf('get'), { type: 'object', required: ['q'], additionalProperties: false, properties: { q: { enum: ['x'] } } } as import('../src/chat/json').JsonSchema],
+    [ToolBodyMachine.bytesOf('go2'), { type: 'object' } as import('../src/chat/json').JsonSchema],
+  ])
+  const feedB = (s: string): { ok: boolean; complete: boolean } => {
+    const m = new ToolBodyMachine([ToolBodyMachine.bytesOf('get'), ToolBodyMachine.bytesOf('go2')], B_SCHEMAS)
+    const ok = m.feed(enc2.encode(s))
+    return { ok, complete: ok && m.complete }
+  }
+  check('body: canonical call completes (leading/trailing newline ok)', feedB('\n{"name": "get", "arguments": {"q": "x"}}\n').complete)
+  check('body: parameter-less tool takes any object', feedB('{"name": "go2", "arguments": {"anything": [1, 2]}}').complete)
+  check('body: name diverging from every declared prefix rejected', !feedB('{"name": "gz').ok)
+  check('body: name that is only a prefix rejected at its quote', !feedB('{"name": "ge"').ok)
+  check('body: deviation from the canonical literal rejected', !feedB('{ "name"').ok)
+  check('body: argument key outside the tool schema rejected', !feedB('{"name": "get", "arguments": {"z').ok)
+  check('body: argument enum enforced', !feedB('{"name": "get", "arguments": {"q": "y').ok)
+  check('body: missing required argument cannot close', !feedB('{"name": "get", "arguments": {}').ok)
+  check('body: whitespace run before the wrapper capped', !feedB('      {').ok)
+  check('body: content after completion rejected', !feedB('{"name": "go2", "arguments": {}}x').ok)
+
+  // block splitter
+  {
+    const sp = new ToolCallSplitter()
+    const p1 = sp.push('before <tool')
+    const p2 = sp.push('_call>{"a":1}</tool_call> after')
+    check('splitter: tags straddling chunks', p1.text + p2.text === 'before  after' && p2.blocks.length === 1 && p2.blocks[0] === '{"a":1}', JSON.stringify(p2))
+    const sp2 = new ToolCallSplitter()
+    const q1 = sp2.push('<tool_call>A</tool_call><tool_call>B</tool_call>tail')
+    const q2 = sp2.flush()
+    check('splitter: two blocks + tail text', q1.blocks.join('|') === 'A|B' && q1.text + q2.text === 'tail' && q2.partial === null)
+    const sp3 = new ToolCallSplitter()
+    sp3.push('<tool_call>{"name": "ge')
+    check('splitter: a cut block surfaces as partial, never as text', sp3.flush().partial === '{"name": "ge')
+  }
+
+  // block parsing
+  {
+    const good = parseToolCall('\n{"name": "get", "arguments": {"q": "x"}}\n')
+    check('parse: object arguments', good.name === 'get' && JSON.stringify(good.arguments) === '{"q":"x"}')
+    const strArgs = parseToolCall('{"name": "g", "arguments": "{\\"a\\": 1}"}')
+    check('parse: stringified arguments unwrapped', strArgs.name === 'g' && JSON.stringify(strArgs.arguments) === '{"a":1}')
+    const bad = parseToolCall('{"nam')
+    check('parse: malformed keeps raw with name ""', bad.name === '' && bad.raw === '{"nam')
+  }
+
+  // send-level guards
+  {
+    const c = await createChat(candEngine([]), { tokenizer: { json: tj, config: tc } })
+    check('send: tools + format throws', ((await c.send(msg('x'), { tools: TOOLS, format: 'json' }).catch((e) => e.message)) as string).includes('cannot be combined with format'))
+    const simple = "{%- for message in messages %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- endif %}"
+    const cNo = await createChat(candEngine([]), { tokenizer: { json: tj, config: { ...tc, chat_template: simple } } })
+    check('send: template without tools support throws', ((await cNo.send(msg('x'), { tools: TOOLS }).catch((e) => e.message)) as string).includes('does not support tools'))
+    const { json: nj, config: nc } = miniTokenizer()
+    ;(nj as { added_tokens: { content: string }[] }).added_tokens = (nj as { added_tokens: { content: string }[] }).added_tokens.filter((t) => !t.content.includes('tool_call'))
+    const cNoVocab = await createChat(candEngine([]), { tokenizer: { json: nj, config: nc } })
+    check('send: vocabulary without markers throws', ((await cNoVocab.send(msg('x'), { tools: TOOLS }).catch((e) => e.message)) as string).includes('no <tool_call> marker tokens'))
+  }
+
+  // filter e2e on the candidate-driven engine: the "model" tries the WRONG token first at every
+  // body position ('z'); the filter must force the canonical enforced call instead.
+  const toolOpen = tk.encode('<tool_call>', false)[0]
+  const toolClose = tk.encode('</tool_call>', false)[0]
+  const BODY = '{"name": "get", "arguments": {"q": "x"}}'
+  const bodySteps: number[][] = [...BODY].map((ch) => [id('z'), id(ch)])
+  const closeStep = [id('z'), toolClose]
+  {
+    const autoSteps = [[id('o')], [id('k')], [toolOpen], ...bodySteps, closeStep, [tk.eosTokenId]]
+    let fired = 0
+    const ca = await createChat(candEngine(autoSteps), { tokenizer: { json: tj, config: tc } })
+    const ra = await ca.send(msg('what is x?'), { tools: TOOLS, onToolCall: () => fired++ })
+    check(
+      'tool e2e (auto): prose passes free, call body forced, block hidden from text',
+      ra.text === 'ok' && ra.toolCalls.length === 1 && ra.toolCalls[0].name === 'get' && JSON.stringify(ra.toolCalls[0].arguments) === '{"q":"x"}' && ra.finishReason === 'tool_calls' && fired === 1,
+      JSON.stringify({ text: ra.text, calls: ra.toolCalls.length }),
+    )
+    check('tool e2e (auto): tools rendered into the system block', tk.decode(ra.inputTokenIds, false).includes('<tools>') && tk.decode(ra.inputTokenIds, false).includes('"get"'))
+  }
+  {
+    const forcedSteps = [[id('h'), toolOpen], ...bodySteps, closeStep, [id('z'), tk.eosTokenId]]
+    const cf = await createChat(candEngine(forcedSteps), { tokenizer: { json: tj, config: tc } })
+    const rf = await cf.send(msg('call it'), { tools: TOOLS, toolChoice: { name: 'get' } })
+    check('tool e2e (forced): first token forced to <tool_call>, eos-only after the call', rf.text === '' && rf.toolCalls.length === 1 && rf.toolCalls[0].name === 'get' && rf.finishReason === 'tool_calls')
+  }
+  {
+    const noneSteps = [[id('a')], [tk.eosTokenId]]
+    const cn = await createChat(candEngine(noneSteps), { tokenizer: { json: tj, config: tc } })
+    const rn = await cn.send(msg('hi'), { tools: TOOLS, toolChoice: 'none' })
+    check("toolChoice 'none': tools not rendered, plain reply", rn.text === 'a' && rn.toolCalls.length === 0 && !tk.decode(rn.inputTokenIds, false).includes('<tools>'))
+  }
+
+  // round trip: call turn -> tool result extends the KV cache -> different tools full-prefill
+  {
+    const engine = mockEngine(tk)
+    const chat = await createChat(engine, { tokenizer: { json: tj, config: tc } })
+    engine.script(['<tool_call>\n{"name": "get", "arguments": {"q": "x"}}\n</tool_call>', 'It is 42.', 'ok', 'sure'])
+    const u: ChatMessage = { role: 'user', content: 'what is x?' }
+    const t1 = await chat.send([u], { tools: TOOLS })
+    check('round trip: pure call turn parsed, empty visible text, committed', t1.toolCalls.length === 1 && t1.text === '' && t1.finishReason === 'tool_calls')
+    const asst: ChatMessage = { role: 'assistant', content: t1.text, tool_calls: t1.toolCalls }
+    const t2 = await chat.send([u, asst, { role: 'tool', content: '42' }], { tools: TOOLS })
+    const delta = tk.decode(t2.inputTokenIds, false)
+    check('round trip: tool result extends the cache (reuse, no full prefill)', t2.reusedCache && t2.text === 'It is 42.')
+    check('round trip: delta = eos + tool_response turn + gen prompt', delta === '<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n', JSON.stringify(delta))
+    const t3 = await chat.send([u, asst, { role: 'tool', content: '42' }, { role: 'assistant', content: t2.text }, { role: 'user', content: 'thanks' }], { tools: [...TOOLS, OTHER] })
+    check('round trip: changed tools list -> full prefill (system block differs)', !t3.reusedCache)
+    const t4 = await chat.send([u, asst, { role: 'tool', content: '42' }, { role: 'assistant', content: t2.text }, { role: 'user', content: 'thanks' }, { role: 'assistant', content: t3.text }, { role: 'user', content: 'more' }], { tools: [...TOOLS, OTHER] })
+    check('round trip: same tools -> user append still reuses', t4.reusedCache)
+  }
+
+  // prewarm with tools
+  {
+    const engine = mockEngine(tk)
+    const chat = await createChat(engine, { tokenizer: { json: tj, config: tc } })
+    const sys: ChatMessage = { role: 'system', content: 'S.' }
+    await chat.prewarm([sys], { tools: TOOLS })
+    check('prewarm with tools renders the tools block', tk.decode(engine.prefills[0], false).includes('<tools>'))
+    engine.script(['hi', 'again'])
+    const rp = await chat.send([sys, { role: 'user', content: 'hey' }], { tools: TOOLS })
+    check('turn after tools prewarm reuses the cache', rp.reusedCache)
+    const rp2 = await chat.send([sys, { role: 'user', content: 'hey' }, { role: 'assistant', content: rp.text }, { role: 'user', content: 'more' }])
+    check('tools dropped on a later turn -> full prefill', !rp2.reusedCache)
+  }
+
+  // tool markers inside a think block are the model musing, not a call
+  {
+    const engine = mockEngine(tk)
+    const chat = await createChat(engine, { tokenizer: { json: tj, config: tc } })
+    engine.script(['<think>maybe <tool_call> syntax?</think>fine'])
+    const rt = await chat.send(msg('x'), { tools: TOOLS, think: true })
+    check('markers inside <think> stay reasoning', rt.toolCalls.length === 0 && rt.text === 'fine' && rt.thinkText.includes('<tool_call>'), JSON.stringify(rt.text))
+  }
+
+  // a call cut by maxTokens: 'length', name '', raw partial, no onToolCall, cache dropped
+  {
+    const engine = mockEngine(tk)
+    const chat = await createChat(engine, { tokenizer: { json: tj, config: tc } })
+    const cutText = '<tool_call>\n{"name": "ge'
+    engine.script([cutText, 'next'])
+    let fired = 0
+    const rc = await chat.send(msg('x'), { tools: TOOLS, maxTokens: tk.encode(cutText, false).length, onToolCall: () => fired++ })
+    check('cut call: length + partial raw + no onToolCall', rc.finishReason === 'length' && rc.toolCalls.length === 1 && rc.toolCalls[0].name === '' && rc.toolCalls[0].raw.includes('"ge') && fired === 0 && rc.text === '', JSON.stringify(rc.toolCalls))
+    const rcNext = await chat.send([...msg('x'), { role: 'assistant', content: '', tool_calls: rc.toolCalls }, { role: 'user', content: 'y' }], { tools: TOOLS })
+    check('cut call: cache dropped (no stale reuse)', !rcNext.reusedCache)
+  }
 }
 
 // ── (C) parity vs transformers.js on a real model (auto-skips when not staged) ───────────────
@@ -523,6 +691,18 @@ if (!staged) {
     }
   }
   check('eos id parity', tk.eosTokenId === Number(ref.eos_token_id ?? -1), `${tk.eosTokenId} vs ${ref.eos_token_id}`)
+
+  // tool rendering parity on the REAL template: declarations in the system block, an assistant
+  // turn carrying a call, and the tool response wrapped as a user turn
+  const twTools = [{ type: 'function', function: { name: 'get_weather', description: 'Get the weather for a city', parameters: { type: 'object', required: ['city'], properties: { city: { type: 'string' } } } } }]
+  const twMsgs: ChatMessage[] = [
+    { role: 'user', content: 'Weather in Paris?' },
+    { role: 'assistant', content: '', tool_calls: [{ name: 'get_weather', arguments: { city: 'Paris' } }] },
+    { role: 'tool', content: '{"temp": 21}' },
+  ]
+  const oursT = tk.applyChatTemplate(twMsgs, { addGenerationPrompt: true, enableThinking: false, tools: twTools })
+  const theirsT = ref.apply_chat_template(twMsgs as never, { add_generation_prompt: true, tokenize: false, enable_thinking: false, tools: twTools } as never) as unknown as string
+  check('tool rendering parity (declarations + call + response)', oursT === theirsT, oursT === theirsT ? '' : JSON.stringify({ ours: oursT.slice(0, 120), theirs: (theirsT ?? '').slice(0, 120) }))
 
   // decoder stream integrity on real BPE with multi-byte content
   const sample = 'Emoji 👍🏽 flag 🇹🇷 combining é́ CJK 世界 done.'

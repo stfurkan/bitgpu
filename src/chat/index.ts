@@ -13,12 +13,15 @@ import type { Engine, GenerateOptions, GenerateResult } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
 import { ThinkSplitter, StopScanner } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
+import { makeToolFilter, parseToolCall, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
 
 export { ChatTokenizer } from './tokenizer'
 export type { ChatMessage, DecoderStream } from './tokenizer'
 export { ThinkSplitter, StopScanner } from './think'
 export { JsonMachine, validateJsonSchema } from './json'
 export type { JsonSchema } from './json'
+export { ToolBodyMachine, ToolCallSplitter, makeToolFilter, parseToolCall, validateTools } from './tools'
+export type { ChatTool, ToolCall, ToolChoice } from './tools'
 
 /** Options for {@link createChat}. Point it at the model directory (which already hosts
  *  tokenizer.json + tokenizer_config.json next to the manifest), at explicit URLs, or at
@@ -71,6 +74,21 @@ export interface ChatSendOptions {
   /** Reuse the KV cache when this turn is a clean append to the previous one (the committed
    *  conversation plus one new user turn). Default true; set false to force a full prefill. */
   reuseCache?: boolean
+  /** Tools the model may call this turn, in the trained (OpenAI-shaped) declaration format. The
+   *  model's own chat template renders them into the system block; any <tool_call> blocks in the
+   *  reply are extracted (never shown as text), grammar-ENFORCED against the declared names and
+   *  each tool's `parameters` schema, and returned parsed in {@link ChatResult.toolCalls}. The
+   *  app executes a call and feeds the result back as a `tool` role message (plus the assistant
+   *  turn with its `tool_calls`); the engine never executes anything. Enforcement guarantees the
+   *  call's SHAPE, not its judgment - whether and what to call is model quality. Cannot combine
+   *  with `format`; disables `promptLookup` for the turn. */
+  tools?: ChatTool[]
+  /** 'auto' (default): the model decides. { name }: FORCE a call to that tool as the whole reply
+   *  (fully enforced end to end - the reliable mode for small models; implies think: false).
+   *  'none': ignore `tools` this turn. */
+  toolChoice?: ToolChoice
+  /** Fired as each completed tool call is parsed during streaming. */
+  onToolCall?: (call: ToolCall) => void
   /** Constrained decoding. `'json'` guarantees the reply is one complete, valid JSON value with
    *  an object or array root: every generated token is validated against an incremental JSON
    *  machine (invalid candidates are never sampled), and generation ends when the root value
@@ -85,16 +103,20 @@ export interface ChatSendOptions {
 }
 
 export interface ChatResult {
-  /** The visible reply (think blocks removed). */
+  /** The visible reply (think blocks and tool_call blocks removed). */
   text: string
   /** Content of <think> blocks, when the model emitted any. */
   thinkText: string
+  /** Parsed tool calls, in emission order (empty when the model answered in prose or no tools
+   *  were given). Grammar enforcement makes every COMPLETED call well-formed; a call cut short
+   *  by maxTokens has name '' and its partial text in `raw` (finishReason is then 'length'). */
+  toolCalls: ToolCall[]
   /** Generated token ids (as returned by the engine; excludes the prompt). */
   tokens: number[]
   /** The exact token ids fed to the engine this turn (the full prompt, or the reuse delta). */
   inputTokenIds: number[]
-  /** Why generation ended. */
-  finishReason: 'stop' | 'length' | 'abort'
+  /** Why generation ended ('tool_calls' = ended at eos after making tool calls). */
+  finishReason: 'stop' | 'length' | 'abort' | 'tool_calls'
   /** True when this turn extended the KV cache instead of a full prefill. */
   reusedCache: boolean
   prefillMs: number
@@ -110,11 +132,13 @@ export interface Chat {
    *  is the generator's return value: `const it = chat.stream(msgs); for await (const d of it) ...` */
   stream(messages: ChatMessage[], options?: ChatSendOptions): AsyncGenerator<string, ChatResult>
   /** Prefill a message prefix (e.g. the static system prompt) into the KV cache without decoding,
-   *  so the first real turn is a cheap cache-append instead of a cold full prefill. */
-  prewarm(messages: ChatMessage[]): Promise<void>
+   *  so the first real turn is a cheap cache-append instead of a cold full prefill. Pass the same
+   *  `tools` the turns will use - the template renders them into the system block, so a prewarm
+   *  without them warms a different prompt. */
+  prewarm(messages: ChatMessage[], opts?: { tools?: ChatTool[] }): Promise<void>
   /** Token count of the rendered prompt for a message list (chat template applied) - use for
    *  window budgeting against `engine.capabilities.maxSeqLen`, e.g. in an onOverflow policy. */
-  countTokens(messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean }): number
+  countTokens(messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean; tools?: ChatTool[] }): number
   /** Forget the conversation: clears the engine's KV cache and the chat's committed transcript.
    *  Use this (not engine.resetCache()) so the two stay in sync. */
   reset(): void
@@ -155,6 +179,14 @@ function deriveChatWrap(tk: ChatTokenizer): ChatWrap | null {
   }
 }
 
+// tool_calls compare by name+arguments only, so feeding ChatResult.toolCalls (which carries the
+// extra `raw` field) back into the transcript still counts as the same message.
+const tcKey = (tcs: ChatMessage['tool_calls']): string => JSON.stringify(tcs?.map((t) => [t.name, t.arguments]) ?? null)
+
+function msgEq(a: ChatMessage, b: ChatMessage): boolean {
+  return a.role === b.role && a.content === b.content && tcKey(a.tool_calls) === tcKey(b.tool_calls)
+}
+
 /** True iff `next` is exactly `committed` plus one new trailing user turn - a clean append, so the
  *  engine can extend its KV cache with just that turn. Compared as MESSAGES, not token ids: chat
  *  templates render past assistant turns differently from live ones (e.g. Qwen3's empty <think>
@@ -162,9 +194,19 @@ function deriveChatWrap(tk: ChatTokenizer): ChatWrap | null {
 function isCleanAppend(committed: readonly ChatMessage[] | null, next: readonly ChatMessage[]): boolean {
   if (!committed || next.length !== committed.length + 1) return false
   if (next[next.length - 1].role !== 'user') return false
-  for (let i = 0; i < committed.length; i++) {
-    if (next[i].role !== committed[i].role || next[i].content !== committed[i].content) return false
-  }
+  for (let i = 0; i < committed.length; i++) if (!msgEq(next[i], committed[i])) return false
+  return true
+}
+
+/** True iff `next` is `committed` (whose last turn is an assistant turn WITH tool calls) plus
+ *  only trailing `tool` result messages - the continuation leg of a tool round trip, appendable
+ *  to the KV cache the same way a user turn is. */
+function isToolAppend(committed: readonly ChatMessage[] | null, next: readonly ChatMessage[]): boolean {
+  if (!committed || committed.length === 0 || next.length <= committed.length) return false
+  const last = committed[committed.length - 1]
+  if (last.role !== 'assistant' || !last.tool_calls?.length) return false
+  for (let i = 0; i < committed.length; i++) if (!msgEq(next[i], committed[i])) return false
+  for (let i = committed.length; i < next.length; i++) if (next[i].role !== 'tool') return false
   return true
 }
 
@@ -198,12 +240,46 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
   // reuse stays token-exact with a cold prefill of the same conversation.
   let committed: ChatMessage[] | null = null
   let cacheEndsAtEos = false
+  // The tools list the committed conversation was rendered with (as canonical JSON; null = no
+  // tools). The template puts tools in the SYSTEM block, so a cache built with one tools list
+  // cannot be extended by a turn using another - reuse requires an exact match.
+  let committedToolsKey: string | null = null
   // Bumped by reset(): a turn in flight when reset() lands must not commit its transcript over
   // the cleared state (same hazard as the engine's own resetCache-vs-generate race).
   let resetEpoch = 0
   const dropCache = (): void => {
     committed = null
+    committedToolsKey = null
     engine.resetCache()
+  }
+
+  // Tool support is a property of the model (template + vocabulary); probe once, loudly.
+  let templateToolsOk: boolean | null = null
+  function prepareTools(tools: ChatTool[], choice: ToolChoice): PreparedTools {
+    validateTools(tools, choice)
+    if (templateToolsOk === null) {
+      try {
+        const probe = tk.applyChatTemplate([{ role: 'user', content: 'x' }], {
+          addGenerationPrompt: false,
+          tools: [{ type: 'function', function: { name: 'bitgpu_probe_tool' } }],
+        })
+        // The template must both render the declarations and instruct the <tool_call> format
+        // this module extracts and enforces.
+        templateToolsOk = probe.includes('bitgpu_probe_tool') && probe.includes('<tool_call>')
+      } catch {
+        templateToolsOk = false
+      }
+    }
+    if (!templateToolsOk) throw new Error("bitgpu/chat: this model's chat template does not support tools")
+    const open = tk.tokenToId('<tool_call>')
+    const close = tk.tokenToId('</tool_call>')
+    if (open === undefined || close === undefined)
+      throw new Error('bitgpu/chat: the vocabulary has no <tool_call> marker tokens, so tool calls cannot be enforced')
+    return {
+      tools,
+      forced: typeof choice === 'object' ? choice.name : null,
+      ids: { open, close, eos: tk.eosTokenId, thinkOpen: tk.tokenToId('<think>'), thinkClose: tk.tokenToId('</think>') },
+    }
   }
 
   // Serialize chat turns: send/stream/prewarm share the committed-transcript bookkeeping, so
@@ -227,11 +303,20 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const json = o.format !== undefined
     const schema = typeof o.format === 'object' ? (o.format.json.schema ?? null) : null
     if (schema) validateJsonSchema(schema) // throws on anything outside the enforceable subset
-    const think = !json && (o.think ?? false) // a think block cannot be valid JSON; format wins
-    const canReuse = (o.reuseCache ?? true) && !think && wrap !== null && isCleanAppend(committed, messages)
+    const toolsGiven = o.tools !== undefined && o.tools.length > 0 && o.toolChoice !== 'none'
+    if (toolsGiven && json) throw new Error('bitgpu/chat: tools cannot be combined with format (a constrained-JSON reply has no room for tool calls)')
+    const prep = toolsGiven ? prepareTools(o.tools as ChatTool[], o.toolChoice ?? 'auto') : null
+    const toolsKey = prep ? JSON.stringify(prep.tools) : null
+    // format wins over think (a think block cannot be valid JSON); a FORCED tool call also
+    // implies think: false (the whole reply is the enforced call).
+    const think = !json && prep?.forced == null && (o.think ?? false)
+    const wantReuse = (o.reuseCache ?? true) && !think && wrap !== null && toolsKey === committedToolsKey
+    const userAppend = wantReuse && isCleanAppend(committed, messages)
+    const toolAppend = wantReuse && !userAppend && isToolAppend(committed, messages)
+    const canReuse = userAppend || toolAppend
 
     let inputTokenIds: number[]
-    if (canReuse) {
+    if (userAppend) {
       const w = wrap as ChatWrap
       const userText = messages[messages.length - 1].content
       // Reconstruct exactly what a cold render of [committed..., user] appends after the cached
@@ -239,9 +324,17 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       // inter-turn newline, the wrapped user turn, and the generation prompt.
       const deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}\n${w.userPrefix}${userText}${w.userSuffix}${w.genPrompt}`
       inputTokenIds = tk.encode(deltaStr, false)
+    } else if (toolAppend) {
+      // The continuation leg of a tool round trip: everything appended after the cached
+      // assistant turn is the tool messages rendered standalone (the template wraps them in a
+      // user turn) plus the generation prompt - byte-identical to what a cold render appends,
+      // since tool-turn rendering does not depend on position.
+      const toolMsgs = messages.slice((committed as ChatMessage[]).length)
+      const deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}\n` + tk.applyChatTemplate(toolMsgs, { addGenerationPrompt: true, enableThinking: false })
+      inputTokenIds = tk.encode(deltaStr, false)
     } else {
       dropCache()
-      inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think }), false)
+      inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think, tools: prep?.tools }), false)
     }
 
     const decoder: DecoderStream = tk.createDecoderStream(true)
@@ -254,14 +347,31 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const signal = stopCtl ? (o.signal ? AbortSignal.any([o.signal, stopCtl.signal]) : stopCtl.signal) : o.signal
     let text = ''
     let thinkText = ''
+    // Tool-call blocks route to their own channel (never the visible reply), each completed
+    // block parsing into a ToolCall as it closes.
+    const toolSplit = prep ? new ToolCallSplitter() : null
+    const toolCalls: ToolCall[] = []
+    const pushBlock = (block: string): void => {
+      const call = parseToolCall(block)
+      toolCalls.push(call)
+      if (call.name) o.onToolCall?.(call)
+    }
+    const emitVisible = (vis: string): void => {
+      if (!vis) return
+      const visible = stops ? stops.push(vis) : vis
+      if (visible) {
+        text += visible
+        o.onText?.(visible)
+      }
+      if (stops?.matched) stopCtl?.abort()
+    }
     const emit = (chunk: { text: string; think: string }): void => {
       if (chunk.text) {
-        const visible = stops ? stops.push(chunk.text) : chunk.text
-        if (visible) {
-          text += visible
-          o.onText?.(visible)
-        }
-        if (stops?.matched) stopCtl?.abort()
+        if (toolSplit) {
+          const r = toolSplit.push(chunk.text)
+          for (const b of r.blocks) pushBlock(b)
+          emitVisible(r.text)
+        } else emitVisible(chunk.text)
       }
       if (chunk.think) {
         thinkText += chunk.think
@@ -275,6 +385,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // prefix; once the root value completes it permits only eos, so generation ends naturally
     // through the normal stop path. advance() moves the real machine on each emitted token.
     const jf = json ? makeJsonFilter((byteTable ??= new TokenByteTable(tk)), tk.eosTokenId, schema) : null
+    // Tool turns: free text until <tool_call> opens, then the body grammar (declared names +
+    // per-tool schema) until </tool_call>; a forced choice pins the whole reply to one call.
+    const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep) : null
     let result: GenerateResult
     try {
       result = await engine.generate(inputTokenIds, {
@@ -285,13 +398,14 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         repetitionPenalty: o.repetitionPenalty,
         noRepeatNgramSize: o.noRepeatNgramSize,
         seed: o.seed,
-        promptLookup: json ? false : o.promptLookup,
+        promptLookup: json || prep ? false : o.promptLookup,
         stopTokens: [tk.eosTokenId, ...(o.stopTokens ?? [])],
         reuseCache: canReuse,
         signal,
-        candidateFilter: jf ? (ids) => jf.filter(ids) : undefined,
+        candidateFilter: jf ? (ids) => jf.filter(ids) : tf ? (ids) => tf.filter(ids) : undefined,
         onToken: (id) => {
           jf?.advance(id)
+          tf?.advance(id)
           emit(splitter.push(decoder.push(id)))
         },
       })
@@ -311,26 +425,42 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     }
     emit(splitter.push(decoder.flush()))
     emit(splitter.flush())
+    if (toolSplit) {
+      const fr = toolSplit.flush()
+      for (const b of fr.blocks) pushBlock(b)
+      if (fr.partial !== null) pushBlock(fr.partial) // maxTokens cut a block: parses to name '' + raw
+      emitVisible(fr.text)
+    }
 
     // ── cache bookkeeping ──
     const aborted = o.signal?.aborted ?? false
+    const callsClean = toolCalls.every((c) => c.name !== '')
     if (aborted || stops?.matched) {
       dropCache() // barge-in, or a stop-sequence cut (the cache holds a token overrun past it)
     } else if (think) {
       dropCache() // the cached tokens contain reasoning the stripped reply won't reproduce
-    } else if (wrap !== null && text.trim() && resetEpoch === epoch0) {
-      committed = [...messages, { role: 'assistant', content: text }]
+    } else if (wrap !== null && (text.trim() || toolCalls.length > 0) && callsClean && resetEpoch === epoch0) {
+      const assistant: ChatMessage = { role: 'assistant', content: text }
+      if (toolCalls.length) assistant.tool_calls = toolCalls.map((c) => ({ name: c.name, arguments: c.arguments }))
+      committed = [...messages, assistant]
+      committedToolsKey = toolsKey
       cacheEndsAtEos = false // the engine stopped AT eos without recording it
     } else {
-      dropCache() // empty reply, non-ChatML template, or a reset() raced this turn
+      dropCache() // empty reply, a truncated tool call, a non-ChatML template, or a reset() raced this turn
     }
 
     return {
       text,
       thinkText,
+      toolCalls,
       tokens: result.tokens,
       inputTokenIds,
-      finishReason: aborted ? 'abort' : stops?.matched ? 'stop' : result.tokens.length >= maxTokens ? 'length' : 'stop',
+      finishReason:
+        aborted ? 'abort'
+        : stops?.matched ? 'stop'
+        : result.tokens.length >= maxTokens ? 'length'
+        : toolCalls.length > 0 ? 'tool_calls'
+        : 'stop',
       reusedCache: canReuse,
       prefillMs: result.prefillMs,
       decodeMs: result.decodeMs,
@@ -340,16 +470,18 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
 
   const send = serialize(sendImpl)
 
-  async function prewarmImpl(messages: ChatMessage[]): Promise<void> {
+  async function prewarmImpl(messages: ChatMessage[], opts: { tools?: ChatTool[] } = {}): Promise<void> {
     if (wrap === null) return // no ChatML wrappers -> reuse is disabled anyway, nothing to warm
+    const prep = opts.tools?.length ? prepareTools(opts.tools, 'auto') : null
     // Render WITHOUT the generation prompt and drop the trailing newline so the cache ends exactly
     // at the eos token; the standard reuse delta (which begins with "\n") then reconstructs the
     // next prompt token-for-token.
-    const str = tk.applyChatTemplate(messages, { addGenerationPrompt: false, enableThinking: false }).replace(/\n$/, '')
+    const str = tk.applyChatTemplate(messages, { addGenerationPrompt: false, enableThinking: false, tools: prep?.tools }).replace(/\n$/, '')
     const epoch0 = resetEpoch
     await engine.prefill(tk.encode(str, false))
     if (resetEpoch !== epoch0) return // a reset() landed mid-prefill: stay forgotten
     committed = [...messages]
+    committedToolsKey = prep ? JSON.stringify(prep.tools) : null
     cacheEndsAtEos = true
   }
 
@@ -401,8 +533,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       return gen()
     },
     prewarm: serialize(prewarmImpl),
-    countTokens: (messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean }): number =>
-      tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: opts?.addGenerationPrompt ?? true, enableThinking: opts?.think ?? false }), false).length,
+    countTokens: (messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean; tools?: ChatTool[] }): number =>
+      tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: opts?.addGenerationPrompt ?? true, enableThinking: opts?.think ?? false, tools: opts?.tools }), false).length,
     reset: (): void => {
       // Synchronous like engine.resetCache(); a turn in flight sees the epoch bump and will not
       // commit, so the next turn starts from the cleared transcript (a clean full prefill).

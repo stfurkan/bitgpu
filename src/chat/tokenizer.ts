@@ -11,8 +11,12 @@ import { Tokenizer } from '@huggingface/tokenizers'
 import { Template } from '@huggingface/jinja'
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | (string & {})
+  role: 'system' | 'user' | 'assistant' | 'tool' | (string & {})
   content: string
+  /** Tool calls made on a past assistant turn (the template renders them back as <tool_call>
+   *  blocks). Feed a turn's calls back verbatim from {@link ChatResult.toolCalls} when
+   *  continuing a tool round trip; a `tool` role message then carries each result. */
+  tool_calls?: { name: string; arguments: Record<string, unknown> | string }[]
 }
 
 /** Incremental decoder for streaming generation: feed token ids as they arrive, get the newly
@@ -72,6 +76,11 @@ export class ChatTokenizer {
     return this.tok.id_to_token(id)
   }
 
+  /** The id of an exact vocab token (e.g. the <tool_call> marker); undefined when absent. */
+  tokenToId(token: string): number | undefined {
+    return this.tok.token_to_id(token)
+  }
+
   /** Ids of all added tokens (ChatML markers, <think>, etc.) - never plain content. */
   addedTokenIds(): Set<number> {
     return new Set(this.tok.get_added_tokens_decoder().keys())
@@ -82,12 +91,14 @@ export class ChatTokenizer {
   }
 
   /** Render a message list to a prompt string via the model's own Jinja chat template
-   *  (matches transformers.js apply_chat_template byte-exactly). */
-  applyChatTemplate(messages: ChatMessage[], opts: { addGenerationPrompt?: boolean; enableThinking?: boolean } = {}): string {
+   *  (matches transformers.js apply_chat_template byte-exactly). `tools` is passed to the
+   *  template verbatim (Qwen-family templates serialize each entry into the system block). */
+  applyChatTemplate(messages: ChatMessage[], opts: { addGenerationPrompt?: boolean; enableThinking?: boolean; tools?: readonly unknown[] } = {}): string {
     if (!this.template) throw new Error('bitgpu/chat: the model has no chat_template in tokenizer_config.json')
     return this.template.render({
       ...this.templateContext,
       messages,
+      tools: opts.tools ?? null,
       add_generation_prompt: opts.addGenerationPrompt ?? true,
       enable_thinking: opts.enableThinking ?? false,
     })

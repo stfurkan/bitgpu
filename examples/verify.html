@@ -366,6 +366,45 @@
         ok = ok && jsOk;
         log(`  ${jsOk ? '[PASS]' : '[FAIL]'} chat json schema enforced (3 items, exact keys/types, ${js.tokens.length} tokens, ${js.tokensPerSecond.toFixed(1)} tok/s)`);
         log(`    schema'd: ${js.text.replace(/\s+/g, ' ').slice(0, 110)}`);
+        // tool calling on real hardware. The FORCED path is the guaranteed one: the reply must be
+        // exactly one <tool_call> block naming the tool with schema-valid arguments (the forced
+        // first token also exercises the full-vocab fallback when <tool_call> is not in the
+        // top-K). Greedy for per-model determinism, checked by running twice.
+        const WEATHER = [{ type: 'function', function: { name: 'get_weather', description: 'Get the current weather for a city.', parameters: { type: 'object', required: ['city'], additionalProperties: false, properties: { city: { type: 'string' }, unit: { enum: ['celsius', 'fahrenheit'] } } } } }];
+        const tq = [{ role: 'user', content: 'What is the weather in Paris right now?' }];
+        chat.reset();
+        const f1 = await chat.send(tq, { tools: WEATHER, toolChoice: { name: 'get_weather' }, maxTokens: 64 });
+        chat.reset();
+        const f2 = await chat.send(tq, { tools: WEATHER, toolChoice: { name: 'get_weather' }, maxTokens: 64 });
+        const fCall = f1.toolCalls.length === 1 ? f1.toolCalls[0] : null;
+        const fOk = fCall !== null && fCall.name === 'get_weather' && typeof fCall.arguments.city === 'string' && fCall.arguments.city.length > 0
+          && Object.keys(fCall.arguments).every((k) => k === 'city' || k === 'unit')
+          && f1.text === '' && f1.finishReason === 'tool_calls'
+          && JSON.stringify(f1.toolCalls) === JSON.stringify(f2.toolCalls);
+        ok = ok && fOk;
+        log(`  ${fOk ? '[PASS]' : '[FAIL]'} chat forced tool call (schema-valid args, deterministic, ${f1.tokens.length} tokens, ${f1.tokensPerSecond.toFixed(1)} tok/s)`);
+        log(`    call: ${JSON.stringify(fCall && { name: fCall.name, arguments: fCall.arguments })}`);
+        // round trip: the tool-result turn must EXTEND the KV cache, and (when the model answers
+        // in prose) be bit-exact vs a cold prefill of the exact same token sequence - the same
+        // proof as the plain-chat reuse check.
+        chat.reset();
+        const w1 = await chat.send(tq, { tools: WEATHER, toolChoice: { name: 'get_weather' }, maxTokens: 64 });
+        const w2 = await chat.send([...tq, { role: 'assistant', content: w1.text, tool_calls: w1.toolCalls }, { role: 'tool', content: '{"temp_c": 21, "sky": "clear"}' }], { tools: WEATHER, maxTokens: 48 });
+        engine.resetCache();
+        const wCold = await engine.generate([...w1.inputTokenIds, ...w1.tokens, ...w2.inputTokenIds], { maxTokens: 48, stopTokens: [chat.eosTokenId] });
+        const wBitOk = w2.toolCalls.length > 0 || (w2.tokens.length === wCold.tokens.length && w2.tokens.every((t, i) => t === wCold.tokens[i]));
+        const wOk = w2.reusedCache && wBitOk && (w2.text.length > 0 || w2.toolCalls.length > 0);
+        ok = ok && wOk;
+        log(`  ${wOk ? '[PASS]' : '[FAIL]'} chat tool round trip: result turn reuses cache${w2.toolCalls.length ? '' : ', bit-exact vs cold'} (reused=${w2.reusedCache})`);
+        log(`    after tool: ${(w2.text || JSON.stringify(w2.toolCalls)).replace(/\s+/g, ' ').slice(0, 100)}`);
+        // auto mode is model judgment (whether it calls is not gated); the STRUCTURE must still
+        // be clean either way - valid calls only, tags never in the visible text.
+        chat.reset();
+        const a1 = await chat.send([{ role: 'user', content: 'Use the get_weather tool to check the weather in Tokyo.' }], { tools: WEATHER, maxTokens: 96 });
+        const aOk = a1.toolCalls.every((c) => c.name === 'get_weather' && typeof c.arguments === 'object') && !a1.text.includes('<tool_call>');
+        ok = ok && aOk;
+        log(`  ${aOk ? '[PASS]' : '[FAIL]'} chat auto tools: ${a1.toolCalls.length ? `called with ${JSON.stringify(a1.toolCalls[0].arguments).slice(0, 60)}` : 'answered in prose (model judgment; structure clean)'}`);
+        chat.reset();
       }
 
       // 8) f16 KV cache mode (kvCache: 'f16'). Within-mode behavior must stay EXACT (determinism,
