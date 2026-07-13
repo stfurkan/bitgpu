@@ -49,7 +49,8 @@ await chat.send([{ role: 'user', content: 'Hi!' }], { onText: (t) => process.std
 
 The [demo](https://stfurkan.github.io/bitgpu/examples/chat.html) ([source](examples/chat.html))
 is this quickstart as a single HTML file: model picker, streaming chat, JSON mode with a schema
-editor, and cached downloads.
+editor, tool calling, cached downloads, and sessions that survive reloads (the KV cache is
+snapshot into IndexedDB and restored - the conversation continues with no re-prefill).
 
 ## Usage
 

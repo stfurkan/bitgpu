@@ -122,7 +122,10 @@
       Or flip on <b>Tools</b> and ask <i>"What is 12.5% of 4,832? Use the calculator."</i> -
       the model calls a calculator that runs inside this page, and the call is grammar-enforced
       so it can never be malformed. Every reply also shows a <b>confidence</b> score computed
-      from the model's own token probabilities.
+      from the model's own token probabilities.<br /><br />
+      Conversations <b>survive reloads</b>: close the tab, come back, load the same model - the
+      chat continues instantly, because the model's working memory (the KV cache) is saved and
+      restored, not re-computed.
     </div>
   </div></div></main>
 
@@ -190,6 +193,28 @@
     };
     refreshStorage();
 
+    // ── session persistence: chat.save() snapshots (messages + the KV cache itself) into
+    // IndexedDB after each turn; the next load of the same model restores the conversation
+    // with NO re-prefill - the model's memory comes back as bytes ──
+    const idbOp = (mode, fn) => new Promise((resolve, reject) => {
+      const open = indexedDB.open('bitgpu-demo', 1);
+      open.onupgradeneeded = () => open.result.createObjectStore('sessions');
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const db = open.result;
+        const rq = fn(db.transaction('sessions', mode).objectStore('sessions'));
+        rq.onsuccess = () => { db.close(); resolve(rq.result); };
+        rq.onerror = () => { db.close(); reject(rq.error); };
+      };
+    });
+    let sessKey = null;
+    const saveSession = () => { // fire-and-forget; quota/serialization errors are non-fatal
+      if (!chat || !sessKey) return;
+      const msgs = JSON.parse(JSON.stringify(messages));
+      chat.save().then((snap) => snap && idbOp('readwrite', (s) => s.put({ snap, msgs }, sessKey))).catch(() => {});
+    };
+    const dropSession = () => { if (sessKey) idbOp('readwrite', (s) => s.delete(sessKey)).catch(() => {}); };
+
     // ── load ──
     let engine = null, chat = null, busy = false, abort = null;
     const messages = [];
@@ -218,7 +243,10 @@
             manifestUrl: `${REPO}/${key}/manifest.json`,
             auxUrl: `${REPO}/${key}/${m.aux}`,
             dataUrl: `${m.hf}/onnx/model_q1.onnx_data`,
-            kvCache: 'f16',
+            // q8 KV: quarter-of-f32 cache memory on ANY adapter (no shader-f16 needed), which
+            // pays for the 4096-token window and keeps session snapshots small.
+            kvCache: 'q8',
+            maxSeqLen: 4096,
             fetchJson, fetchArrayBuffer, fetchStream,
             onProgress: (p) => { if (p.total) $('prog').value = p.loaded / p.total; },
           });
@@ -238,6 +266,28 @@
         $('prog').hidden = true;
         const cap = engine.capabilities;
         status(`<span class="ok">ready</span> - ${key} on ${cap.adapter.vendor ?? 'your GPU'} (${cap.useSubgroups ? 'subgroups' : 'fallback'} path, kv ${cap.kvCache}, window ${cap.maxSeqLen} tokens)`);
+        // restore the previous session for this model, KV cache included - no re-prefill
+        sessKey = `${key}:${cap.kvCache}`;
+        try {
+          const sess = await idbOp('readonly', (s) => s.get(sessKey));
+          if (sess?.snap && sess.msgs?.length) {
+            await chat.restore(sess.snap);
+            messages.push(...sess.msgs);
+            let pendingCalls = [];
+            for (const m of sess.msgs) {
+              if (m.role === 'user') bubble('user', m.content);
+              else if (m.role === 'assistant') { pendingCalls = [...(m.tool_calls ?? [])]; if (m.content) bubble('assistant', m.content); }
+              else if (m.role === 'tool') {
+                const call = pendingCalls.shift();
+                const tb = bubble('toolcall', '');
+                tb.innerHTML = '⚙ <b></b> → ';
+                tb.querySelector('b').textContent = call ? `${call.name}(${JSON.stringify(call.arguments)})` : 'tool';
+                tb.appendChild(document.createTextNode(m.content));
+              }
+            }
+            status(`<span class="ok">session restored</span> - ${key} picks up where you left off: the model's memory came back from IndexedDB, the next turn just appends (no re-prefill).`);
+          }
+        } catch { dropSession(); } // stale/mismatched snapshot (e.g. new engine version): start fresh
         $('prompt').disabled = false; $('send').disabled = false; $('clear').disabled = false;
         setPlaceholder(); $('prompt').focus();
         markCached(); refreshStorage();
@@ -303,8 +353,9 @@
       if (busy) abort?.abort();
       messages.length = 0;
       chat?.reset();
+      dropSession();
       $('log').replaceChildren();
-      status('<span class="ok">chat cleared</span> - the model forgot the conversation (KV cache reset).');
+      status('<span class="ok">chat cleared</span> - the model forgot the conversation (KV cache reset, saved session removed).');
     };
 
     // geometric-mean token probability from the per-token logprobs: an honest "how sure was the
@@ -388,6 +439,7 @@
             + (calls ? ` · ${calls} tool round${calls > 1 ? 's' : ''}` : '')
             + (json ? ` · ${r.finishReason === 'stop' ? 'valid JSON' : 'cut by maxTokens'}` : '');
           out.appendChild(meta);
+          saveSession(); // persist the conversation + KV cache; a reload continues from here
         }
       } catch (e) {
         out.textContent = `error: ${e.message}`;
