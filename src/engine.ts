@@ -246,7 +246,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // f16 KV STORAGE (math stays f32; one rounding at cache-write). 'f16' silently falls back to
   // f32 where shader-f16 is missing, so callers can request it unconditionally.
   const kv16 = opts.kvCache === 'f16' && adapter.features.has('shader-f16' as GPUFeatureName)
-  const KVB = kv16 ? 2 : 4 // bytes per cached K/V element
+  // q8: packed snorm8 K/V with one f32 scale per 32-element block (q8_0-style). Pure core WGSL
+  // (pack4x8snorm), so unlike f16 it needs no adapter feature - available everywhere.
+  const kv8 = opts.kvCache === 'q8'
+  const KVB = kv16 ? 2 : kv8 ? 1 : 4 // bytes per cached K/V element (q8 block scales tracked separately)
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
   if (kv16) features.push('shader-f16' as GPUFeatureName)
@@ -286,6 +289,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
   for (const r of [T.embed_tokens.weight!, T.embed_tokens.scales!, T.embed_tokens.zp!, manifest.luts.tgt4]) track(r.len)
+  if (kv8 && A.head_dim % 32 !== 0)
+    throw new Error(`bitgpu: kvCache 'q8' needs head_dim divisible by 32 (got ${A.head_dim}); use 'f16' or 'f32' for this model`)
   // Non-weight bindings that also count against the limit: a per-layer KV buffer at full
   // maxSeqLen capacity, the largest prefill-segment activation, and the widest logits scratch.
   const kvLayerBytes = maxSeqLen * A.kv_heads * A.head_dim * KVB
@@ -351,10 +356,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (useSG) for (const n of ['attention_sg_kv16', 'rmsnorm_rope_sg_kv16']) specs.push([n, { SG: sgMax }])
     else specs.push(['attention_wg_kv16'])
   }
-  // Cache-touching kernel names resolve once by KV storage mode.
-  const ATT = kv16 ? (useSG ? 'attention_sg_kv16' : 'attention_wg_kv16') : useSG ? 'attention_sg' : 'attention_wg'
-  const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache
-  const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache
+  if (kv8) {
+    // q8-KV variants (pure core WGSL: pack4x8snorm; no adapter feature needed)
+    specs.push(['copy_kv8'])
+    if (useSG) for (const n of ['attention_sg_kv8', 'rmsnorm_rope_sg_kv8']) specs.push([n, { SG: sgMax }])
+    else specs.push(['attention_wg_kv8'])
+  }
+  // Cache-touching kernel names resolve once by KV storage mode. q8's writers need extra
+  // bindings (the block-scale buffers), so its call sites branch instead of renaming.
+  const ATT = kv16 ? (useSG ? 'attention_sg_kv16' : 'attention_wg_kv16') : kv8 ? (useSG ? 'attention_sg_kv8' : 'attention_wg_kv8') : useSG ? 'attention_sg' : 'attention_wg'
+  const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache (f32/f16; q8 branches)
+  const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache (f32/f16; q8 branches)
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
   const S_ = GPUBufferUsage.STORAGE,
@@ -745,9 +757,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   let kvCapacity = Math.min(maxSeqLen, KV_INITIAL)
   const Kc: GPUBuffer[] = [],
     Vc: GPUBuffer[] = []
+  // q8 block scales: one f32 per 32 cached elements, per layer, alongside Kc/Vc (empty otherwise)
+  const Ksc: GPUBuffer[] = [],
+    Vsc: GPUBuffer[] = []
+  const kvScaleBytes = (cap: number): number => cap * KV * (Dh / 32) * 4
   for (let li = 0; li < A.layers; li++) {
     Kc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
     Vc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
+    if (kv8) {
+      Ksc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
+      Vsc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
+    }
   }
   const loadOom = await device.popErrorScope()
   const loadVal = await device.popErrorScope()
@@ -761,8 +781,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (needed <= kvCapacity) return
     const newCap = Math.min(maxSeqLen, Math.max(needed, kvCapacity * 2))
     const copyBytes = kvCapacity * KV * Dh * KVB // preserve all currently-allocated K/V
+    const copyScales = kvScaleBytes(kvCapacity)
     device.pushErrorScope('out-of-memory')
     const enc = device.createCommandEncoder()
+    // Every cache buffer this layer set held before the growth, in [K, V, (Ksc, Vsc)] groups.
+    const per = kv8 ? 4 : 2
     const olds: GPUBuffer[] = []
     for (let li = 0; li < A.layers; li++) {
       const nk = device.createBuffer({ size: newCap * KV * Dh * KVB, usage: S_ | CS | CD })
@@ -772,6 +795,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       olds.push(Kc[li], Vc[li])
       Kc[li] = nk
       Vc[li] = nv
+      if (kv8) {
+        const nks = device.createBuffer({ size: kvScaleBytes(newCap), usage: S_ | CS | CD })
+        const nvs = device.createBuffer({ size: kvScaleBytes(newCap), usage: S_ | CS | CD })
+        enc.copyBufferToBuffer(Ksc[li], 0, nks, 0, copyScales)
+        enc.copyBufferToBuffer(Vsc[li], 0, nvs, 0, copyScales)
+        olds.push(Ksc[li], Vsc[li])
+        Ksc[li] = nks
+        Vsc[li] = nvs
+      }
     }
     device.queue.submit([enc.finish()])
     await device.queue.onSubmittedWorkDone()
@@ -781,8 +813,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       for (let li = 0; li < A.layers; li++) {
         Kc[li].destroy()
         Vc[li].destroy()
-        Kc[li] = olds[2 * li]
-        Vc[li] = olds[2 * li + 1]
+        Kc[li] = olds[per * li]
+        Vc[li] = olds[per * li + 1]
+        if (kv8) {
+          Ksc[li].destroy()
+          Vsc[li].destroy()
+          Ksc[li] = olds[per * li + 2]
+          Vsc[li] = olds[per * li + 3]
+        }
       }
       poolInvalidate()
       throw new GpuOutOfMemoryError(`KV cache growth to ${newCap} positions failed: ${oom.message}`)
@@ -932,6 +970,21 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
+  // Append `rows` rows of Dh f32 values into layer li's K (which=0) or V (which=1) cache at row
+  // dstRow0, quantizing under q8 (copy_kv8 is a per-row workgroup kernel with two outputs, so it
+  // cannot ride the flat COPY_KV dispatch).
+  function appendKV(pass: GPUComputePassEncoder, src: GPUBuffer, which: 0 | 1, li: number, rows: number, dstRow0: number): void {
+    const data = which === 0 ? Kc[li] : Vc[li]
+    if (kv8) {
+      setup(pass, 'copy_kv8', [['u', rows], ['u', Dh], ['u', dstRow0], ['u', 0]], [src], [data, which === 0 ? Ksc[li] : Vsc[li]])
+      pass.dispatchWorkgroups(isFull('copy_kv8') ? rows : 1)
+    } else {
+      run(pass, COPY_KV, [['u', rows * Dh], ['u', dstRow0 * Dh], ['u', 0], ['u', 0]], [src], data, rows * Dh)
+    }
+  }
+  // The attention kernel's cache bindings by KV mode (q8 adds the block-scale buffers).
+  const attIns = (qr: GPUBuffer, li: number): GPUBuffer[] => (kv8 ? [qr, Kc[li], Vc[li], Ksc[li], Vsc[li]] : [qr, Kc[li], Vc[li]])
+
   function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const Ltot = posBase + S
     const n1 = actBuf(S * Hd)
@@ -946,13 +999,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const Ntot = qkv.N0! + qkv.N1! + qkv.N2!,
         gx = Math.min(Ntot, 65535)
       runWG(pass, 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
-      run(pass, COPY_KV, [['u', KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], KV * Dh)
+      appendKV(pass, v, 1, li, KV, posBase * KV)
       const qr = actBuf(H * Dh)
       runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
-      runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], Kc[li], KV)
+      if (kv8) {
+        // fused K write, quantizing into the cache (extra scale binding -> its own dispatch)
+        setup(pass, 'rmsnorm_rope_sg_kv8', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', 0], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], [Kc[li], Ksc[li]])
+        pass.dispatchWorkgroups(isFull('rmsnorm_rope_sg_kv8') ? KV : 1)
+      } else {
+        runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], Kc[li], KV)
+      }
       cap(li, 'qr', qr)
       const att = actBuf(H * Dh)
-      runN(pass, ATT, [['u', 1], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]], [qr, Kc[li], Vc[li]], att, H)
+      runN(pass, ATT, [['u', 1], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]], attIns(qr, li), att, H)
       cap(li, 'att', att)
       const o = W[`layers.${li}.attn.o_proj`],
         h2 = actBuf(Hd)
@@ -984,12 +1043,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       kr = actBuf(S * KV * Dh)
     run(pass, 'rope', [['u', S], ['u', H], ['u', Dh], ['u', 0]], [qn, cos, sin], qr, S * H * Dh)
     run(pass, 'rope', [['u', S], ['u', KV], ['u', Dh], ['u', 0]], [kn, cos, sin], kr, S * KV * Dh)
-    run(pass, COPY_KV, [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [kr], Kc[li], S * KV * Dh)
-    run(pass, COPY_KV, [['u', S * KV * Dh], ['u', posBase * KV * Dh], ['u', 0], ['u', 0]], [v], Vc[li], S * KV * Dh)
+    appendKV(pass, kr, 0, li, S * KV, posBase * KV)
+    appendKV(pass, v, 1, li, S * KV, posBase * KV)
     cap(li, 'qr', qr)
     const att = actBuf(S * H * Dh)
     const attF: Field[] = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]]
-    runN(pass, ATT, attF, [qr, Kc[li], Vc[li]], att, S * H)
+    runN(pass, ATT, attF, attIns(qr, li), att, S * H)
     cap(li, 'att', att)
     const o = W[`layers.${li}.attn.o_proj`],
       h2 = actBuf(S * Hd)
@@ -1698,8 +1757,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const ck: Record<string, Float32Array> = {}
       for (const [name, b] of Object.entries(DBG0)) ck[name] = await readback(b, b.size / 4)
       const off = pos * KV * Dh
-      if (!kv16) {
-        // f32-mode only: readback() types the bytes as f32, which is wrong for an f16 cache
+      if (!kv16 && !kv8) {
+        // f32-mode only: readback() types the bytes as f32, which is wrong for an f16/q8 cache
         ck.kc = (await readback(Kc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh) // kvCapacity, not maxSeqLen: the cache may not have grown yet
         ck.vc = (await readback(Vc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh)
       }
@@ -1759,7 +1818,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const capabilities: EngineCapabilities = {
     useSubgroups: useSG,
     subgroupSize: sgMax,
-    kvCache: kv16 ? 'f16' : 'f32',
+    kvCache: kv16 ? 'f16' : kv8 ? 'q8' : 'f32',
     maxSeqLen,
     adapter: { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description },
     limits: {

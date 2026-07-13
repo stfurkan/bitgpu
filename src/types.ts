@@ -45,15 +45,20 @@ export interface EngineOptions {
   /** Prefill GEMM tiling: `'auto'` tiles once a prompt fills the 64-row tiles, `'always'`/`'never'` force it. Default `'auto'`. */
   prefillTiling?: 'auto' | 'always' | 'never'
   /** Max KV-cache length (prompt + generated positions). Caps VRAM (~`maxSeqLen` x 224 KB at f32,
-   *  half that with `kvCache: 'f16'`). Default `2048`. */
+   *  half that with `kvCache: 'f16'`, ~a quarter with `'q8'`). Default `2048`. */
   maxSeqLen?: number
-  /** KV-cache STORAGE precision. `'f16'` halves KV memory (the industry-standard choice: all
-   *  arithmetic stays f32; each cached K/V value is rounded once at cache-write). Outputs are no
-   *  longer guaranteed bit-identical to f32 mode, though within f16 mode decoding stays exact and
-   *  deterministic (same seed -> same tokens; cache reuse == full prefill). Falls back to `'f32'`
-   *  silently when the adapter lacks `shader-f16` (see `capabilities.kvCache` for what's active).
-   *  Default `'f32'`. */
-  kvCache?: 'f32' | 'f16'
+  /** KV-cache STORAGE precision. `'f16'` halves KV memory (all arithmetic stays f32; each cached
+   *  K/V value is rounded once at cache-write); it falls back to `'f32'` silently when the
+   *  adapter lacks `shader-f16`. `'q8'` QUARTERS KV memory vs f32 (packed 8-bit values with one
+   *  f32 scale per 32-element block, llama.cpp q8_0-style, ~1.125 bytes/value) and needs no
+   *  adapter feature, so it works even where f16 does not (and at long context it decodes FASTER
+   *  than f32 - attention there is memory-bound and reads a quarter of the bytes). Outputs under
+   *  f16/q8 are no longer
+   *  guaranteed bit-identical to f32 mode - q8 is the first knowingly-lossy tier, measured per
+   *  model by the GPU gate - though WITHIN a mode decoding stays exact and deterministic (same
+   *  seed -> same tokens; cache reuse == full prefill). See `capabilities.kvCache` for what's
+   *  active. Default `'f32'`. */
+  kvCache?: 'f32' | 'f16' | 'q8'
   /** Called as the model loads. */
   onProgress?: (progress: LoadProgress) => void
   /** Called if the GPU device is lost after creation (driver reset, OS reclaim, tab backgrounding
@@ -182,8 +187,9 @@ export interface EngineCapabilities {
   useSubgroups: boolean
   /** Subgroup width when the subgroup path is active. */
   subgroupSize: number
-  /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16). */
-  kvCache: 'f32' | 'f16'
+  /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16;
+   *  'q8' whenever requested - it needs no adapter feature). */
+  kvCache: 'f32' | 'f16' | 'q8'
   /** The engine's KV window in positions (the resolved maxSeqLen option): prompt + generated
    *  tokens per conversation must fit inside it. */
   maxSeqLen: number

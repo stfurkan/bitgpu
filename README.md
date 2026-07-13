@@ -6,7 +6,8 @@ Today it runs **1-bit (binary-weight)** models.
 Reference targets are Bonsai **1.7B, 4B and 8B** (Qwen3 architecture, sign-packed binary linear
 weights + 2/4-bit embeddings, tied or untied lm_head) - every size is gated bit-exact against the
 reference forward on real hardware. GPU-resident decode (greedy or sampled), streaming, EOS stop,
-`AbortSignal`, and cross-turn KV-cache reuse. Runs the fast subgroup path on Apple / NVIDIA /
+`AbortSignal`, cross-turn KV-cache reuse, and optional f16/q8 KV-cache compression for long
+contexts in less VRAM. Runs the fast subgroup path on Apple / NVIDIA /
 recent AMD and falls back to a workgroup-reduction path everywhere else WebGPU is available.
 Device limits are negotiated from the manifest, so the 8B's ~148 MiB lm_head binding is requested
 only when that model needs it and smaller models keep running at WebGPU's guaranteed minimums.
@@ -83,6 +84,35 @@ await engine.generate(promptTokenIds, { repetitionPenalty: 1.15, noRepeatNgramSi
 
 engine.dispose()
 ```
+
+### KV cache modes (`kvCache`)
+
+The KV cache is what grows with conversation length (~224 KB per position at f32 on
+Bonsai-1.7B; `maxSeqLen` caps it). `kvCache` selects its **storage** precision - attention
+arithmetic always stays f32, values are compressed once at cache-write:
+
+| Mode | Bytes/value | KV memory | Requires |
+| --- | --- | --- | --- |
+| `'f32'` (default) | 4 | 1x | - |
+| `'f16'` | 2 | 1/2 | `shader-f16` (silently falls back to f32 without it) |
+| `'q8'` | ~1.125 | ~1/4 | nothing - works on every WebGPU adapter |
+
+```ts
+const engine = await createEngine({ modelUrl, kvCache: 'q8', maxSeqLen: 4096 })
+```
+
+`'q8'` stores 8-bit values with one f32 scale per 32-element block (llama.cpp q8_0-style, the
+tier the wider ecosystem treats as near-lossless). Within any mode decoding stays exact and
+deterministic (same seed -> same tokens, cache reuse == full prefill), but f16/q8 outputs are
+**not guaranteed bit-identical to f32** - they are measured instead: the GPU gate compares
+greedy continuations against f32 on every Bonsai size and both kernel paths, and q8 currently
+agrees 96/96 tokens on short prompts, 24/24 after a 400-token prompt and 48/48 after a
+1500-token prompt (logits cosine >= 0.99997). Long contexts also get *faster* under q8 - decode
+at 1500 tokens of depth measured 37-58% quicker than f32 (attention there is memory-bound and
+reads a quarter of the bytes) - while shallow-context decode measures a few percent slower.
+Reach for `'q8'` to run a 4x longer window in the same VRAM (or the same window on smaller
+GPUs); keep the default `'f32'` when bit-exact reproducibility is the point.
+`engine.capabilities.kvCache` reports what is actually active.
 
 ## Chat (`bitgpu/chat`)
 
@@ -310,8 +340,9 @@ npm run check:publish # publint + are-the-types-wrong
 
 `examples/verify.html` re-runs the full bit-exactness + throughput suite (forward cosines vs the
 committed reference fixtures in `test-fixtures/forward/`, known-good greedy ids, sampler kernel
-parity, determinism, KV reuse/growth, prompt-lookup identity) against the **built package** and
-prints `PACKAGE OK` or `REGRESSION`.
+parity, determinism, KV reuse/growth, prompt-lookup identity, and the f16/q8 KV-mode sections:
+within-mode exactness plus greedy agreement vs f32 out to a 1500-token prompt) against the
+**built package** and prints `PACKAGE OK` or `REGRESSION`.
 
 It needs model weights, which are not committed. Point `examples/model` at a directory holding the
 model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):

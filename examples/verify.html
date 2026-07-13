@@ -496,6 +496,77 @@
         e16.dispose();
       } else log('\nf16 KV cache checks SKIPPED (no shader-f16 on this adapter)');
 
+      // 9) q8 KV cache mode (kvCache: 'q8', ~1.125 bytes/value, quarter of f32). Same contract
+      // as f16: within-mode behavior must stay EXACT; agreement vs f32 is gated loosely (the
+      // known-good prefix bar) and reported as the quality measurement. q8 needs no adapter
+      // feature, so this section runs everywhere, including the nosg fallback.
+      {
+        log('\nq8 KV cache checks (second engine, kvCache: q8)...');
+        const e8 = await createEngine({ modelUrl: MODEL_DIR, kvCache: 'q8', forceNoSubgroups: new URLSearchParams(location.search).get('nosg') === '1' });
+        const capOk8 = e8.capabilities.kvCache === 'q8';
+        ok = ok && capOk8;
+        log(`  ${capOk8 ? '[PASS]' : '[FAIL]'} capabilities.kvCache = ${e8.capabilities.kvCache}`);
+        // forward correctness vs the f32 reference fixtures (cosine thresholds)
+        const r8 = await e8.forward(ids);
+        for (const name of ['embed', 'layer0', 'finalnorm', 'logits']) {
+          const c = cos(r8[name], new Float32Array(await buf(`${FIX}/${name}.bin`)));
+          const pass = c > 0.999; ok = ok && pass;
+          log(`  ${pass ? '[PASS]' : '[FAIL]'} forward ${name.padEnd(9)} cosine=${c.toFixed(7)}`);
+        }
+        // within-mode exactness: determinism + reuse == cold full prefill
+        const q1 = await e8.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+        const q2 = await e8.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+        const detOk8 = q1.tokens.length === q2.tokens.length && q1.tokens.every((t, i) => t === q2.tokens[i]);
+        ok = ok && detOk8;
+        log(`  ${detOk8 ? '[PASS]' : '[FAIL]'} q8 determinism (seed 42 identical twice)`);
+        e8.resetCache();
+        const qr1 = await e8.generate(ids, { maxTokens: 8 });
+        const qr2 = await e8.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        e8.resetCache();
+        const qc2 = await e8.generate([...ids, ...qr1.tokens, ...ids.slice(0, 5)], { maxTokens: 8 });
+        const rOk8 = qr2.tokens.length === qc2.tokens.length && qr2.tokens.every((t, i) => t === qc2.tokens[i]);
+        ok = ok && rOk8;
+        log(`  ${rOk8 ? '[PASS]' : '[FAIL]'} q8 reuse turn-2 == full-prefill turn-2 (exact within mode)`);
+        // f32 vs q8 token agreement (greedy): compare continuations until first divergence.
+        // Gate: the fixture prompt must agree for >= 24 of 32; the rest is reported measurement.
+        e8.resetCache(); engine.resetCache();
+        let agr8 = 0, agrN8 = 0;
+        for (const pr of [ids, [...ids, ...ids], ids.slice(0, 7)]) {
+          const a = await engine.generate(pr, { maxTokens: 32 });
+          const b = await e8.generate(pr, { maxTokens: 32 });
+          let n = 0; while (n < a.tokens.length && n < b.tokens.length && a.tokens[n] === b.tokens[n]) n++;
+          agr8 += n; agrN8 += a.tokens.length;
+          log(`  agreement (greedy 32, prompt ${pr.length} tok): ${n}/${a.tokens.length}${n === a.tokens.length ? ' identical' : ' then diverged'}`);
+          e8.resetCache(); engine.resetCache();
+        }
+        const qFix = await e8.generate(ids, { maxTokens: 32 });
+        let nFix8 = 0; while (nFix8 < 32 && qFix.tokens[nFix8] === KNOWN_GOOD[nFix8]) nFix8++;
+        const aOk8 = nFix8 >= 24;
+        ok = ok && aOk8;
+        log(`  ${aOk8 ? '[PASS]' : '[FAIL]'} q8 vs known-good ids: ${nFix8}/32 prefix (total agreement ${agr8}/${agrN8})`);
+        // long-context quality probes: long prompts exercise hundreds/thousands of quantized
+        // reads per score; continuations are compared f32 vs q8 (agreement measured, not gated
+        // hard). The deep probe builds a varied (rotated-slice) prompt so it is not purely
+        // repetitive, and decodes 48 tokens so quantized decode-written rows are read back too.
+        const longP = []; while (longP.length < 400) longP.push(...ids);
+        const lp32 = longP.slice(0, 400);
+        engine.resetCache(); const aL = await engine.generate(lp32, { maxTokens: 24 });
+        e8.resetCache(); const bL = await e8.generate(lp32, { maxTokens: 24 });
+        let nL = 0; while (nL < aL.tokens.length && nL < bL.tokens.length && aL.tokens[nL] === bL.tokens[nL]) nL++;
+        log(`  agreement (greedy 24, prompt 400 tok): ${nL}/${aL.tokens.length}${nL === aL.tokens.length ? ' identical' : ' then diverged'}`);
+        const deepP = []; let rot = 0;
+        while (deepP.length < 1500) { deepP.push(...ids.slice(rot % ids.length), ...ids.slice(0, rot % ids.length)); rot += 3; }
+        const lp1500 = deepP.slice(0, 1500);
+        engine.resetCache(); const aD = await engine.generate(lp1500, { maxTokens: 48 });
+        e8.resetCache(); const bD = await e8.generate(lp1500, { maxTokens: 48 });
+        let nD = 0; while (nD < aD.tokens.length && nD < bD.tokens.length && aD.tokens[nD] === bD.tokens[nD]) nD++;
+        log(`  agreement (greedy 48, prompt 1500 tok): ${nD}/${aD.tokens.length}${nD === aD.tokens.length ? ' identical' : ' then diverged'}`);
+        log(`  q8 decode at depth 1500: ${bD.tokensPerSecond.toFixed(2)} tok/s (f32 at depth: ${aD.tokensPerSecond.toFixed(2)})`);
+        engine.resetCache();
+        log(`  q8 decode ${qFix.tokensPerSecond.toFixed(2)} tok/s (f32 was ${g.tokensPerSecond.toFixed(2)})`);
+        e8.dispose();
+      }
+
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);
     }
 
