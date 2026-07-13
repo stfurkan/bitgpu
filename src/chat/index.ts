@@ -9,7 +9,7 @@
 // The two text libraries (@huggingface/tokenizers, @huggingface/jinja - pure JS, Apache-2.0)
 // are inlined into dist/chat.js at build time, the same way the engine inlines its WGSL:
 // `bitgpu` stays a zero-dependency package, and importing plain `bitgpu` never loads chat code.
-import type { Engine, GenerateOptions, GenerateResult, TokenLogprobs } from '../types'
+import type { Engine, GenerateOptions, GenerateResult, KvSnapshot, TokenLogprobs } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
 import { ThinkSplitter, StopScanner } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
@@ -130,6 +130,23 @@ export interface ChatResult {
   tokensPerSecond: number
 }
 
+/** A saved conversation from {@link Chat.save}: the engine's {@link KvSnapshot} plus the
+ *  chat-layer bookkeeping that makes cache reuse safe. Structured-cloneable (store in
+ *  IndexedDB / OPFS or postMessage as-is; NOT `JSON.stringify`-able - the KV buffer would be
+ *  lost). Treat the fields as opaque. */
+export interface ChatSnapshot {
+  /** Snapshot format version (currently `1`). */
+  version: 1
+  /** The engine-level KV cache + token history snapshot. */
+  engine: KvSnapshot
+  /** The committed transcript the cache holds, as messages. */
+  committed: ChatMessage[]
+  /** Whether the cached token sequence already ends with the eos token. */
+  cacheEndsAtEos: boolean
+  /** Canonical JSON of the tools list the conversation was rendered with (null = no tools). */
+  toolsKey: string | null
+}
+
 export interface Chat {
   /** Generate a reply for the message list. Resolves with the full result; stream text via
    *  `onText`. Turns are serialized: overlapping calls queue instead of interleaving. */
@@ -148,6 +165,16 @@ export interface Chat {
   /** Forget the conversation: clears the engine's KV cache and the chat's committed transcript.
    *  Use this (not engine.resetCache()) so the two stay in sync. */
   reset(): void
+  /** Snapshot the conversation - the engine's KV cache plus the chat's committed-transcript
+   *  bookkeeping - as one structured-cloneable object. Persist it (IndexedDB / OPFS) or ship it
+   *  to another worker; restoring it into a chat on the same model and `kvCache` mode makes the
+   *  next clean-append turn extend the cache exactly as if the conversation never stopped (no
+   *  re-prefill). Returns null when no conversation is committed. Queues behind in-flight turns
+   *  like send/stream. */
+  save(): Promise<ChatSnapshot | null>
+  /** Replace the current conversation with a saved snapshot (see {@link Chat.save}). Throws when
+   *  the snapshot does not match this engine's model or `kvCache` mode. */
+  restore(snapshot: ChatSnapshot): Promise<void>
   /** The model's end-of-sequence token id. */
   readonly eosTokenId: number
   /** Escape hatch: encode/decode/applyChatTemplate for callers that need the text boundary. */
@@ -549,6 +576,29 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       resetEpoch++
       dropCache()
     },
+    // Messages are deep-copied through JSON (they are JSON-safe by construction - the template
+    // renders them) so a caller mutating its message objects cannot corrupt a saved snapshot.
+    save: serialize(async (): Promise<ChatSnapshot | null> => {
+      if (committed === null) return null
+      const eng = await engine.saveCache()
+      if (!eng) return null
+      return {
+        version: 1,
+        engine: eng,
+        committed: JSON.parse(JSON.stringify(committed)) as ChatMessage[],
+        cacheEndsAtEos,
+        toolsKey: committedToolsKey,
+      }
+    }),
+    restore: serialize(async (snap: ChatSnapshot): Promise<void> => {
+      if (!snap || snap.version !== 1) throw new Error('bitgpu/chat: unsupported chat snapshot version')
+      if (!Array.isArray(snap.committed) || snap.committed.length === 0) throw new Error('bitgpu/chat: chat snapshot holds no committed transcript')
+      await engine.restoreCache(snap.engine) // validates model + kvCache mode, throws on mismatch
+      resetEpoch++ // same hazard as reset(): a raced turn must not commit over the restored state
+      committed = JSON.parse(JSON.stringify(snap.committed)) as ChatMessage[]
+      committedToolsKey = snap.toolsKey ?? null
+      cacheEndsAtEos = !!snap.cacheEndsAtEos
+    }),
     eosTokenId: tk.eosTokenId,
     tokenizer: tk,
   }

@@ -164,6 +164,12 @@ function mockEngine(tk: ChatTokenizer): Engine & {
     resetCache(): void {
       m.resets++
     },
+    // Minimal snapshot stubs: chat.save()/restore() only need an opaque engine snapshot to
+    // round-trip; the real GPU readback path is covered by the browser gate.
+    async saveCache() {
+      return { version: 1 as const, kvCache: 'f32' as const, model: { layers: 1, kvHeads: 1, headDim: 32, hidden: 32, vocab: 300 }, ids: [1], data: new ArrayBuffer(0) }
+    },
+    async restoreCache(): Promise<void> {},
     capabilities: { maxSeqLen: 128 },
   }
   return m as never
@@ -308,6 +314,22 @@ await (async () => {
     const oi = overflowInfo as { promptTokenCount: number; maxSeqLen: number } | null // TS cannot see the callback assignment
     check('onOverflow receives prompt token count + maxSeqLen', oi !== null && oi.promptTokenCount > 0 && oi.maxSeqLen === 128)
   }
+
+  // save()/restore(): the snapshot must capture the committed-transcript bookkeeping, so a
+  // restored conversation's next clean-append turn is a cache REUSE with the exact same delta
+  // ids as the live continuation (the engine-side KV bytes are covered by the browser gate).
+  engine.script(['snap reply', 'live follow-up', 'unrelated', 'restored follow-up'])
+  const su: ChatMessage = { role: 'user', content: 'snapshot test' }
+  const rSnap = await chat.send([su])
+  const snap = await chat.save()
+  check('save() returns the committed snapshot', snap !== null && snap.version === 1 && snap.committed.length === 2 && snap.committed[1].content === rSnap.text)
+  const followMsgs: ChatMessage[] = [su, { role: 'assistant', content: rSnap.text }, { role: 'user', content: 'more' }]
+  const rLive = await chat.send(followMsgs)
+  await chat.send([{ role: 'user', content: 'pollute' }]) // full prefill commits an unrelated transcript
+  await chat.restore(snap!)
+  const rBack = await chat.send(followMsgs)
+  check('restore() re-enables clean-append reuse', rLive.reusedCache && rBack.reusedCache)
+  check('restored delta ids == live delta ids', JSON.stringify(rBack.inputTokenIds) === JSON.stringify(rLive.inputTokenIds))
 })()
 
 // ── (D) JSON constrained decoding: machine, byte table, filter, mock-engine e2e ──────────────

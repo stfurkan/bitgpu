@@ -199,6 +199,24 @@ export interface EngineCapabilities {
   limits: { maxStorageBufferBindingSize: number; maxComputeWorkgroupStorageSize: number }
 }
 
+/** A saved KV cache + conversation token history, from {@link Engine.saveCache}. A plain object
+ *  holding one `ArrayBuffer`, so it is structured-cloneable: store it in IndexedDB / OPFS or send
+ *  it over `postMessage` as-is (it is NOT `JSON.stringify`-able - the buffer would be lost).
+ *  Restore requires the SAME model architecture and the SAME `kvCache` mode; snapshots never
+ *  convert across modes. Treat the fields as opaque. */
+export interface KvSnapshot {
+  /** Snapshot format version (currently `1`). */
+  version: 1
+  /** KV storage mode the snapshot was taken under. */
+  kvCache: 'f32' | 'f16' | 'q8'
+  /** Architecture stamp; restore rejects a snapshot from a different model shape. */
+  model: { layers: number; kvHeads: number; headDim: number; hidden: number; vocab: number }
+  /** The full conversation token sequence at save time. */
+  ids: number[]
+  /** Packed per-layer cached K/V bytes (and q8 block scales). */
+  data: ArrayBuffer
+}
+
 /** A loaded model ready to generate. Create one with {@link createEngine}. */
 export interface Engine {
   /** Generate tokens from a prompt given as token ids. */
@@ -212,6 +230,19 @@ export interface Engine {
   forward(tokenIds: number[]): Promise<ForwardResult>
   /** Clear the cross-turn KV cache and token history (start a fresh conversation). */
   resetCache(): void
+  /** Snapshot the current conversation - KV cache contents + token history - as a
+   *  structured-cloneable {@link KvSnapshot} (GPU -> CPU readback). Restoring it, into this
+   *  engine or a fresh one on the same model and `kvCache` mode, is bit-identical to having kept
+   *  the conversation alive, so conversations survive engine disposal and page reloads (persist
+   *  the snapshot in IndexedDB / OPFS). Size ~ tokens x layers x kvHeads x headDim x 2 x
+   *  bytes-per-value (~224 KB/token at f32 on Bonsai-1.7B, ~63 KB/token at q8). Returns `null`
+   *  when the cache is empty. Serialized with generate/prefill/forward like every engine op. */
+  saveCache(): Promise<KvSnapshot | null>
+  /** Replace the current conversation with a {@link KvSnapshot} (CPU -> GPU upload). The next
+   *  `generate(delta, { reuseCache: true })` continues the saved conversation exactly. Throws if
+   *  the snapshot's model architecture or `kvCache` mode does not match this engine, or if it
+   *  exceeds this engine's `maxSeqLen`. */
+  restoreCache(snapshot: KvSnapshot): Promise<void>
   /** Detected GPU capabilities and selected code path. */
   readonly capabilities: EngineCapabilities
   /** Resolves when the GPU device is lost (including via {@link dispose}, with reason 'destroyed').

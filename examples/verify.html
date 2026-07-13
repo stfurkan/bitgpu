@@ -440,6 +440,20 @@
         const aOk = a1.toolCalls.every((c) => c.name === 'get_weather' && typeof c.arguments === 'object') && !a1.text.includes('<tool_call>');
         ok = ok && aOk;
         log(`  ${aOk ? '[PASS]' : '[FAIL]'} chat auto tools: ${a1.toolCalls.length ? `called with ${JSON.stringify(a1.toolCalls[0].arguments).slice(0, 60)}` : 'answered in prose (model judgment; structure clean)'}`);
+        // 7b) chat save/restore: snapshot after turn 1, run the follow-up live, pollute with an
+        // unrelated conversation, restore, rerun the follow-up - the text must match exactly and
+        // the restored turn must still be a cache REUSE (a cheap append, not a re-prefill).
+        chat.reset();
+        const p1 = await chat.send(CMSG, CSEED);
+        const snapC = await chat.save();
+        const follow = [...CMSG, { role: 'assistant', content: p1.text }, { role: 'user', content: 'And the capital of Germany?' }];
+        const liveF = await chat.send(follow, CSEED);
+        await chat.send([{ role: 'user', content: 'Name three kinds of cheese.' }], CSEED); // pollute
+        await chat.restore(snapC);
+        const backF = await chat.send(follow, CSEED);
+        const csOk = snapC !== null && backF.text === liveF.text && liveF.reusedCache === true && backF.reusedCache === true;
+        ok = ok && csOk;
+        log(`  ${csOk ? '[PASS]' : '[FAIL]'} chat save/restore: follow-up after restore == live follow-up (reused=${backF.reusedCache})`);
         chat.reset();
       }
 
@@ -493,6 +507,17 @@
         ok = ok && aOk;
         log(`  ${aOk ? '[PASS]' : '[FAIL]'} f16 vs known-good ids: ${nFix}/32 prefix (total agreement ${agreeSum}/${agreeN})`);
         log(`  f16 decode ${aFix.tokensPerSecond.toFixed(2)} tok/s (f32 was ${g.tokensPerSecond.toFixed(2)})`);
+        // snapshot round trip within f16 mode: save mid-conversation, pollute, restore, continue
+        e16.resetCache();
+        await e16.generate(ids, { maxTokens: 6 });
+        const sn16 = await e16.saveCache();
+        const sA16 = await e16.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        await e16.generate([...ids, ...ids], { maxTokens: 4 }); // pollute with an unrelated conversation
+        await e16.restoreCache(sn16);
+        const sB16 = await e16.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        const snOk16 = sA16.tokens.length === sB16.tokens.length && sA16.tokens.every((t, i) => t === sB16.tokens[i]);
+        ok = ok && snOk16;
+        log(`  ${snOk16 ? '[PASS]' : '[FAIL]'} f16 snapshot save/restore round trip (continuation exact)`);
         e16.dispose();
       } else log('\nf16 KV cache checks SKIPPED (no shader-f16 on this adapter)');
 
@@ -564,7 +589,59 @@
         log(`  q8 decode at depth 1500: ${bD.tokensPerSecond.toFixed(2)} tok/s (f32 at depth: ${aD.tokensPerSecond.toFixed(2)})`);
         engine.resetCache();
         log(`  q8 decode ${qFix.tokensPerSecond.toFixed(2)} tok/s (f32 was ${g.tokensPerSecond.toFixed(2)})`);
+        // snapshot round trip within q8 mode (exercises the scale-buffer regions): save
+        // mid-conversation, pollute, restore, continue
+        e8.resetCache();
+        await e8.generate(ids, { maxTokens: 6 });
+        const sn8 = await e8.saveCache();
+        const sA8 = await e8.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        await e8.generate([...ids, ...ids], { maxTokens: 4 }); // pollute with an unrelated conversation
+        await e8.restoreCache(sn8);
+        const sB8 = await e8.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        const snOk8 = sA8.tokens.length === sB8.tokens.length && sA8.tokens.every((t, i) => t === sB8.tokens[i]);
+        ok = ok && snOk8;
+        log(`  ${snOk8 ? '[PASS]' : '[FAIL]'} q8 snapshot save/restore round trip (continuation exact)`);
         e8.dispose();
+      }
+
+      // 10) KV snapshot/restore (engine-level, f32 main engine). f32 is within-mode exact, so
+      // these are hard gates: restoring - into this engine after unrelated turns, or into a
+      // FRESH engine (the persistence story: page reload, new session) - must continue the
+      // conversation bit-identically. Tampered snapshots must throw, never garbage-generate.
+      {
+        log('\nKV snapshot/restore checks (f32 engine)...');
+        engine.resetCache();
+        await engine.generate(ids, { maxTokens: 8 });
+        const sn = await engine.saveCache();
+        log(`  snapshot: ${sn.ids.length} tokens, ${(sn.data.byteLength / 1048576).toFixed(1)} MB data`);
+        const sDelta = ids.slice(0, 5);
+        const sLive = await engine.generate(sDelta, { maxTokens: 12, reuseCache: true });
+        await engine.generate([...ids, ...ids], { maxTokens: 4 }); // pollute with an unrelated conversation
+        await engine.restoreCache(sn);
+        const sBack = await engine.generate(sDelta, { maxTokens: 12, reuseCache: true });
+        const rtOk = sLive.tokens.length === sBack.tokens.length && sLive.tokens.every((t, i) => t === sBack.tokens[i]);
+        ok = ok && rtOk;
+        log(`  ${rtOk ? '[PASS]' : '[FAIL]'} restore into same engine: continuation bit-exact`);
+        const eF = await createEngine({ modelUrl: MODEL_DIR, forceNoSubgroups: new URLSearchParams(location.search).get('nosg') === '1' });
+        await eF.restoreCache(sn);
+        const sFresh = await eF.generate(sDelta, { maxTokens: 12, reuseCache: true });
+        const feOk = sLive.tokens.length === sFresh.tokens.length && sLive.tokens.every((t, i) => t === sFresh.tokens[i]);
+        ok = ok && feOk;
+        log(`  ${feOk ? '[PASS]' : '[FAIL]'} restore into FRESH engine: continuation bit-exact (survives disposal/reload)`);
+        eF.dispose();
+        let rej = 0;
+        for (const bad of [
+          { ...sn, kvCache: 'q8' },                                        // mode mismatch
+          { ...sn, model: { ...sn.model, layers: sn.model.layers + 1 } },  // arch mismatch
+          { ...sn, version: 2 },                                           // unknown version
+          { ...sn, data: sn.data.slice(0, sn.data.byteLength - 4) },       // truncated data
+        ]) {
+          try { await engine.restoreCache(bad); } catch { rej++; }
+        }
+        const rejOk = rej === 4;
+        ok = ok && rejOk;
+        log(`  ${rejOk ? '[PASS]' : '[FAIL]'} tampered snapshots rejected (${rej}/4 threw)`);
+        engine.resetCache();
       }
 
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);

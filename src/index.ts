@@ -8,6 +8,7 @@ export type {
   GenerateOptions,
   GenerateResult,
   ForwardResult,
+  KvSnapshot,
   LoadProgress,
   TokenLogprobs,
 } from './types'

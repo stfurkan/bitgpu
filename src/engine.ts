@@ -20,6 +20,7 @@ import type {
   ForwardResult,
   GenerateOptions,
   GenerateResult,
+  KvSnapshot,
   TokenLogprobs,
 } from './types'
 
@@ -1971,6 +1972,82 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
+  // ---- KV snapshot / restore ----
+  // The engine's entire cross-turn state is fullHistory plus the first (fullHistory.length - 1)
+  // cached positions of each layer's K/V (the last token's K/V is re-written by the reuse path's
+  // re-fed token; see the fullHistory comment). A snapshot captures exactly that, packed into one
+  // ArrayBuffer, so restoring it - into this engine or a fresh one on the same model + mode - is
+  // bit-identical to having kept the conversation alive. Layout: per layer, K then V region
+  // (then Ksc, Vsc under q8), each sized len positions; all region sizes are multiples of 4.
+  const kvRowBytes = KV * Dh * KVB // one position of K (or V), per layer
+  const scRowBytes = kv8 ? KV * (Dh / 32) * 4 : 0 // one position of q8 block scales
+  const snapshotBytes = (len: number): number => A.layers * 2 * len * (kvRowBytes + scRowBytes)
+
+  async function saveCache(): Promise<KvSnapshot | null> {
+    if (fullHistory.length === 0) return null
+    const len = fullHistory.length - 1
+    const data = new ArrayBuffer(snapshotBytes(len))
+    if (len > 0) {
+      const rb = device.createBuffer({ size: snapshotBytes(len), usage: GPUBufferUsage.MAP_READ | CD })
+      const enc = device.createCommandEncoder()
+      let off = 0
+      for (let li = 0; li < A.layers; li++) {
+        enc.copyBufferToBuffer(Kc[li], 0, rb, off, len * kvRowBytes)
+        off += len * kvRowBytes
+        enc.copyBufferToBuffer(Vc[li], 0, rb, off, len * kvRowBytes)
+        off += len * kvRowBytes
+        if (kv8) {
+          enc.copyBufferToBuffer(Ksc[li], 0, rb, off, len * scRowBytes)
+          off += len * scRowBytes
+          enc.copyBufferToBuffer(Vsc[li], 0, rb, off, len * scRowBytes)
+          off += len * scRowBytes
+        }
+      }
+      device.queue.submit([enc.finish()])
+      await rb.mapAsync(GPUMapMode.READ)
+      new Uint8Array(data).set(new Uint8Array(rb.getMappedRange()))
+      rb.unmap()
+      rb.destroy()
+    }
+    return {
+      version: 1,
+      kvCache: capabilities.kvCache,
+      model: { layers: A.layers, kvHeads: KV, headDim: Dh, hidden: Hd, vocab: A.vocab },
+      ids: [...fullHistory],
+      data,
+    }
+  }
+
+  async function restoreCache(snap: KvSnapshot): Promise<void> {
+    if (!snap || snap.version !== 1) throw new Error(`restoreCache: unsupported snapshot version ${snap?.version}`)
+    if (snap.kvCache !== capabilities.kvCache)
+      throw new Error(`restoreCache: snapshot was saved under kvCache '${snap.kvCache}' but this engine runs '${capabilities.kvCache}' - snapshots do not convert across modes`)
+    const m = snap.model
+    if (!m || m.layers !== A.layers || m.kvHeads !== KV || m.headDim !== Dh || m.hidden !== Hd || m.vocab !== A.vocab)
+      throw new Error('restoreCache: snapshot is from a different model (architecture mismatch)')
+    if (!Array.isArray(snap.ids) || snap.ids.length === 0) throw new Error('restoreCache: snapshot holds no tokens')
+    if (snap.ids.length > maxSeqLen)
+      throw new Error(`restoreCache: snapshot length ${snap.ids.length} exceeds maxSeqLen ${maxSeqLen}`)
+    const len = snap.ids.length - 1
+    if (snap.data.byteLength !== snapshotBytes(len))
+      throw new Error(`restoreCache: snapshot data is ${snap.data.byteLength} bytes, expected ${snapshotBytes(len)}`)
+    await ensureKvCapacity(len)
+    let off = 0
+    for (let li = 0; li < A.layers; li++) {
+      device.queue.writeBuffer(Kc[li], 0, snap.data, off, len * kvRowBytes)
+      off += len * kvRowBytes
+      device.queue.writeBuffer(Vc[li], 0, snap.data, off, len * kvRowBytes)
+      off += len * kvRowBytes
+      if (kv8) {
+        device.queue.writeBuffer(Ksc[li], 0, snap.data, off, len * scRowBytes)
+        off += len * scRowBytes
+        device.queue.writeBuffer(Vsc[li], 0, snap.data, off, len * scRowBytes)
+        off += len * scRowBytes
+      }
+    }
+    fullHistory = [...snap.ids]
+  }
+
   // The engine shares one KV cache, buffer pool, and flag set across calls, so concurrent
   // generate/prefill/forward would corrupt each other. Serialize them: overlapping calls queue
   // instead of interleaving (npm consumers do not all have the app's single-flight worker).
@@ -1990,6 +2067,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     generate: serialize(generate),
     prefill: serialize(prefill),
     forward: serialize(forward),
+    saveCache: serialize(saveCache),
+    restoreCache: serialize(restoreCache),
     resetCache,
     capabilities,
     lost,

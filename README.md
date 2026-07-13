@@ -6,8 +6,9 @@ Today it runs **1-bit (binary-weight)** models.
 Reference targets are Bonsai **1.7B, 4B and 8B** (Qwen3 architecture, sign-packed binary linear
 weights + 2/4-bit embeddings, tied or untied lm_head) - every size is gated bit-exact against the
 reference forward on real hardware. GPU-resident decode (greedy or sampled), streaming, EOS stop,
-`AbortSignal`, cross-turn KV-cache reuse, and optional f16/q8 KV-cache compression for long
-contexts in less VRAM. Runs the fast subgroup path on Apple / NVIDIA /
+`AbortSignal`, cross-turn KV-cache reuse, optional f16/q8 KV-cache compression for long
+contexts in less VRAM, and conversation snapshots (save/restore across page reloads). Runs the
+fast subgroup path on Apple / NVIDIA /
 recent AMD and falls back to a workgroup-reduction path everywhere else WebGPU is available.
 Device limits are negotiated from the manifest, so the 8B's ~148 MiB lm_head binding is requested
 only when that model needs it and smaller models keep running at WebGPU's guaranteed minimums.
@@ -240,6 +241,28 @@ needed, and validate argument *values* in your executor. The engine never execut
 never loops, never retries: it returns a validated call and the app stays in charge (there is
 deliberately no agent framework in here).
 
+### Conversation snapshots (`save` / `restore`)
+
+`chat.save()` captures the whole conversation - the engine's KV cache plus the chat's exact
+token bookkeeping - as one structured-cloneable object; `chat.restore(snapshot)` brings it back,
+so the next turn extends the cache as if the session never ended (no re-prefill of the history):
+
+```ts
+const snapshot = await chat.save()   // structured-cloneable: IndexedDB / OPFS / postMessage
+                                     // (NOT JSON.stringify - the KV buffer would be lost)
+// ...page reload: new engine + chat on the same model and kvCache mode...
+await chat.restore(snapshot)
+await chat.send([...savedMessages, { role: 'user', content: 'as I was saying...' }]) // cache reuse
+```
+
+Use it for instant conversation switching (save several, restore the active one) and for
+resuming after a reload without re-prefilling a long history. Restore validates the model
+architecture and `kvCache` mode and throws on mismatch; restoring is bit-identical to having
+kept the conversation alive (gated on real hardware). Snapshot size scales with the KV mode
+(~224 / 112 / 63 KB per cached token on Bonsai-1.7B at f32 / f16 / q8), which makes
+`kvCache: 'q8'` the natural companion. The engine-level `engine.saveCache()` /
+`engine.restoreCache()` are the same thing for ids-in/ids-out callers.
+
 The two text libraries (`@huggingface/tokenizers`, `@huggingface/jinja` - pure JS, Apache-2.0,
 see THIRD_PARTY_LICENSES.md) are inlined into `dist/chat.js` at build time, the same way the
 engine inlines its WGSL: the package keeps **zero runtime dependencies**, and importing plain
@@ -291,6 +314,10 @@ regenerating the verification fixtures for a new model: [tools/README.md](tools/
   later `generate(delta, { reuseCache: true })` starts from a warm cache (e.g. a static system prompt).
 - `engine.forward(tokenIds)` - single forward pass (hidden states + logits) for correctness checks.
 - `engine.resetCache()` - clear the cross-turn KV cache (start a fresh conversation).
+- `engine.saveCache()` / `engine.restoreCache(snapshot)` - snapshot the conversation (KV cache
+  contents + token history) as one structured-cloneable object and bring it back later,
+  bit-identically - into this engine or a fresh one on the same model and `kvCache` mode. See
+  the chat-layer `save()`/`restore()` below for the batteries-included version.
 - `engine.capabilities` - detected GPU path (`useSubgroups`, `subgroupSize`, adapter info, limits).
 - `engine.lost` - promise that resolves if the GPU device is lost (also via `onDeviceLost` option);
   create a new engine to recover.
@@ -340,9 +367,10 @@ npm run check:publish # publint + are-the-types-wrong
 
 `examples/verify.html` re-runs the full bit-exactness + throughput suite (forward cosines vs the
 committed reference fixtures in `test-fixtures/forward/`, known-good greedy ids, sampler kernel
-parity, determinism, KV reuse/growth, prompt-lookup identity, and the f16/q8 KV-mode sections:
-within-mode exactness plus greedy agreement vs f32 out to a 1500-token prompt) against the
-**built package** and prints `PACKAGE OK` or `REGRESSION`.
+parity, determinism, KV reuse/growth, prompt-lookup identity, KV snapshot save/restore round
+trips - including into a fresh engine - and the f16/q8 KV-mode sections: within-mode exactness
+plus greedy agreement vs f32 out to a 1500-token prompt) against the **built package** and
+prints `PACKAGE OK` or `REGRESSION`.
 
 It needs model weights, which are not committed. Point `examples/model` at a directory holding the
 model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):
