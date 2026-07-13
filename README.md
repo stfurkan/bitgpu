@@ -33,7 +33,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.9.0/models/bonsai-1.7b'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.10.0/models/bonsai-1.7b'
 const HF = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
