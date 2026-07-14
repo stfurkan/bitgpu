@@ -34,7 +34,7 @@
     // params.json carries its own known-good greedy continuation (bit-exact gate).
     const MODEL_TAG = new URLSearchParams(location.search).get('model') || '';
     // ?fast=1: development iteration mode - the bit-exact core (sections 1-7) only; the
-    // KV-mode/snapshot/sinks/drafter sections are release-gate material (npm run verify:headless
+    // KV-mode/snapshot/sinks sections are release-gate material (npm run verify:headless
     // without FAST=1 runs everything on every staged model).
     const FAST = new URLSearchParams(location.search).get('fast') === '1';
     const MODEL_DIR = MODEL_TAG ? `./model-${MODEL_TAG}` : './model';
@@ -739,87 +739,7 @@
         } else log('  f16+sinks SKIPPED (no shader-f16)');
       }
 
-      // 12) pluggable speculative decoding (the drafter hook). Drafts feed the SAME verify
-      // machinery as promptLookup, so output must be BIT-IDENTICAL to plain decoding no matter
-      // what the drafter proposes - perfect drafts only add speed, garbage only costs it.
-      if (!FAST) {
-        log('\nspeculative decoding (drafter hook) checks...');
-        engine.resetCache();
-        const plainG = await engine.generate(ids, { maxTokens: 48, promptLookup: false });
-        const perfect = (src) => ({ history, k }) => {
-          const at = history.length - ids.length; // tokens generated so far
-          return src.tokens.slice(at, at + Math.min(k, 5));
-        };
-        engine.resetCache();
-        const spA = await engine.generate(ids, { maxTokens: 48, drafter: perfect(plainG) });
-        const spAOk = spA.tokens.length === plainG.tokens.length && spA.tokens.every((t, i) => t === plainG.tokens[i]) && (spA.speculation?.accepted ?? 0) > 0;
-        ok = ok && spAOk;
-        log(`  ${spAOk ? '[PASS]' : '[FAIL]'} perfect drafter: bit-identical to plain greedy (${spA.speculation?.accepted}/${spA.speculation?.drafted} accepted, ${spA.speculation?.steps} verify steps for 48 tokens)`);
-        engine.resetCache();
-        const spB = await engine.generate(ids, { maxTokens: 48, drafter: ({ k }) => [11, 22, 33].slice(0, k) });
-        const spBOk = spB.tokens.length === plainG.tokens.length && spB.tokens.every((t, i) => t === plainG.tokens[i]);
-        ok = ok && spBOk;
-        log(`  ${spBOk ? '[PASS]' : '[FAIL]'} garbage drafter: still bit-identical (${spB.speculation?.accepted ?? 0} accepted - wrong drafts only cost speed)`);
-        engine.resetCache();
-        const spC = await engine.generate(ids, { maxTokens: 24, drafter: async (c) => { await new Promise((r) => setTimeout(r, 0)); return perfect(plainG)(c); } });
-        const spCOk = spC.tokens.every((t, i) => t === plainG.tokens[i]);
-        ok = ok && spCOk;
-        log(`  ${spCOk ? '[PASS]' : '[FAIL]'} async drafter: bit-identical (${spC.tokens.length} tokens)`);
-        engine.resetCache();
-        const plainS = await engine.generate(ids, { ...SOPT, seed: 42, maxTokens: 32, promptLookup: false });
-        engine.resetCache();
-        const spD = await engine.generate(ids, { ...SOPT, seed: 42, maxTokens: 32, drafter: perfect(plainS) });
-        const spDOk = spD.tokens.length === plainS.tokens.length && spD.tokens.every((t, i) => t === plainS.tokens[i]);
-        ok = ok && spDOk;
-        log(`  ${spDOk ? '[PASS]' : '[FAIL]'} sampled + drafter: bit-identical under seed 42 (${spD.speculation?.accepted}/${spD.speculation?.drafted} accepted)`);
-        // rewind(): dropping the last n tokens must be indistinguishable from never generating
-        // them - the reuse continuation after a rewind equals a cold prefill of the kept prefix.
-        engine.resetCache();
-        const rw1 = await engine.generate(ids, { maxTokens: 12 });
-        engine.rewind(6);
-        const rwCont = await engine.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
-        engine.resetCache();
-        const rwCold = await engine.generate([...ids, ...rw1.tokens.slice(0, 6), ...ids.slice(0, 5)], { maxTokens: 8 });
-        const rwOk = rwCont.tokens.length === rwCold.tokens.length && rwCont.tokens.every((t, i) => t === rwCold.tokens[i]);
-        ok = ok && rwOk;
-        log(`  ${rwOk ? '[PASS]' : '[FAIL]'} rewind(6) + reuse == cold prefill of the kept prefix (bit-exact)`);
-        engine.resetCache();
-        // two-model speculation (8B page only, when the baseline 1.7B is staged): the small
-        // model greedy-drafts via the hook + rewind; the 8B verifies - output must equal plain
-        // 8B decoding exactly, and the speedup/acceptance are the measured story.
-        const canTwo = MODEL_TAG === '8b' && (await fetch('./model/manifest.json', { method: 'HEAD' }).then((r) => r.ok).catch(() => false));
-        if (canTwo) {
-          const eD = await createEngine({ modelUrl: './model', forceNoSubgroups: new URLSearchParams(location.search).get('nosg') === '1' });
-          await eD.generate(ids, { maxTokens: 0 }); // prefill the draft engine with the prompt
-          let eDHist = [...ids];
-          const modelDrafter = async ({ history, k }) => {
-            let p = 0; // sync the draft engine to the target's accepted history
-            while (p < eDHist.length && p < history.length && eDHist[p] === history[p]) p++;
-            if (eDHist.length > p) { eD.rewind(eDHist.length - p); eDHist.length = p; }
-            const delta = history.slice(p);
-            const d = await eD.generate(delta, { maxTokens: k, reuseCache: true, promptLookup: false });
-            eDHist.push(...delta, ...d.tokens);
-            return d.tokens;
-          };
-          engine.resetCache();
-          const t2a = performance.now();
-          const two = await engine.generate(ids, { maxTokens: 64, drafter: modelDrafter });
-          const twoMs = performance.now() - t2a;
-          engine.resetCache();
-          const t2b = performance.now();
-          const plain8 = await engine.generate(ids, { maxTokens: 64, promptLookup: false });
-          const plainMs = performance.now() - t2b;
-          const twoOk = two.tokens.length === plain8.tokens.length && two.tokens.every((t, i) => t === plain8.tokens[i]);
-          ok = ok && twoOk;
-          const acc = two.speculation ? `${two.speculation.accepted}/${two.speculation.drafted}` : '?';
-          log(`  ${twoOk ? '[PASS]' : '[FAIL]'} two-model speculation (1.7B drafts for 8B): bit-identical to plain 8B`);
-          log(`  two-model: ${(64000 / twoMs).toFixed(2)} tok/s vs plain ${(64000 / plainMs).toFixed(2)} tok/s (accepted ${acc}, ${two.speculation?.steps} steps)`);
-          eD.dispose();
-          engine.resetCache();
-        }
-      }
-
-      if (FAST) log('\nFAST mode: f16/q8/snapshot/sinks/drafter sections SKIPPED (run the full gate before any release)');
+      if (FAST) log('\nFAST mode: f16/q8/snapshot/sinks sections SKIPPED (run the full gate before any release)');
 
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);
     }

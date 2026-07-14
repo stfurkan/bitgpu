@@ -1722,18 +1722,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         if (signal?.aborted) break
         pos = evictFor(pos, maxDraft + 1) // sink mode: roll before a full drafting step needs the room
         const kMax = Math.min(maxDraft, nTokens - total - 1, maxSeqLen - 1 - pos)
-        // A custom drafter replaces the built-in prompt-lookup source; the verify/acceptance
-        // machinery below is identical, so its bit-exactness guarantee is inherited. Invalid or
-        // over-long proposals are truncated at the first offender (a bad draft can only cost
-        // speed, never correctness).
-        let drafts: number[] = []
-        if (kMax > 0 && genOpts.drafter) {
-          const proposed = (await genOpts.drafter({ history: [...history], k: kMax })) ?? []
-          for (const t of proposed) {
-            if (drafts.length >= kMax || !Number.isInteger(t) || t < 0 || t >= vocab) break
-            drafts.push(t)
-          }
-        } else if (kMax > 0) drafts = draftNgram(history, ngramSize, kMax)
+        const drafts = kMax > 0 ? draftNgram(history, ngramSize, kMax) : []
         const S = drafts.length + 1
         await ensureKvCapacity(pos + S)
         let t = performance.now()
@@ -2007,11 +1996,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // the same per-step candidate readback, so they route identically.
     const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
     let r: RawGenResult
-    if (!hasFilter && genOpts.drafter) {
-      // An explicit drafter is the caller's decision: speculative path for the whole turn, no
-      // probation/bail heuristics (those exist to guess whether ngram drafting pays off).
-      r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory)
-    } else if (!hasFilter && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+    if (!hasFilter && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
       // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
       // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
       // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
@@ -2206,17 +2191,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
-  // Drop the last n conversation tokens (draft-engine rollback for app-side two-model
-  // speculation): CPU bookkeeping only - the K/V rows beyond the new length are simply
-  // overwritten by the next turn, the same idempotent-overwrite convention reuse relies on.
-  function rewind(n: number): void {
-    if (!Number.isInteger(n) || n < 0) throw new Error('rewind: n must be a non-negative integer')
-    if (n === 0) return
-    if (roll) throw new Error("rewind: not supported under overflow 'sinks' (eviction breaks the token<->slot mapping)")
-    if (n >= fullHistory.length) throw new Error(`rewind: cannot drop ${n} of ${fullHistory.length} tokens (use resetCache to start over)`)
-    fullHistory.length -= n
-  }
-
   const api: EngineInternal = {
     generate: serialize(generate),
     prefill: serialize(prefill),
@@ -2224,7 +2198,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     saveCache: serialize(saveCache),
     restoreCache: serialize(restoreCache),
     resetCache,
-    rewind,
     capabilities,
     lost,
     dispose: () => device.destroy(),

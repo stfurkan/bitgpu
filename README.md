@@ -143,37 +143,22 @@ prompt-side trimming when every token of context must count. Prompts longer than
 still throw (`bitgpu/chat`'s `onOverflow` handles that side). Snapshots keep working - sink
 mode saves version-2 snapshots (restore requires sink mode with the same `sinkTokens`).
 
-### Speculative decoding (`drafter`)
+### Speculative decoding: why only `promptLookup`
 
-The engine speculates out of the box: `promptLookup` drafts from n-gram matches in the prompt
-(great for extraction/repetition-heavy turns, free otherwise thanks to auto-probation). The
-`drafter` option opens that machinery to ANY draft source:
+The engine speculates out of the box where it pays: `promptLookup` drafts from n-gram matches
+in the prompt and verifies them in one batched pass, with auto-probation that measures the
+break-even and bails when speculation does not help (output is bit-identical either way).
 
-```ts
-await engine.generate(prompt, {
-  drafter: ({ history, k }) => myDrafts(history, k), // up to k proposed next-token ids; may be async
-})
-```
-
-Proposals feed the same batched-verify path as prompt lookup, so the output is
-**bit-identical to non-speculative decoding no matter what the drafter returns** - stronger
-than the usual "distribution lossless" rejection-sampling guarantee; a bad draft can only cost
-speed, never correctness (gated: perfect, garbage, async, and sampled drafters all reproduce
-the plain output exactly).
-
-Know the physics before reaching for it: speculative decoding pays only when verifying k
-tokens in one batched pass costs about one token's time - true for f16 models, whose decode is
-weight-bandwidth-bound, but NOT here. 1-bit weights are so small that decode already saturates
-the GPU's compute at batch 1, so a k-row verify costs ~k single steps (measured: an S=9 verify
-~= 9.8x one step, and even a perfect zero-cost drafter decodes slower than plain on the
-subgroup path). That is why there is no built-in two-model mode - drafting with a second
-engine was built, measured bit-exact and slower, and removed; the fast single-stream decode
-and profitable speculation are the same budget, already spent on the former. Where the hook
-(and `promptLookup`, which auto-measures and bails) can still win: the no-subgroup fallback
-path and other latency-bound setups, where one batched pass replaces k dispatch round-trips.
-`engine.rewind(n)` (drop the last n tokens cheaply) remains available for custom multi-engine
-experiments. Like `promptLookup`, `drafter` is disabled when `candidateFilter` or `logprobs`
-is set.
+There is deliberately no draft-model / two-model mode, and the reason is measured, not
+guessed: speculative decoding pays only when verifying k tokens in one batched pass costs
+about one token's time - true for f16 models, whose decode is weight-bandwidth-bound, but not
+for 1-bit models. The weight stream here is so small that batch-1 decode already saturates GPU
+compute, so a k-row verify costs ~k single steps (measured: S=9 verify ~= 9.8x one step, and
+even a perfect zero-cost drafter decoded slower than plain on the subgroup path). A full
+in-engine two-model orchestration was built, gate-proven bit-exact, measured slower, and
+removed - fast single-stream 1-bit decode and profitable speculation are the same budget,
+already spent on the former. Where batching still wins (dispatch-latency-bound setups like the
+no-subgroup fallback path) is exactly where `promptLookup`'s probation keeps it on.
 
 ## Chat (`bitgpu/chat`)
 
@@ -374,8 +359,6 @@ regenerating the verification fixtures for a new model: [tools/README.md](tools/
   later `generate(delta, { reuseCache: true })` starts from a warm cache (e.g. a static system prompt).
 - `engine.forward(tokenIds)` - single forward pass (hidden states + logits) for correctness checks.
 - `engine.resetCache()` - clear the cross-turn KV cache (start a fresh conversation).
-- `engine.rewind(n)` - drop the last `n` conversation tokens (cheap, CPU-side); built for
-  draft-engine rollback in two-model speculation. Not available under `overflow: 'sinks'`.
 - `engine.saveCache()` / `engine.restoreCache(snapshot)` - snapshot the conversation (KV cache
   contents + token history) as one structured-cloneable object and bring it back later,
   bit-identically - into this engine or a fresh one on the same model and `kvCache` mode. See
@@ -433,9 +416,7 @@ parity, determinism, KV reuse/growth, prompt-lookup identity, KV snapshot save/r
 trips - including into a fresh engine - the f16/q8 KV-mode sections: within-mode exactness
 plus greedy agreement vs f32 out to a 1500-token prompt, the rolling-window section:
 pre-eviction bit-exactness, 600 tokens through a 192-token window, determinism across
-evictions, and the drafter section: custom/async/sampled drafters bit-identical to plain
-decoding, rewind, and 1.7B-drafts-for-8B two-model speculation) against the **built package**
-and prints `PACKAGE OK` or `REGRESSION`.
+evictions) against the **built package** and prints `PACKAGE OK` or `REGRESSION`.
 
 It needs model weights, which are not committed. Point `examples/model` at a directory holding the
 model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):
