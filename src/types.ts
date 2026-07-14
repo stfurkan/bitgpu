@@ -142,6 +142,15 @@ export interface GenerateOptions {
    *  acceptance is ~zero when both are on (measured 0/320). No draft model, no extra VRAM.
    *  `true`/`'auto'` = `{ ngramSize: 3, maxDraft: 8 }`. Default `false`. */
   promptLookup?: boolean | 'auto' | { ngramSize?: number; maxDraft?: number }
+  /** Custom speculative-decoding drafter: called once per verify step with the conversation so
+   *  far, returns up to `k` proposed next-token ids (empty = decode one token normally this
+   *  step). Proposals feed the SAME verify machinery as `promptLookup`, so output stays
+   *  BIT-IDENTICAL to non-speculative decoding no matter how bad the drafts are - a wrong draft
+   *  only costs speed. May be async (e.g. a second, smaller engine drafting for this one;
+   *  pair with {@link Engine.rewind} to roll the draft engine back to the accepted prefix).
+   *  Overrides `promptLookup`; ignored (like it) when `candidateFilter` or `logprobs` is set.
+   *  Cap: `promptLookup.maxDraft` (default 8) proposals per step. */
+  drafter?: (ctx: { history: number[]; k: number }) => number[] | Promise<number[]>
   /** Per-token TRUE logprobs (log-softmax over the full vocabulary, after penalties): set to N
    *  (1..32) to receive the emitted token's logprob plus the top-N alternatives each step in
    *  {@link GenerateResult.logprobs}. Exact, not a top-K approximation - the normalizer is a GPU
@@ -250,6 +259,12 @@ export interface Engine {
   forward(tokenIds: number[]): Promise<ForwardResult>
   /** Clear the cross-turn KV cache and token history (start a fresh conversation). */
   resetCache(): void
+  /** Drop the last `n` conversation tokens (cheap, CPU-side). Built for app-side two-model
+   *  speculation: a DRAFT engine generates ahead, and after the target rejects some suffix the
+   *  draft engine rewinds to the accepted prefix instead of re-prefilling. Throws under
+   *  `overflow: 'sinks'` (eviction breaks the token-to-slot mapping) and when `n` would empty
+   *  the history (use `resetCache`). */
+  rewind(n: number): void
   /** Snapshot the current conversation - KV cache contents + token history - as a
    *  structured-cloneable {@link KvSnapshot} (GPU -> CPU readback). Restoring it, into this
    *  engine or a fresh one on the same model and `kvCache` mode, is bit-identical to having kept

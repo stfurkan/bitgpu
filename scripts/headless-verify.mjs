@@ -86,6 +86,11 @@ if (process.argv[2]) {
     console.error('no staged models found (examples/model or examples/model-<tag>)')
     process.exit(2)
   }
+  if (process.env.FAST === '1') {
+    // Development iteration: ONE run - the baseline model, subgroup path, core sections only
+    // (?fast=1 skips the KV-mode/snapshot/sinks/drafter sections). Not a release gate.
+    urls = [`${BASE}?fast=1`]
+  }
   if (process.env.PLAN === '1') {
     console.log(urls.map((u) => u.replace(/^.*verify\.html/, 'verify.html')).join('\n'))
     server.close()

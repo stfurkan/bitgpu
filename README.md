@@ -143,6 +143,34 @@ prompt-side trimming when every token of context must count. Prompts longer than
 still throw (`bitgpu/chat`'s `onOverflow` handles that side). Snapshots keep working - sink
 mode saves version-2 snapshots (restore requires sink mode with the same `sinkTokens`).
 
+### Speculative decoding (`drafter`)
+
+The engine speculates out of the box: `promptLookup` drafts from n-gram matches in the prompt
+(great for extraction/repetition-heavy turns, free otherwise thanks to auto-probation). The
+`drafter` option opens that machinery to ANY draft source:
+
+```ts
+await engine.generate(prompt, {
+  drafter: ({ history, k }) => myDrafts(history, k), // up to k proposed next-token ids; may be async
+})
+```
+
+Proposals feed the same batched-verify path as prompt lookup, so the output is
+**bit-identical to non-speculative decoding no matter what the drafter returns** - stronger
+than the usual "distribution lossless" rejection-sampling guarantee; a bad draft can only cost
+speed, never correctness (gated: perfect, garbage, async, and sampled drafters all reproduce
+the plain output exactly). Two-model speculation - a small engine drafting
+for a big one, `engine.rewind(n)` rolling the draft engine back to the accepted prefix instead
+of re-prefilling - is wired and gate-proven bit-exact (see examples/verify.html section 12 for
+the complete draft/verify/rewind sync loop). Honest measurement, though: on a single shared
+GPU it is NOT currently a speedup - Bonsai-1.7B drafting for 8B reaches a promising 75%
+acceptance but the per-call engine overhead of micro-turns outweighs the saved verify steps
+(measured 3.9 vs 8.8 tok/s plain). Treat the hook as the extension point it is: cheap
+CPU-side drafters win today (that is what `promptLookup` is), and trained lightweight drafters
+(EAGLE/DFlash-class, should one exist for your model) plug in without engine changes. Speed
+depends entirely on acceptance rate and drafter cost; the two models must share a tokenizer.
+Like `promptLookup`, `drafter` is disabled when `candidateFilter` or `logprobs` is set.
+
 ## Chat (`bitgpu/chat`)
 
 The engine is deliberately ids-in/ids-out; `bitgpu/chat` is the batteries-included text layer on
@@ -342,6 +370,8 @@ regenerating the verification fixtures for a new model: [tools/README.md](tools/
   later `generate(delta, { reuseCache: true })` starts from a warm cache (e.g. a static system prompt).
 - `engine.forward(tokenIds)` - single forward pass (hidden states + logits) for correctness checks.
 - `engine.resetCache()` - clear the cross-turn KV cache (start a fresh conversation).
+- `engine.rewind(n)` - drop the last `n` conversation tokens (cheap, CPU-side); built for
+  draft-engine rollback in two-model speculation. Not available under `overflow: 'sinks'`.
 - `engine.saveCache()` / `engine.restoreCache(snapshot)` - snapshot the conversation (KV cache
   contents + token history) as one structured-cloneable object and bring it back later,
   bit-identically - into this engine or a fresh one on the same model and `kvCache` mode. See
@@ -397,9 +427,11 @@ npm run check:publish # publint + are-the-types-wrong
 committed reference fixtures in `test-fixtures/forward/`, known-good greedy ids, sampler kernel
 parity, determinism, KV reuse/growth, prompt-lookup identity, KV snapshot save/restore round
 trips - including into a fresh engine - the f16/q8 KV-mode sections: within-mode exactness
-plus greedy agreement vs f32 out to a 1500-token prompt, and the rolling-window section:
+plus greedy agreement vs f32 out to a 1500-token prompt, the rolling-window section:
 pre-eviction bit-exactness, 600 tokens through a 192-token window, determinism across
-evictions) against the **built package** and prints `PACKAGE OK` or `REGRESSION`.
+evictions, and the drafter section: custom/async/sampled drafters bit-identical to plain
+decoding, rewind, and 1.7B-drafts-for-8B two-model speculation) against the **built package**
+and prints `PACKAGE OK` or `REGRESSION`.
 
 It needs model weights, which are not committed. Point `examples/model` at a directory holding the
 model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):
@@ -408,6 +440,7 @@ model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~
 ln -s /path/to/bonsai-model examples/model   # or copy the files in
 npm run build
 npm run verify:headless                      # serves the repo itself + drives system Chrome headlessly
+FAST=1 npm run verify:headless               # dev iteration: baseline model, core sections only (~3 min; NOT a release gate)
 ```
 
 Or serve the repo root (`python3 -m http.server 8000`) and open
