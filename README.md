@@ -159,17 +159,21 @@ Proposals feed the same batched-verify path as prompt lookup, so the output is
 **bit-identical to non-speculative decoding no matter what the drafter returns** - stronger
 than the usual "distribution lossless" rejection-sampling guarantee; a bad draft can only cost
 speed, never correctness (gated: perfect, garbage, async, and sampled drafters all reproduce
-the plain output exactly). Two-model speculation - a small engine drafting
-for a big one, `engine.rewind(n)` rolling the draft engine back to the accepted prefix instead
-of re-prefilling - is wired and gate-proven bit-exact (see examples/verify.html section 12 for
-the complete draft/verify/rewind sync loop). Honest measurement, though: on a single shared
-GPU it is NOT currently a speedup - Bonsai-1.7B drafting for 8B reaches a promising 75%
-acceptance but the per-call engine overhead of micro-turns outweighs the saved verify steps
-(measured 3.9 vs 8.8 tok/s plain). Treat the hook as the extension point it is: cheap
-CPU-side drafters win today (that is what `promptLookup` is), and trained lightweight drafters
-(EAGLE/DFlash-class, should one exist for your model) plug in without engine changes. Speed
-depends entirely on acceptance rate and drafter cost; the two models must share a tokenizer.
-Like `promptLookup`, `drafter` is disabled when `candidateFilter` or `logprobs` is set.
+the plain output exactly).
+
+Know the physics before reaching for it: speculative decoding pays only when verifying k
+tokens in one batched pass costs about one token's time - true for f16 models, whose decode is
+weight-bandwidth-bound, but NOT here. 1-bit weights are so small that decode already saturates
+the GPU's compute at batch 1, so a k-row verify costs ~k single steps (measured: an S=9 verify
+~= 9.8x one step, and even a perfect zero-cost drafter decodes slower than plain on the
+subgroup path). That is why there is no built-in two-model mode - drafting with a second
+engine was built, measured bit-exact and slower, and removed; the fast single-stream decode
+and profitable speculation are the same budget, already spent on the former. Where the hook
+(and `promptLookup`, which auto-measures and bails) can still win: the no-subgroup fallback
+path and other latency-bound setups, where one batched pass replaces k dispatch round-trips.
+`engine.rewind(n)` (drop the last n tokens cheaply) remains available for custom multi-engine
+experiments. Like `promptLookup`, `drafter` is disabled when `candidateFilter` or `logprobs`
+is set.
 
 ## Chat (`bitgpu/chat`)
 
