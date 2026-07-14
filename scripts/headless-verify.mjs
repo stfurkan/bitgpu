@@ -119,12 +119,12 @@ try {
       await page.waitForFunction(
         () => /PACKAGE OK|REGRESSION|^ERROR:|\nERROR:/.test(document.getElementById('out').textContent),
         undefined,
-        { timeout: 1800000, polling: 1000 },
+        { timeout: 2700000, polling: 1000 },
       )
     } catch (e) {
       // Timeout: dump the partial transcript so the stall point is visible, then fail the gate.
       const partial = await page.evaluate(() => document.getElementById('out').textContent).catch(() => '(page unresponsive)')
-      console.log(`TIMED OUT after 1800s; partial transcript:\n${partial}`)
+      console.log(`TIMED OUT after 2700s; partial transcript:\n${partial}`)
       allOk = false
       await page.close()
       continue

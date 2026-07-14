@@ -250,6 +250,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // q8: packed snorm8 K/V with one f32 scale per 32-element block (q8_0-style). Pure core WGSL
   // (pack4x8snorm), so unlike f16 it needs no adapter feature - available everywhere.
   const kv8 = opts.kvCache === 'q8'
+  // Rolling window with attention sinks (StreamingLLM): keys cached UNROPED, rotated at read
+  // by cache-relative position, middle evicted in batches. See the attention_*_roll shaders.
+  const roll = opts.overflow === 'sinks'
+  const SINKS = roll ? Math.max(1, Math.floor(opts.sinkTokens ?? 4)) : 0
+  if (roll && maxSeqLen < SINKS + 64)
+    throw new Error(`bitgpu: overflow 'sinks' needs maxSeqLen >= sinkTokens + 64 (got ${maxSeqLen} with ${SINKS} sinks)`)
   const KVB = kv16 ? 2 : kv8 ? 1 : 4 // bytes per cached K/V element (q8 block scales tracked separately)
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
@@ -363,9 +369,27 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (useSG) for (const n of ['attention_sg_kv8', 'rmsnorm_rope_sg_kv8']) specs.push([n, { SG: sgMax }])
     else specs.push(['attention_wg_kv8'])
   }
+  // Rolling-window (sinks) attention reads rotate K at read time, so it has its own kernel per
+  // mode+path. The sg roll kernels keep the rotate partner in-lane only when SG <= head_dim/2;
+  // outside that geometry the wg roll kernel takes over (attention only - everything else
+  // keeps the sg path).
+  const rollSG = useSG && sgMax <= A.head_dim / 2
+  if (roll) {
+    const rollAtt = kv16 ? 'attention_sg_kv16_roll' : kv8 ? 'attention_sg_kv8_roll' : 'attention_sg_roll'
+    const rollAttWg = kv16 ? 'attention_wg_kv16_roll' : kv8 ? 'attention_wg_kv8_roll' : 'attention_wg_roll'
+    if (rollSG) specs.push([rollAtt, { SG: sgMax }])
+    else specs.push([rollAttWg])
+  }
   // Cache-touching kernel names resolve once by KV storage mode. q8's writers need extra
   // bindings (the block-scale buffers), so its call sites branch instead of renaming.
-  const ATT = kv16 ? (useSG ? 'attention_sg_kv16' : 'attention_wg_kv16') : kv8 ? (useSG ? 'attention_sg_kv8' : 'attention_wg_kv8') : useSG ? 'attention_sg' : 'attention_wg'
+  const ATT =
+    roll ?
+      kv16 ? (rollSG ? 'attention_sg_kv16_roll' : 'attention_wg_kv16_roll')
+      : kv8 ? (rollSG ? 'attention_sg_kv8_roll' : 'attention_wg_kv8_roll')
+      : rollSG ? 'attention_sg_roll' : 'attention_wg_roll'
+    : kv16 ? (useSG ? 'attention_sg_kv16' : 'attention_wg_kv16')
+    : kv8 ? (useSG ? 'attention_sg_kv8' : 'attention_wg_kv8')
+    : useSG ? 'attention_sg' : 'attention_wg'
   const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache (f32/f16; q8 branches)
   const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache (f32/f16; q8 branches)
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
@@ -454,8 +478,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // fullHistory.length - 1 (the last token's K/V is never written during decode), and that last token
   // is re-fed when resuming so its K/V gets written. The persistent Kc/Vc (below) hold the cached K/V.
   let fullHistory: number[] = []
+  // Sink-mode bookkeeping: filled cache SLOTS. Diverges from fullHistory.length-1 once the
+  // window rolls (fullHistory keeps the whole conversation for penalties/PLD; the cache holds
+  // sinks + recent). Maintained by the decode loops; meaningless while overflow is 'error'.
+  let cacheLen = 0
   const resetCache = (): void => {
     fullHistory = []
+    cacheLen = 0
   }
 
   if (manifest.luts.tgt2.src !== 'aux')
@@ -770,6 +799,24 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       Vsc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
     }
   }
+  // Sink-mode statics: the aux rope tables ([window, Dh/2]) for the read-time K rotation, and
+  // cos=1/sin=0 stand-ins so the K WRITE kernels store the un-roped rmsnorm output unchanged
+  // (nd*1 + rot*0 == nd; no separate no-rope kernel variants needed).
+  let rollCosT: GPUBuffer | null = null,
+    rollSinT: GPUBuffer | null = null,
+    rollOnes: GPUBuffer | null = null,
+    rollZeros: GPUBuffer | null = null
+  if (roll) {
+    const R2 = Dh / 2
+    rollCosT = device.createBuffer({ size: maxSeqLen * R2 * 4, usage: S_ | CD })
+    rollSinT = device.createBuffer({ size: maxSeqLen * R2 * 4, usage: S_ | CD })
+    device.queue.writeBuffer(rollCosT, 0, cosCache.buffer, cosCache.byteOffset, maxSeqLen * R2 * 4)
+    device.queue.writeBuffer(rollSinT, 0, sinCache.buffer, sinCache.byteOffset, maxSeqLen * R2 * 4)
+    rollOnes = device.createBuffer({ size: Dh * 4, usage: S_ | CD })
+    rollZeros = device.createBuffer({ size: Dh * 4, usage: S_ | CD })
+    device.queue.writeBuffer(rollOnes, 0, new Float32Array(Dh).fill(1))
+    device.queue.writeBuffer(rollZeros, 0, new Float32Array(Dh))
+  }
   const loadOom = await device.popErrorScope()
   const loadVal = await device.popErrorScope()
   if (loadOom) throw new GpuOutOfMemoryError(`GPU allocation failed while loading weights (~${Math.round(weightBytes / 1048576)} MB VRAM needed): ${loadOom.message}`)
@@ -830,6 +877,42 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     kvCapacity = newCap
     poolInvalidate()
   }
+
+  // ---- sink-mode eviction (overflow: 'sinks') ----
+  // Batched StreamingLLM compaction: keep the SINKS anchor positions plus the most recent
+  // block, drop the middle. Cache bytes only MOVE (same-buffer copies are forbidden in WebGPU,
+  // so each region bounces through one lazily-kept scratch buffer); nothing is re-roped or
+  // requantized - the roll attention kernels rotate K by cache slot at read, so a moved row
+  // simply reads as "closer". Queue order makes the copies land before any later dispatch, so
+  // no CPU sync is needed. Called only from inside a turn (the op is already serialized).
+  let evictScratch: GPUBuffer | null = null
+  function evict(fill: number, need: number): number {
+    // free at least `need` slots plus a quarter-of-recent batch, so events stay rare
+    const recent = fill - SINKS
+    const batch = Math.min(recent, Math.max(need, Math.ceil((maxSeqLen - SINKS) / 4)))
+    const keep = recent - batch
+    if (keep <= 0) return SINKS // nothing recent survives (giant need): sinks only
+    const rowK = KV * Dh * KVB
+    const rowS = kv8 ? KV * (Dh / 32) * 4 : 0
+    if (!evictScratch || evictScratch.size < keep * rowK) {
+      evictScratch?.destroy()
+      evictScratch = device.createBuffer({ size: keep * rowK, usage: CS | CD })
+    }
+    const enc = device.createCommandEncoder()
+    const groups: Array<[GPUBuffer, number]> = []
+    for (let li = 0; li < A.layers; li++) {
+      groups.push([Kc[li], rowK], [Vc[li], rowK])
+      if (kv8) groups.push([Ksc[li], rowS], [Vsc[li], rowS])
+    }
+    for (const [buf, row] of groups) {
+      enc.copyBufferToBuffer(buf, (SINKS + batch) * row, evictScratch, 0, keep * row)
+      enc.copyBufferToBuffer(evictScratch, 0, buf, SINKS * row, keep * row)
+    }
+    device.queue.submit([enc.finish()])
+    return SINKS + keep
+  }
+  // Make room for `n` more rows before recording a batch; returns the (possibly reduced) fill.
+  const evictFor = (fill: number, n: number): number => (roll && fill + n > maxSeqLen ? evict(fill, fill + n - maxSeqLen) : fill)
 
   async function readback(buf: GPUBuffer, n: number): Promise<Float32Array> {
     const rb = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | CD })
@@ -984,7 +1067,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
   // The attention kernel's cache bindings by KV mode (q8 adds the block-scale buffers).
-  const attIns = (qr: GPUBuffer, li: number): GPUBuffer[] => (kv8 ? [qr, Kc[li], Vc[li], Ksc[li], Vsc[li]] : [qr, Kc[li], Vc[li]])
+  const attIns = (qr: GPUBuffer, li: number): GPUBuffer[] => {
+    const ins = kv8 ? [qr, Kc[li], Vc[li], Ksc[li], Vsc[li]] : [qr, Kc[li], Vc[li]]
+    if (roll) ins.push(rollCosT!, rollSinT!) // read-time K rotation tables
+    return ins
+  }
 
   function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const Ltot = posBase + S
@@ -1003,12 +1090,16 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       appendKV(pass, v, 1, li, KV, posBase * KV)
       const qr = actBuf(H * Dh)
       runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
+      // Sink mode stores K UNROPED (rotation happens at attention read): bind cos=1/sin=0 so
+      // the same write kernels store the plain rmsnorm output.
+      const kcos = roll ? rollOnes! : cos,
+        ksin = roll ? rollZeros! : sin
       if (kv8) {
         // fused K write, quantizing into the cache (extra scale binding -> its own dispatch)
-        setup(pass, 'rmsnorm_rope_sg_kv8', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', 0], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], [Kc[li], Ksc[li]])
+        setup(pass, 'rmsnorm_rope_sg_kv8', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', 0], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], [Kc[li], Ksc[li]])
         pass.dispatchWorkgroups(isFull('rmsnorm_rope_sg_kv8') ? KV : 1)
       } else {
-        runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, cos, sin], Kc[li], KV)
+        runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], Kc[li], KV)
       }
       cap(li, 'qr', qr)
       const att = actBuf(H * Dh)
@@ -1043,8 +1134,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const qr = actBuf(S * H * Dh),
       kr = actBuf(S * KV * Dh)
     run(pass, 'rope', [['u', S], ['u', H], ['u', Dh], ['u', 0]], [qn, cos, sin], qr, S * H * Dh)
-    run(pass, 'rope', [['u', S], ['u', KV], ['u', Dh], ['u', 0]], [kn, cos, sin], kr, S * KV * Dh)
-    appendKV(pass, kr, 0, li, S * KV, posBase * KV)
+    if (!roll) run(pass, 'rope', [['u', S], ['u', KV], ['u', Dh], ['u', 0]], [kn, cos, sin], kr, S * KV * Dh)
+    appendKV(pass, roll ? kn : kr, 0, li, S * KV, posBase * KV) // sink mode caches K unroped
     appendKV(pass, v, 1, li, S * KV, posBase * KV)
     cap(li, 'qr', qr)
     const att = actBuf(S * H * Dh)
@@ -1106,6 +1197,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // forward() overwrites K/V at positions 0..S-1 of every layer: whatever conversation the cache
     // held is gone, so nothing may reuse it. Same rule as an aborted prefill.
     fullHistory = []
+    cacheLen = 0
     await ensureKvCapacity(S)
     const vocab = W.lm_head.N!
     // Segmented like runPrefill (bit-exact by the same composition the reuse gates prove), so a
@@ -1157,6 +1249,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     for (let off = 0; off < ids.length; off += PREFILL_SEG) {
       if (off > 0 && signal?.aborted) {
         fullHistory = []
+        cacheLen = 0
         return null
       }
       const seg = ids.slice(off, off + PREFILL_SEG)
@@ -1215,15 +1308,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         ctl?.onToken?.(firstTok)
       }
       poolInvalidate() // rebuild cached bind groups against this call's buffers
+      let slot = posBase + ids.length // cache slot where the next fed token's K/V lands
       while (total < nTokens && !stopped) {
         if (ctl?.signal?.aborted) break
         const batch = Math.min(syncN, nTokens - total)
+        slot = evictFor(slot, batch) // sink mode: roll the window before the batch needs the room
         poolUse('decode') // reuse decode scratch + uniforms across batches; resets the slot indices
         let t = performance.now()
         const enc = device.createCommandEncoder()
         for (let j = 0; j < batch; j++) {
           const idxOut = total + j,
-            pos = posBase + ids.length + idxOut - 1
+            pos = slot + j
           let pass = enc.beginComputePass()
           runN(pass, 'embed_gather', [['u', Hd], ['u', idxOut - 1], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
           pass.end()
@@ -1243,14 +1338,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         t = performance.now()
         const toks = await readbackU32(tokBuf, total + batch)
         rbMs += performance.now() - t
+        let fed = batch // slots that belong to the history (EOS discards the rest of the batch)
         for (let j = 0; j < batch; j++) {
           const tk = toks[total + j]
-          if (stopSet?.has(tk)) { stopped = true; break } // EOS lands at the batch boundary (greedy)
+          if (stopSet?.has(tk)) { stopped = true; fed = j; break } // EOS lands at the batch boundary (greedy)
           gen.push(tk)
           ctl?.onToken?.(tk)
         }
         total += batch
+        slot += fed
       }
+      cacheLen = slot // sink-mode bookkeeping: the last history token's (re-feed) slot
       const decodeMs = performance.now() - t1,
         nd = Math.max(1, gen.length - 1)
       return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd }
@@ -1448,10 +1546,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const t1 = performance.now()
       let total = 1
       poolInvalidate() // rebuild cached bind groups against this call's buffers
+      let slot = posBase + ids.length // cache slot where the next fed token's K/V lands
       while (total < nTokens && !stopped) {
         if (signal?.aborted) break
         poolUse('decode')
-        const idxOut = total, pos = posBase + ids.length + idxOut - 1
+        slot = evictFor(slot, 1) // sink mode: roll the window before this step needs the room
+        const idxOut = total, pos = slot
         let t = performance.now()
         const { affLen, banLen } = writeAffBan(history)
         const enc = device.createCommandEncoder()
@@ -1485,7 +1585,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         recordLp(ci, cv, lse)
         onToken?.(tk)
         device.queue.writeBuffer(tokBuf, idxOut * 4, new Uint32Array([tk])) // feed the next step's embed gather
+        slot += 1
       }
+      cacheLen = slot // sink-mode bookkeeping (filled slots; the last emitted token is unfed)
       const decodeMs = performance.now() - t1
       const nd = Math.max(1, gen.length - 1)
       return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd, rng, ...(lpOut ? { lp: lpOut } : {}) }
@@ -1618,6 +1720,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const t1 = performance.now()
       while (total < nTokens && !stopped) {
         if (signal?.aborted) break
+        pos = evictFor(pos, maxDraft + 1) // sink mode: roll before a full drafting step needs the room
         const kMax = Math.min(maxDraft, nTokens - total - 1, maxSeqLen - 1 - pos)
         const drafts = kMax > 0 ? draftNgram(history, ngramSize, kMax) : []
         const S = drafts.length + 1
@@ -1710,6 +1813,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         pos += emitted.length
         tLast = emitted[emitted.length - 1]
       }
+      cacheLen = pos // sink-mode bookkeeping: the last history token's (re-feed) slot
       const decodeMs = performance.now() - t1
       const nd = Math.max(1, gen.length - 1)
       return {
@@ -1820,6 +1924,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     useSubgroups: useSG,
     subgroupSize: sgMax,
     kvCache: kv16 ? 'f16' : kv8 ? 'q8' : 'f32',
+    overflow: roll ? 'sinks' : 'error',
     maxSeqLen,
     adapter: { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description },
     limits: {
@@ -1847,12 +1952,23 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
     // Validate BEFORE mutating fullHistory: a throw must leave the reuse state exactly as it was,
     // or a caller that catches and retries decodes against K/V that was never written.
-    const posBase = reuse ? fullHistory.length - 1 : 0 // reuse: the prior last token (uncached) is re-fed, then the delta
+    // Sink mode: the cache slot no longer tracks fullHistory once the window has rolled, so
+    // posBase comes from cacheLen; if the incoming turn does not fit, evict FIRST (the prompt
+    // itself must still fit the window - prompt-side trimming stays the caller's job).
+    let posBase = reuse ? (roll ? cacheLen : fullHistory.length - 1) : 0 // reuse: the prior last token (uncached) is re-fed, then the delta
     const prefillTokens = reuse ? [fullHistory[fullHistory.length - 1], ...promptTokenIds] : promptTokenIds
     if (prefillTokens.length === 0) throw new Error('generate: no tokens to process')
+    if (roll && posBase + prefillTokens.length + 1 > maxSeqLen) {
+      if (SINKS + prefillTokens.length + 1 > maxSeqLen)
+        throw new Error(`generate: prompt length ${prefillTokens.length} exceeds the rolling window (maxSeqLen ${maxSeqLen} minus ${SINKS} sinks); trim the prompt`)
+      await ensureKvCapacity(Math.min(maxSeqLen, posBase + prefillTokens.length)) // eviction copies within allocated rows
+      posBase = evict(posBase, posBase + prefillTokens.length + 1 - maxSeqLen)
+      cacheLen = posBase
+    }
     const room = maxSeqLen - posBase - prefillTokens.length // decode positions left in the KV window
     if (room < 1) throw new Error(`generate: prompt length ${posBase + prefillTokens.length} exceeds maxSeqLen ${maxSeqLen}; trim history or raise maxSeqLen`)
-    const maxTokens = Math.min(genOpts.maxTokens ?? 256, room) // clamp instead of throwing: fill the window, stop there
+    // In sink mode the window rolls mid-turn, so maxTokens is honored as-is (no window clamp).
+    const maxTokens = roll ? (genOpts.maxTokens ?? 256) : Math.min(genOpts.maxTokens ?? 256, room) // clamp instead of throwing: fill the window, stop there
     if (reuse) fullHistory.push(...promptTokenIds) // the delta is now part of the conversation (last token already present)
     else fullHistory = [...promptTokenIds]
 
@@ -1866,6 +1982,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         const t0 = performance.now()
         await runPrefill(prefillTokens, posBase, genOpts.signal)
         await device.queue.onSubmittedWorkDone()
+        cacheLen = posBase + prefillTokens.length - 1 // sink-mode bookkeeping (last token re-feeds)
         return { tokens: [], prefillMs: performance.now() - t0, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
       } finally {
         flushTransients()
@@ -1965,6 +2082,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       await runPrefill(ids, 0) // posBase 0: fresh prefix; writes K/V for every position (segmented)
       await device.queue.onSubmittedWorkDone()
       fullHistory = [...ids]
+      cacheLen = ids.length - 1 // sink-mode bookkeeping (last token re-feeds)
       return { prefillMs: performance.now() - t0 }
     } finally {
       flushTransients()
@@ -1985,7 +2103,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
   async function saveCache(): Promise<KvSnapshot | null> {
     if (fullHistory.length === 0) return null
-    const len = fullHistory.length - 1
+    const len = roll ? cacheLen : fullHistory.length - 1 // rolled cache: slots, not history
     const data = new ArrayBuffer(snapshotBytes(len))
     if (len > 0) {
       const rb = device.createBuffer({ size: snapshotBytes(len), usage: GPUBufferUsage.MAP_READ | CD })
@@ -2010,25 +2128,34 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       rb.destroy()
     }
     return {
-      version: 1,
+      version: roll ? 2 : 1, // v2 = unroped keys + rolled window; only restores into sink mode
       kvCache: capabilities.kvCache,
       model: { layers: A.layers, kvHeads: KV, headDim: Dh, hidden: Hd, vocab: A.vocab },
       ids: [...fullHistory],
+      ...(roll ? { roll: { sinkTokens: SINKS, cacheLen } } : {}),
       data,
     }
   }
 
   async function restoreCache(snap: KvSnapshot): Promise<void> {
-    if (!snap || snap.version !== 1) throw new Error(`restoreCache: unsupported snapshot version ${snap?.version}`)
+    if (!snap || (snap.version !== 1 && snap.version !== 2)) throw new Error(`restoreCache: unsupported snapshot version ${snap?.version}`)
+    if ((snap.version === 2) !== roll)
+      throw new Error(
+        snap.version === 2 ?
+          "restoreCache: snapshot was saved under overflow 'sinks' (unroped keys); this engine runs overflow 'error'"
+        : "restoreCache: snapshot was saved under overflow 'error' (roped keys); this engine runs overflow 'sinks'",
+      )
+    if (snap.version === 2 && snap.roll?.sinkTokens !== SINKS)
+      throw new Error(`restoreCache: snapshot uses ${snap.roll?.sinkTokens} sink tokens but this engine uses ${SINKS}`)
     if (snap.kvCache !== capabilities.kvCache)
       throw new Error(`restoreCache: snapshot was saved under kvCache '${snap.kvCache}' but this engine runs '${capabilities.kvCache}' - snapshots do not convert across modes`)
     const m = snap.model
     if (!m || m.layers !== A.layers || m.kvHeads !== KV || m.headDim !== Dh || m.hidden !== Hd || m.vocab !== A.vocab)
       throw new Error('restoreCache: snapshot is from a different model (architecture mismatch)')
     if (!Array.isArray(snap.ids) || snap.ids.length === 0) throw new Error('restoreCache: snapshot holds no tokens')
-    if (snap.ids.length > maxSeqLen)
-      throw new Error(`restoreCache: snapshot length ${snap.ids.length} exceeds maxSeqLen ${maxSeqLen}`)
-    const len = snap.ids.length - 1
+    const len = snap.version === 2 ? snap.roll!.cacheLen : snap.ids.length - 1
+    if (len + 1 > maxSeqLen)
+      throw new Error(`restoreCache: snapshot needs ${len + 1} cache slots but maxSeqLen is ${maxSeqLen}`)
     if (snap.data.byteLength !== snapshotBytes(len))
       throw new Error(`restoreCache: snapshot data is ${snap.data.byteLength} bytes, expected ${snapshotBytes(len)}`)
     await ensureKvCapacity(len)
@@ -2046,6 +2173,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       }
     }
     fullHistory = [...snap.ids]
+    cacheLen = len
   }
 
   // The engine shares one KV cache, buffer pool, and flag set across calls, so concurrent

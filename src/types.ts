@@ -59,6 +59,20 @@ export interface EngineOptions {
    *  seed -> same tokens; cache reuse == full prefill). See `capabilities.kvCache` for what's
    *  active. Default `'f32'`. */
   kvCache?: 'f32' | 'f16' | 'q8'
+  /** What happens when a conversation outgrows `maxSeqLen`. `'error'` (default): generate
+   *  throws, exactly as before. `'sinks'`: StreamingLLM-style rolling window - the first
+   *  `sinkTokens` positions (attention sinks) plus the most recent window are kept and the
+   *  middle is evicted in batches, so generation and multi-turn chat continue indefinitely in
+   *  fixed memory. Keys are cached UNROPED and rotated at read by cache-relative position, so
+   *  eviction never rewrites or (under q8) requantizes cache bytes. Sink mode is its own
+   *  measured mode like f16/q8: within-mode decoding stays exact and deterministic, and before
+   *  the first eviction f32+sinks matches default f32 (gated); after eviction the model
+   *  genuinely forgets evicted middle context - that is the trade. Prompts longer than the
+   *  window still throw (trim prompt-side, e.g. chat onOverflow). */
+  overflow?: 'error' | 'sinks'
+  /** Number of initial attention-sink positions kept forever under `overflow: 'sinks'`.
+   *  Default `4` (the StreamingLLM setting). */
+  sinkTokens?: number
   /** Called as the model loads. */
   onProgress?: (progress: LoadProgress) => void
   /** Called if the GPU device is lost after creation (driver reset, OS reclaim, tab backgrounding
@@ -190,8 +204,11 @@ export interface EngineCapabilities {
   /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16;
    *  'q8' whenever requested - it needs no adapter feature). */
   kvCache: 'f32' | 'f16' | 'q8'
-  /** The engine's KV window in positions (the resolved maxSeqLen option): prompt + generated
-   *  tokens per conversation must fit inside it. */
+  /** Active overflow policy ('sinks' = rolling window with attention sinks). */
+  overflow: 'error' | 'sinks'
+  /** The engine's KV window in positions (the resolved maxSeqLen option). Under
+   *  `overflow: 'error'` prompt + generated tokens must fit inside it; under `'sinks'` it is
+   *  the rolling window size. */
   maxSeqLen: number
   /** Adapter identification, when the browser exposes it. */
   adapter: { vendor?: string; architecture?: string; device?: string; description?: string }
@@ -205,10 +222,13 @@ export interface EngineCapabilities {
  *  Restore requires the SAME model architecture and the SAME `kvCache` mode; snapshots never
  *  convert across modes. Treat the fields as opaque. */
 export interface KvSnapshot {
-  /** Snapshot format version (currently `1`). */
-  version: 1
+  /** Snapshot format version: `1` = default mode, `2` = saved under `overflow: 'sinks'`
+   *  (the cache holds unroped keys and a rolled window; restore requires sink mode). */
+  version: 1 | 2
   /** KV storage mode the snapshot was taken under. */
   kvCache: 'f32' | 'f16' | 'q8'
+  /** Version 2 only: rolling-window state (sink count and filled cache slots). */
+  roll?: { sinkTokens: number; cacheLen: number }
   /** Architecture stamp; restore rejects a snapshot from a different model shape. */
   model: { layers: number; kvHeads: number; headDim: number; hidden: number; vocab: number }
   /** The full conversation token sequence at save time. */

@@ -7,7 +7,8 @@ Reference targets are Bonsai **1.7B, 4B and 8B** (Qwen3 architecture, sign-packe
 weights + 2/4-bit embeddings, tied or untied lm_head) - every size is gated bit-exact against the
 reference forward on real hardware. GPU-resident decode (greedy or sampled), streaming, EOS stop,
 `AbortSignal`, cross-turn KV-cache reuse, optional f16/q8 KV-cache compression for long
-contexts in less VRAM, and conversation snapshots (save/restore across page reloads). Runs the
+contexts in less VRAM, conversation snapshots (save/restore across page reloads), and an
+optional rolling window with attention sinks for unbounded chats in fixed memory. Runs the
 fast subgroup path on Apple / NVIDIA /
 recent AMD and falls back to a workgroup-reduction path everywhere else WebGPU is available.
 Device limits are negotiated from the manifest, so the 8B's ~148 MiB lm_head binding is requested
@@ -115,6 +116,32 @@ reads a quarter of the bytes) - while shallow-context decode measures a few perc
 Reach for `'q8'` to run a 4x longer window in the same VRAM (or the same window on smaller
 GPUs); keep the default `'f32'` when bit-exact reproducibility is the point.
 `engine.capabilities.kvCache` reports what is actually active.
+
+### Unbounded conversations (`overflow: 'sinks'`)
+
+By default a conversation that outgrows `maxSeqLen` throws. `overflow: 'sinks'` switches to a
+StreamingLLM-style rolling window instead: the first `sinkTokens` positions (default 4, the
+"attention sinks" that anchor the model's attention) plus the most recent window are kept, the
+middle is evicted in batches, and generation or multi-turn chat continues indefinitely in fixed
+memory - `maxTokens` is no longer clamped to the window:
+
+```ts
+const engine = await createEngine({ modelUrl, kvCache: 'q8', overflow: 'sinks', maxSeqLen: 4096 })
+```
+
+Implementation detail that matters: keys are cached **unroped** and rotated at read time by
+their cache-relative position (the StreamingLLM reference scheme), so eviction is a plain
+byte-exact compaction - nothing is ever re-rotated or, under q8, requantized. This is the
+combination llama.cpp cannot offer (its context shift rewrites roped K in place and is
+disabled for quantized K caches); here `q8 + sinks` is the flagship pairing: unbounded chat in
+a quarter of the memory. The guarantees follow the mode philosophy: within-mode decoding is
+exact and deterministic (same seed -> same tokens, across evictions; gated on real hardware),
+and **before the first eviction f32+sinks is bit-identical to default f32** (gated against the
+known-good ids). After an eviction the model genuinely forgets the evicted middle - that is
+the trade, by design: prefer it over hard failure for open-ended chat; prefer `'error'` plus
+prompt-side trimming when every token of context must count. Prompts longer than the window
+still throw (`bitgpu/chat`'s `onOverflow` handles that side). Snapshots keep working - sink
+mode saves version-2 snapshots (restore requires sink mode with the same `sinkTokens`).
 
 ## Chat (`bitgpu/chat`)
 
@@ -369,9 +396,10 @@ npm run check:publish # publint + are-the-types-wrong
 `examples/verify.html` re-runs the full bit-exactness + throughput suite (forward cosines vs the
 committed reference fixtures in `test-fixtures/forward/`, known-good greedy ids, sampler kernel
 parity, determinism, KV reuse/growth, prompt-lookup identity, KV snapshot save/restore round
-trips - including into a fresh engine - and the f16/q8 KV-mode sections: within-mode exactness
-plus greedy agreement vs f32 out to a 1500-token prompt) against the **built package** and
-prints `PACKAGE OK` or `REGRESSION`.
+trips - including into a fresh engine - the f16/q8 KV-mode sections: within-mode exactness
+plus greedy agreement vs f32 out to a 1500-token prompt, and the rolling-window section:
+pre-eviction bit-exactness, 600 tokens through a 192-token window, determinism across
+evictions) against the **built package** and prints `PACKAGE OK` or `REGRESSION`.
 
 It needs model weights, which are not committed. Point `examples/model` at a directory holding the
 model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):

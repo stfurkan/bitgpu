@@ -644,6 +644,97 @@
         engine.resetCache();
       }
 
+      // 11) Rolling window / attention sinks (overflow: 'sinks'). Keys are cached UNROPED and
+      // rotated at read by cache slot, so BEFORE the first eviction f32+sinks must reproduce
+      // the known-good ids bit-exactly (hard gate); after eviction generation rolls past the
+      // window indefinitely - determinism and multi-turn reuse must hold ACROSS evictions, and
+      // coherence is measured (distinct-token ratio in the post-eviction tail).
+      {
+        log('\nrolling-window (attention sinks) checks (window 192, 4 sinks)...');
+        const nosgQ = new URLSearchParams(location.search).get('nosg') === '1';
+        const eR = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', maxSeqLen: 192, forceNoSubgroups: nosgQ });
+        const capOkS = eR.capabilities.overflow === 'sinks';
+        ok = ok && capOkS;
+        log(`  ${capOkS ? '[PASS]' : '[FAIL]'} capabilities.overflow = ${eR.capabilities.overflow}`);
+        const gS = await eR.generate(ids, { maxTokens: 32 }); // 12+32 << 192: nothing evicts
+        let nS = 0; while (nS < 32 && gS.tokens[nS] === KNOWN_GOOD[nS]) nS++;
+        const preOk = nS === 32;
+        ok = ok && preOk;
+        log(`  ${preOk ? '[PASS]' : '[FAIL]'} pre-eviction f32+sinks vs known-good ids: ${nS}/32 (bit-exact)`);
+        // generation must roll PAST the window (12 + 600 >> 192) and stay deterministic
+        eR.resetCache();
+        const r1 = await eR.generate(ids, { maxTokens: 600 });
+        const r2 = (eR.resetCache(), await eR.generate(ids, { maxTokens: 600 }));
+        const rollOk = r1.tokens.length === 600;
+        const detOkR = rollOk && r2.tokens.length === 600 && r1.tokens.every((t, i) => t === r2.tokens[i]);
+        ok = ok && rollOk && detOkR;
+        log(`  ${rollOk ? '[PASS]' : '[FAIL]'} generated ${r1.tokens.length}/600 tokens through a 192-token window (~9 evictions)`);
+        log(`  ${detOkR ? '[PASS]' : '[FAIL]'} deterministic across evictions (600 greedy identical twice)`);
+        const tail = r1.tokens.slice(-200), distinctR = new Set(tail).size;
+        log(`  post-eviction tail: ${distinctR}/200 distinct tokens (degeneracy probe, measured)`);
+        // multi-turn: a reuse turn that lands past the window must evict at entry and continue
+        eR.resetCache();
+        await eR.generate(ids, { maxTokens: 150 });
+        const mt = await eR.generate(ids.slice(0, 5), { maxTokens: 150, reuseCache: true });
+        const mtOk = mt.tokens.length === 150;
+        ok = ok && mtOk;
+        log(`  ${mtOk ? '[PASS]' : '[FAIL]'} multi-turn reuse across the roll (turn 2: ${mt.tokens.length}/150 tokens)`);
+        // sampled path across the roll (per-step eviction hook), deterministic under a seed
+        eR.resetCache();
+        const sR1 = await eR.generate(ids, { ...SOPT, maxTokens: 250, seed: 42 });
+        eR.resetCache();
+        const sR2 = await eR.generate(ids, { ...SOPT, maxTokens: 250, seed: 42 });
+        const sOkR = sR1.tokens.length === sR2.tokens.length && sR1.tokens.every((t, i) => t === sR2.tokens[i]);
+        ok = ok && sOkR;
+        log(`  ${sOkR ? '[PASS]' : '[FAIL]'} sampled decode across evictions (seed 42 identical twice, ${sR1.tokens.length} tokens)`);
+        // snapshot v2: round trip within sink mode; cross-mode restores must throw
+        eR.resetCache();
+        await eR.generate(ids, { maxTokens: 40 });
+        const snR = await eR.saveCache();
+        const v2Ok = snR.version === 2 && snR.roll && snR.roll.cacheLen <= 192;
+        const cA = await eR.generate(ids.slice(0, 5), { maxTokens: 12, reuseCache: true });
+        await eR.generate([...ids, ...ids], { maxTokens: 4 });
+        await eR.restoreCache(snR);
+        const cB = await eR.generate(ids.slice(0, 5), { maxTokens: 12, reuseCache: true });
+        const snOkR = v2Ok && cA.tokens.length === cB.tokens.length && cA.tokens.every((t, i) => t === cB.tokens[i]);
+        ok = ok && snOkR;
+        log(`  ${snOkR ? '[PASS]' : '[FAIL]'} v2 snapshot round trip in sink mode (continuation exact)`);
+        engine.resetCache();
+        await engine.generate(ids, { maxTokens: 4 });
+        const snV1 = await engine.saveCache();
+        let xRej = 0;
+        try { await eR.restoreCache(snV1); } catch { xRej++; }
+        try { await engine.restoreCache(snR); } catch { xRej++; }
+        const xOk = xRej === 2;
+        ok = ok && xOk;
+        log(`  ${xOk ? '[PASS]' : '[FAIL]'} v1<->v2 cross-mode restores rejected (${xRej}/2 threw)`);
+        engine.resetCache();
+        eR.dispose();
+        // q8 + sinks: the flagship combination (llama.cpp cannot shift a quantized K cache at
+        // all; here the packed bytes never move losslessly-incorrectly - they only compact)
+        const eQ = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', kvCache: 'q8', maxSeqLen: 192, forceNoSubgroups: nosgQ });
+        const rq1 = await eQ.generate(ids, { maxTokens: 400 });
+        eQ.resetCache();
+        const rq2 = await eQ.generate(ids, { maxTokens: 400 });
+        const qOkR = rq1.tokens.length === 400 && rq2.tokens.length === 400 && rq1.tokens.every((t, i) => t === rq2.tokens[i]);
+        ok = ok && qOkR;
+        const tailQ = rq1.tokens.slice(-200), distinctQ = new Set(tailQ).size;
+        log(`  ${qOkR ? '[PASS]' : '[FAIL]'} q8+sinks: 400 tokens through the window, deterministic (tail ${distinctQ}/200 distinct)`);
+        log(`  q8+sinks decode ${rq1.tokensPerSecond.toFixed(2)} tok/s (flat-cost rolling window)`);
+        eQ.dispose();
+        // f16 + sinks (when the adapter has shader-f16): same roll + determinism probe
+        if ((await navigator.gpu.requestAdapter()).features.has('shader-f16')) {
+          const eH = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', kvCache: 'f16', maxSeqLen: 192, forceNoSubgroups: nosgQ });
+          const h1 = await eH.generate(ids, { maxTokens: 300 });
+          eH.resetCache();
+          const h2 = await eH.generate(ids, { maxTokens: 300 });
+          const hOkR = h1.tokens.length === 300 && h2.tokens.length === 300 && h1.tokens.every((t, i) => t === h2.tokens[i]);
+          ok = ok && hOkR;
+          log(`  ${hOkR ? '[PASS]' : '[FAIL]'} f16+sinks: 300 tokens through the window, deterministic`);
+          eH.dispose();
+        } else log('  f16+sinks SKIPPED (no shader-f16)');
+      }
+
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);
     }
 
