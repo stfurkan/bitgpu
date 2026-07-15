@@ -29,16 +29,16 @@
     const cos = (a, e) => { let d = 0, na = 0, nb = 0; for (let i = 0; i < e.length; i++) { d += a[i] * e[i]; na += a[i] * a[i]; nb += e[i] * e[i]; } return d / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9); };
 
     // ?model=<tag> selects a staged model + fixture set: ./model-<tag> with
-    // ../test-fixtures/forward-<tag>. Default (no param) is the reference
-    // Bonsai-1.7B in ./model with ../test-fixtures/forward. Each fixture set's
-    // params.json carries its own known-good greedy continuation (bit-exact gate).
-    const MODEL_TAG = new URLSearchParams(location.search).get('model') || '';
+    // ../test-fixtures/forward-<tag>. Default is the reference Bonsai-1.7B
+    // (tag "1.7b"). Each fixture set's params.json carries its own known-good
+    // greedy continuation (bit-exact gate).
+    const MODEL_TAG = new URLSearchParams(location.search).get('model') || '1.7b';
     // ?fast=1: development iteration mode - the bit-exact core (sections 1-7) only; the
     // KV-mode/snapshot/sinks sections are release-gate material (npm run verify:headless
     // without FAST=1 runs everything on every staged model).
     const FAST = new URLSearchParams(location.search).get('fast') === '1';
-    const MODEL_DIR = MODEL_TAG ? `./model-${MODEL_TAG}` : './model';
-    const FIX = MODEL_TAG ? `../test-fixtures/forward-${MODEL_TAG}` : '../test-fixtures/forward';
+    const MODEL_DIR = `./model-${MODEL_TAG}`;
+    const FIX = `../test-fixtures/forward-${MODEL_TAG}`;
 
     async function run() {
       out.textContent = '';

@@ -318,14 +318,15 @@ GPU gate proves the reuse paths bit-exact on real hardware. Prefer your own toke
 
 ## Bring your own model
 
-bitgpu loads its own small format instead of parsing ONNX at runtime: a `manifest.json` (the
-architecture contract + every tensor mapped to a byte range) and a ~30 KB aux file, both
-produced ONCE, offline, from a standard export - while the big weights file is used
-byte-for-byte unchanged, so it can keep streaming from wherever it already lives (e.g. the
-Hugging Face Hub). Same one-time-conversion model as GGUF/llama.cpp or MLX.
+bitgpu loads its own small format instead of parsing ONNX or GGUF at runtime: a
+`manifest.json` (the architecture contract + every tensor mapped to a byte range) and a small
+aux file, both produced ONCE, offline, from a standard export - while the big weights file is
+used byte-for-byte unchanged, so it can keep streaming from wherever it already lives (e.g.
+the Hugging Face Hub). Same one-time-conversion model as llama.cpp or MLX. Two converters:
 
 ```sh
-python tools/convert.py --model <dir with config.json + the q1 .onnx + its data file>
+python tools/convert-onnx.py --model <dir with config.json + the q1 .onnx + its data file>
+python tools/convert-gguf.py --gguf <a 1-bit Q1_0 .gguf>   # the .gguf itself stays the data file
 ```
 
 Host the two small files anywhere (they're static), point `createEngine` at them, done:
@@ -334,18 +335,23 @@ Host the two small files anywhere (they're static), point `createEngine` at them
 createEngine({
   manifestUrl: 'https://your-site.example/model/manifest.json',
   auxUrl: 'https://your-site.example/model/model_q1.aux.bin',
-  dataUrl: 'https://huggingface.co/<repo>/resolve/main/onnx/model_q1.onnx_data',
+  dataUrl: 'https://huggingface.co/<repo>/resolve/main/onnx/model_q1.onnx_data', // or .../<model>.gguf
 })
 ```
 
-Compatibility envelope: Qwen3-family models quantized with the onnx-community 1-bit ("q1")
-recipe (silu/SwiGLU, head_dim <= 128, 128-wide scale blocks, tied or untied lm_head) - the
-engine validates the manifest loudly at load. The reference exports are
-[onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX),
-[Bonsai-4B-ONNX](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) and
-[Bonsai-8B-ONNX](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` +
-its data file). Format spec: [docs/FORMAT.md](docs/FORMAT.md); the full pipeline including
-regenerating the verification fixtures for a new model: [tools/README.md](tools/README.md).
+Compatibility envelope: Qwen3-family models quantized with the 1-bit recipe (silu/SwiGLU,
+head_dim <= 128, 128-wide scale blocks, tied or untied lm_head), in either container: ONNX
+exports with the onnx-community "q1" recipe, or GGUFs with PrismML's Q1_0 tensor type - the
+engine validates the manifest loudly at load. The two containers carry bit-identical weights
+for the Bonsai releases (verified sign-bit-for-sign-bit on 8B), so pick by hosting preference.
+Reference exports: [onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX) /
+[4B](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) /
+[8B](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` + data file), and
+[prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) /
+[4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) /
+[8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) (`Bonsai-*-Q1_0.gguf`). Format spec:
+[docs/FORMAT.md](docs/FORMAT.md); the full pipeline including regenerating the verification
+fixtures for a new model: [tools/README.md](tools/README.md).
 
 ## API
 
@@ -411,18 +417,19 @@ npm run check:publish # publint + are-the-types-wrong
 ### GPU verification gate
 
 `examples/verify.html` re-runs the full bit-exactness + throughput suite (forward cosines vs the
-committed reference fixtures in `test-fixtures/forward/`, known-good greedy ids, sampler kernel
+committed reference fixtures in `test-fixtures/forward-<tag>/`, known-good greedy ids, sampler kernel
 parity, determinism, KV reuse/growth, prompt-lookup identity, KV snapshot save/restore round
 trips - including into a fresh engine - the f16/q8 KV-mode sections: within-mode exactness
 plus greedy agreement vs f32 out to a 1500-token prompt, the rolling-window section:
 pre-eviction bit-exactness, 600 tokens through a 192-token window, determinism across
 evictions) against the **built package** and prints `PACKAGE OK` or `REGRESSION`.
 
-It needs model weights, which are not committed. Point `examples/model` at a directory holding the
-model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B, ~290 MB):
+It needs model weights, which are not committed. Point `examples/model-1.7b` at a directory
+holding the model's `manifest.json` + data/aux files (the reference target is Bonsai-1.7B,
+~290 MB):
 
 ```sh
-ln -s /path/to/bonsai-model examples/model   # or copy the files in
+ln -s /path/to/bonsai-model examples/model-1.7b   # or copy the files in
 npm run build
 npm run verify:headless                      # serves the repo itself + drives system Chrome headlessly
 FAST=1 npm run verify:headless               # dev iteration: baseline model, core sections only (~3 min; NOT a release gate)
@@ -438,10 +445,11 @@ known-good ids.
 
 The gate is model-parametric: `verify.html?model=<tag>` loads `examples/model-<tag>` against
 `test-fixtures/forward-<tag>`, and the headless driver automatically runs every staged variant.
-Fixture sets for all three Bonsai sizes are committed - `forward` (1.7B, hidden 2048),
-`forward-4b` (4B, hidden 2560) and `forward-8b` (8B, hidden 4096, untied lm_head, raised
-device limits) - so engine changes are checked against three geometries; stage the extra
-weights with `ln -s /path/to/bonsai-<size> examples/model-<size>`. The chat-layer checks need
+Committed fixture sets: `forward-1.7b` (1.7B, hidden 2048), `forward-4b` (4B, hidden 2560),
+`forward-8b` (8B, hidden 4096, untied lm_head, raised device limits), plus the GGUF-container
+twins `forward-{1.7b,4b,8b}-gguf` (q1_0 de-interleave, tied and untied, three synthesized-rope
+configurations) - so engine changes are checked against three geometries and both containers; stage
+the extra weights with `ln -s /path/to/bonsai-<size> examples/model-<size>`. The chat-layer checks need
 `tokenizer.json` + `tokenizer_config.json` in the staged model dir and skip loudly when absent.
 To add fixtures for another model, run `tools/golden.py` then
 `tools/reference.py --dump test-fixtures/forward-<tag>` on the converted work dir and record the

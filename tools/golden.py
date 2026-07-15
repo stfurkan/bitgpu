@@ -4,7 +4,7 @@
 Runs the .onnx graph on CPU (onnxruntime) for a fixed prompt and saves the exact
 logits. reference.py then checks its numpy forward against these, and its --dump
 fixtures become the browser verify page's reference. Reads the architecture from
-the manifest.json that convert.py wrote (run convert.py first).
+the manifest.json that convert-onnx.py wrote (run convert-onnx.py first).
 
 Usage: python tools/golden.py --model <dir> [--onnx model_q1.onnx] [--prompt "..."] [--out <dir>]
 Requires: numpy, onnxruntime, tokenizers (and <dir>/tokenizer.json from the model repo).

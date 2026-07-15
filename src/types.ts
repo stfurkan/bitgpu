@@ -45,7 +45,9 @@ export interface EngineOptions {
   /** Prefill GEMM tiling: `'auto'` tiles once a prompt fills the 64-row tiles, `'always'`/`'never'` force it. Default `'auto'`. */
   prefillTiling?: 'auto' | 'always' | 'never'
   /** Max KV-cache length (prompt + generated positions). Caps VRAM (~`maxSeqLen` x 224 KB at f32,
-   *  half that with `kvCache: 'f16'`, ~a quarter with `'q8'`). Default `2048`. */
+   *  half that with `kvCache: 'f16'`, ~a quarter with `'q8'`). Default `2048`. Capped by the
+   *  model's RoPE range: the baked cache length for ONNX-derived manifests, `max_positions`
+   *  (the GGUF context length) for GGUF-derived ones - exceeding it fails loudly at load. */
   maxSeqLen?: number
   /** KV-cache STORAGE precision. `'f16'` halves KV memory (all arithmetic stays f32; each cached
    *  K/V value is rounded once at cache-write); it falls back to `'f32'` silently when the

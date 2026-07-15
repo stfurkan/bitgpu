@@ -1,0 +1,5168 @@
+{
+ "version": 2,
+ "data_file": "Bonsai-1.7B-Q1_0.gguf",
+ "aux_file": "Bonsai-1.7B-Q1_0.aux.bin",
+ "arch": {
+  "model_type": "qwen3",
+  "layers": 28,
+  "hidden": 2048,
+  "intermediate": 6144,
+  "heads": 16,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "rms_eps": 9.999999974752427e-07,
+  "rope": {
+   "rope_theta": 1000000.0,
+   "rope_type": "yarn",
+   "factor": 4.0,
+   "original_max_position_embeddings": 8192
+  },
+  "max_positions": 32768,
+  "vocab": 151669,
+  "eos": 151645,
+  "tie_word_embeddings": true,
+  "act": "silu"
+ },
+ "luts": {
+  "tgt2": {
+   "dtype": "UINT8",
+   "shape": [
+    256,
+    2
+   ],
+   "src": "aux",
+   "off": 0,
+   "len": 512
+  },
+  "tgt4": {
+   "dtype": "UINT8",
+   "shape": [
+    256,
+    4
+   ],
+   "src": "aux",
+   "off": 512,
+   "len": 1024
+  }
+ },
+ "tensors": {
+  "layers.0.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 50527424,
+    "len": 589824
+   }
+  },
+  "layers.0.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 49633984,
+    "len": 294912
+   }
+  },
+  "layers.0.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 51117760,
+    "len": 294912
+   }
+  },
+  "layers.0.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 49937600,
+    "len": 589824
+   }
+  },
+  "layers.0.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 53182144,
+    "len": 1769472
+   }
+  },
+  "layers.0.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 54959808,
+    "len": 1769472
+   }
+  },
+  "layers.0.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 51412672,
+    "len": 1769472
+   }
+  },
+  "layers.0.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 49929408,
+    "len": 8192
+   }
+  },
+  "layers.0.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 54951616,
+    "len": 8192
+   }
+  },
+  "layers.0.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 51117248,
+    "len": 512
+   }
+  },
+  "layers.0.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 49928896,
+    "len": 512
+   }
+  },
+  "layers.1.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 57622720,
+    "len": 589824
+   }
+  },
+  "layers.1.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 56729280,
+    "len": 294912
+   }
+  },
+  "layers.1.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 58213056,
+    "len": 294912
+   }
+  },
+  "layers.1.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 57032896,
+    "len": 589824
+   }
+  },
+  "layers.1.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 60277440,
+    "len": 1769472
+   }
+  },
+  "layers.1.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 62055104,
+    "len": 1769472
+   }
+  },
+  "layers.1.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 58507968,
+    "len": 1769472
+   }
+  },
+  "layers.1.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 57024704,
+    "len": 8192
+   }
+  },
+  "layers.1.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 62046912,
+    "len": 8192
+   }
+  },
+  "layers.1.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 58212544,
+    "len": 512
+   }
+  },
+  "layers.1.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 57024192,
+    "len": 512
+   }
+  },
+  "layers.2.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 64718016,
+    "len": 589824
+   }
+  },
+  "layers.2.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 63824576,
+    "len": 294912
+   }
+  },
+  "layers.2.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 65308352,
+    "len": 294912
+   }
+  },
+  "layers.2.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 64128192,
+    "len": 589824
+   }
+  },
+  "layers.2.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 67372736,
+    "len": 1769472
+   }
+  },
+  "layers.2.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 69150400,
+    "len": 1769472
+   }
+  },
+  "layers.2.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 65603264,
+    "len": 1769472
+   }
+  },
+  "layers.2.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 64120000,
+    "len": 8192
+   }
+  },
+  "layers.2.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 69142208,
+    "len": 8192
+   }
+  },
+  "layers.2.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 65307840,
+    "len": 512
+   }
+  },
+  "layers.2.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 64119488,
+    "len": 512
+   }
+  },
+  "layers.3.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 71813312,
+    "len": 589824
+   }
+  },
+  "layers.3.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 70919872,
+    "len": 294912
+   }
+  },
+  "layers.3.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 72403648,
+    "len": 294912
+   }
+  },
+  "layers.3.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 71223488,
+    "len": 589824
+   }
+  },
+  "layers.3.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 74468032,
+    "len": 1769472
+   }
+  },
+  "layers.3.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 76245696,
+    "len": 1769472
+   }
+  },
+  "layers.3.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 72698560,
+    "len": 1769472
+   }
+  },
+  "layers.3.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 71215296,
+    "len": 8192
+   }
+  },
+  "layers.3.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 76237504,
+    "len": 8192
+   }
+  },
+  "layers.3.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 72403136,
+    "len": 512
+   }
+  },
+  "layers.3.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 71214784,
+    "len": 512
+   }
+  },
+  "layers.4.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 78908608,
+    "len": 589824
+   }
+  },
+  "layers.4.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 78015168,
+    "len": 294912
+   }
+  },
+  "layers.4.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 79498944,
+    "len": 294912
+   }
+  },
+  "layers.4.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 78318784,
+    "len": 589824
+   }
+  },
+  "layers.4.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 81563328,
+    "len": 1769472
+   }
+  },
+  "layers.4.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 83340992,
+    "len": 1769472
+   }
+  },
+  "layers.4.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 79793856,
+    "len": 1769472
+   }
+  },
+  "layers.4.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 78310592,
+    "len": 8192
+   }
+  },
+  "layers.4.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 83332800,
+    "len": 8192
+   }
+  },
+  "layers.4.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 79498432,
+    "len": 512
+   }
+  },
+  "layers.4.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 78310080,
+    "len": 512
+   }
+  },
+  "layers.5.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 86003904,
+    "len": 589824
+   }
+  },
+  "layers.5.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 85110464,
+    "len": 294912
+   }
+  },
+  "layers.5.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 86594240,
+    "len": 294912
+   }
+  },
+  "layers.5.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 85414080,
+    "len": 589824
+   }
+  },
+  "layers.5.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 88658624,
+    "len": 1769472
+   }
+  },
+  "layers.5.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 90436288,
+    "len": 1769472
+   }
+  },
+  "layers.5.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 86889152,
+    "len": 1769472
+   }
+  },
+  "layers.5.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 85405888,
+    "len": 8192
+   }
+  },
+  "layers.5.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 90428096,
+    "len": 8192
+   }
+  },
+  "layers.5.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 86593728,
+    "len": 512
+   }
+  },
+  "layers.5.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 85405376,
+    "len": 512
+   }
+  },
+  "layers.6.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 93099200,
+    "len": 589824
+   }
+  },
+  "layers.6.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 92205760,
+    "len": 294912
+   }
+  },
+  "layers.6.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 93689536,
+    "len": 294912
+   }
+  },
+  "layers.6.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 92509376,
+    "len": 589824
+   }
+  },
+  "layers.6.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 95753920,
+    "len": 1769472
+   }
+  },
+  "layers.6.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 97531584,
+    "len": 1769472
+   }
+  },
+  "layers.6.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 93984448,
+    "len": 1769472
+   }
+  },
+  "layers.6.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 92501184,
+    "len": 8192
+   }
+  },
+  "layers.6.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 97523392,
+    "len": 8192
+   }
+  },
+  "layers.6.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 93689024,
+    "len": 512
+   }
+  },
+  "layers.6.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 92500672,
+    "len": 512
+   }
+  },
+  "layers.7.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 100194496,
+    "len": 589824
+   }
+  },
+  "layers.7.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 99301056,
+    "len": 294912
+   }
+  },
+  "layers.7.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 100784832,
+    "len": 294912
+   }
+  },
+  "layers.7.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 99604672,
+    "len": 589824
+   }
+  },
+  "layers.7.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 102849216,
+    "len": 1769472
+   }
+  },
+  "layers.7.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 104626880,
+    "len": 1769472
+   }
+  },
+  "layers.7.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 101079744,
+    "len": 1769472
+   }
+  },
+  "layers.7.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 99596480,
+    "len": 8192
+   }
+  },
+  "layers.7.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 104618688,
+    "len": 8192
+   }
+  },
+  "layers.7.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 100784320,
+    "len": 512
+   }
+  },
+  "layers.7.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 99595968,
+    "len": 512
+   }
+  },
+  "layers.8.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 107289792,
+    "len": 589824
+   }
+  },
+  "layers.8.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 106396352,
+    "len": 294912
+   }
+  },
+  "layers.8.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 107880128,
+    "len": 294912
+   }
+  },
+  "layers.8.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 106699968,
+    "len": 589824
+   }
+  },
+  "layers.8.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 109944512,
+    "len": 1769472
+   }
+  },
+  "layers.8.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 111722176,
+    "len": 1769472
+   }
+  },
+  "layers.8.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 108175040,
+    "len": 1769472
+   }
+  },
+  "layers.8.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 106691776,
+    "len": 8192
+   }
+  },
+  "layers.8.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 111713984,
+    "len": 8192
+   }
+  },
+  "layers.8.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 107879616,
+    "len": 512
+   }
+  },
+  "layers.8.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 106691264,
+    "len": 512
+   }
+  },
+  "layers.9.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 114385088,
+    "len": 589824
+   }
+  },
+  "layers.9.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 113491648,
+    "len": 294912
+   }
+  },
+  "layers.9.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 114975424,
+    "len": 294912
+   }
+  },
+  "layers.9.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 113795264,
+    "len": 589824
+   }
+  },
+  "layers.9.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 117039808,
+    "len": 1769472
+   }
+  },
+  "layers.9.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 118817472,
+    "len": 1769472
+   }
+  },
+  "layers.9.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 115270336,
+    "len": 1769472
+   }
+  },
+  "layers.9.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 113787072,
+    "len": 8192
+   }
+  },
+  "layers.9.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 118809280,
+    "len": 8192
+   }
+  },
+  "layers.9.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 114974912,
+    "len": 512
+   }
+  },
+  "layers.9.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 113786560,
+    "len": 512
+   }
+  },
+  "layers.10.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 121480384,
+    "len": 589824
+   }
+  },
+  "layers.10.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 120586944,
+    "len": 294912
+   }
+  },
+  "layers.10.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 122070720,
+    "len": 294912
+   }
+  },
+  "layers.10.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 120890560,
+    "len": 589824
+   }
+  },
+  "layers.10.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 124135104,
+    "len": 1769472
+   }
+  },
+  "layers.10.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 125912768,
+    "len": 1769472
+   }
+  },
+  "layers.10.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 122365632,
+    "len": 1769472
+   }
+  },
+  "layers.10.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 120882368,
+    "len": 8192
+   }
+  },
+  "layers.10.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 125904576,
+    "len": 8192
+   }
+  },
+  "layers.10.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 122070208,
+    "len": 512
+   }
+  },
+  "layers.10.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 120881856,
+    "len": 512
+   }
+  },
+  "layers.11.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 128575680,
+    "len": 589824
+   }
+  },
+  "layers.11.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 127682240,
+    "len": 294912
+   }
+  },
+  "layers.11.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 129166016,
+    "len": 294912
+   }
+  },
+  "layers.11.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 127985856,
+    "len": 589824
+   }
+  },
+  "layers.11.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 131230400,
+    "len": 1769472
+   }
+  },
+  "layers.11.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 133008064,
+    "len": 1769472
+   }
+  },
+  "layers.11.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 129460928,
+    "len": 1769472
+   }
+  },
+  "layers.11.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 127977664,
+    "len": 8192
+   }
+  },
+  "layers.11.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 132999872,
+    "len": 8192
+   }
+  },
+  "layers.11.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 129165504,
+    "len": 512
+   }
+  },
+  "layers.11.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 127977152,
+    "len": 512
+   }
+  },
+  "layers.12.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 135670976,
+    "len": 589824
+   }
+  },
+  "layers.12.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 134777536,
+    "len": 294912
+   }
+  },
+  "layers.12.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 136261312,
+    "len": 294912
+   }
+  },
+  "layers.12.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 135081152,
+    "len": 589824
+   }
+  },
+  "layers.12.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 138325696,
+    "len": 1769472
+   }
+  },
+  "layers.12.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 140103360,
+    "len": 1769472
+   }
+  },
+  "layers.12.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 136556224,
+    "len": 1769472
+   }
+  },
+  "layers.12.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 135072960,
+    "len": 8192
+   }
+  },
+  "layers.12.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 140095168,
+    "len": 8192
+   }
+  },
+  "layers.12.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 136260800,
+    "len": 512
+   }
+  },
+  "layers.12.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 135072448,
+    "len": 512
+   }
+  },
+  "layers.13.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 142766272,
+    "len": 589824
+   }
+  },
+  "layers.13.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 141872832,
+    "len": 294912
+   }
+  },
+  "layers.13.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 143356608,
+    "len": 294912
+   }
+  },
+  "layers.13.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 142176448,
+    "len": 589824
+   }
+  },
+  "layers.13.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 145420992,
+    "len": 1769472
+   }
+  },
+  "layers.13.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 147198656,
+    "len": 1769472
+   }
+  },
+  "layers.13.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 143651520,
+    "len": 1769472
+   }
+  },
+  "layers.13.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 142168256,
+    "len": 8192
+   }
+  },
+  "layers.13.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 147190464,
+    "len": 8192
+   }
+  },
+  "layers.13.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 143356096,
+    "len": 512
+   }
+  },
+  "layers.13.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 142167744,
+    "len": 512
+   }
+  },
+  "layers.14.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 149861568,
+    "len": 589824
+   }
+  },
+  "layers.14.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 148968128,
+    "len": 294912
+   }
+  },
+  "layers.14.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 150451904,
+    "len": 294912
+   }
+  },
+  "layers.14.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 149271744,
+    "len": 589824
+   }
+  },
+  "layers.14.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 152516288,
+    "len": 1769472
+   }
+  },
+  "layers.14.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 154293952,
+    "len": 1769472
+   }
+  },
+  "layers.14.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 150746816,
+    "len": 1769472
+   }
+  },
+  "layers.14.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 149263552,
+    "len": 8192
+   }
+  },
+  "layers.14.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 154285760,
+    "len": 8192
+   }
+  },
+  "layers.14.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 150451392,
+    "len": 512
+   }
+  },
+  "layers.14.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 149263040,
+    "len": 512
+   }
+  },
+  "layers.15.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 156956864,
+    "len": 589824
+   }
+  },
+  "layers.15.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 156063424,
+    "len": 294912
+   }
+  },
+  "layers.15.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 157547200,
+    "len": 294912
+   }
+  },
+  "layers.15.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 156367040,
+    "len": 589824
+   }
+  },
+  "layers.15.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 159611584,
+    "len": 1769472
+   }
+  },
+  "layers.15.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 161389248,
+    "len": 1769472
+   }
+  },
+  "layers.15.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 157842112,
+    "len": 1769472
+   }
+  },
+  "layers.15.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 156358848,
+    "len": 8192
+   }
+  },
+  "layers.15.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 161381056,
+    "len": 8192
+   }
+  },
+  "layers.15.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 157546688,
+    "len": 512
+   }
+  },
+  "layers.15.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 156358336,
+    "len": 512
+   }
+  },
+  "layers.16.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 164052160,
+    "len": 589824
+   }
+  },
+  "layers.16.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 163158720,
+    "len": 294912
+   }
+  },
+  "layers.16.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 164642496,
+    "len": 294912
+   }
+  },
+  "layers.16.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 163462336,
+    "len": 589824
+   }
+  },
+  "layers.16.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 166706880,
+    "len": 1769472
+   }
+  },
+  "layers.16.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 168484544,
+    "len": 1769472
+   }
+  },
+  "layers.16.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 164937408,
+    "len": 1769472
+   }
+  },
+  "layers.16.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 163454144,
+    "len": 8192
+   }
+  },
+  "layers.16.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 168476352,
+    "len": 8192
+   }
+  },
+  "layers.16.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 164641984,
+    "len": 512
+   }
+  },
+  "layers.16.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 163453632,
+    "len": 512
+   }
+  },
+  "layers.17.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 171147456,
+    "len": 589824
+   }
+  },
+  "layers.17.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 170254016,
+    "len": 294912
+   }
+  },
+  "layers.17.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 171737792,
+    "len": 294912
+   }
+  },
+  "layers.17.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 170557632,
+    "len": 589824
+   }
+  },
+  "layers.17.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 173802176,
+    "len": 1769472
+   }
+  },
+  "layers.17.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 175579840,
+    "len": 1769472
+   }
+  },
+  "layers.17.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 172032704,
+    "len": 1769472
+   }
+  },
+  "layers.17.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 170549440,
+    "len": 8192
+   }
+  },
+  "layers.17.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 175571648,
+    "len": 8192
+   }
+  },
+  "layers.17.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 171737280,
+    "len": 512
+   }
+  },
+  "layers.17.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 170548928,
+    "len": 512
+   }
+  },
+  "layers.18.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 178242752,
+    "len": 589824
+   }
+  },
+  "layers.18.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 177349312,
+    "len": 294912
+   }
+  },
+  "layers.18.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 178833088,
+    "len": 294912
+   }
+  },
+  "layers.18.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 177652928,
+    "len": 589824
+   }
+  },
+  "layers.18.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 180897472,
+    "len": 1769472
+   }
+  },
+  "layers.18.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 182675136,
+    "len": 1769472
+   }
+  },
+  "layers.18.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 179128000,
+    "len": 1769472
+   }
+  },
+  "layers.18.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 177644736,
+    "len": 8192
+   }
+  },
+  "layers.18.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 182666944,
+    "len": 8192
+   }
+  },
+  "layers.18.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 178832576,
+    "len": 512
+   }
+  },
+  "layers.18.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 177644224,
+    "len": 512
+   }
+  },
+  "layers.19.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 185338048,
+    "len": 589824
+   }
+  },
+  "layers.19.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 184444608,
+    "len": 294912
+   }
+  },
+  "layers.19.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 185928384,
+    "len": 294912
+   }
+  },
+  "layers.19.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 184748224,
+    "len": 589824
+   }
+  },
+  "layers.19.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 187992768,
+    "len": 1769472
+   }
+  },
+  "layers.19.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 189770432,
+    "len": 1769472
+   }
+  },
+  "layers.19.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 186223296,
+    "len": 1769472
+   }
+  },
+  "layers.19.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 184740032,
+    "len": 8192
+   }
+  },
+  "layers.19.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 189762240,
+    "len": 8192
+   }
+  },
+  "layers.19.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 185927872,
+    "len": 512
+   }
+  },
+  "layers.19.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 184739520,
+    "len": 512
+   }
+  },
+  "layers.20.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 192433344,
+    "len": 589824
+   }
+  },
+  "layers.20.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 191539904,
+    "len": 294912
+   }
+  },
+  "layers.20.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 193023680,
+    "len": 294912
+   }
+  },
+  "layers.20.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 191843520,
+    "len": 589824
+   }
+  },
+  "layers.20.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 195088064,
+    "len": 1769472
+   }
+  },
+  "layers.20.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 196865728,
+    "len": 1769472
+   }
+  },
+  "layers.20.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 193318592,
+    "len": 1769472
+   }
+  },
+  "layers.20.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 191835328,
+    "len": 8192
+   }
+  },
+  "layers.20.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 196857536,
+    "len": 8192
+   }
+  },
+  "layers.20.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 193023168,
+    "len": 512
+   }
+  },
+  "layers.20.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 191834816,
+    "len": 512
+   }
+  },
+  "layers.21.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 199528640,
+    "len": 589824
+   }
+  },
+  "layers.21.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 198635200,
+    "len": 294912
+   }
+  },
+  "layers.21.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 200118976,
+    "len": 294912
+   }
+  },
+  "layers.21.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 198938816,
+    "len": 589824
+   }
+  },
+  "layers.21.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 202183360,
+    "len": 1769472
+   }
+  },
+  "layers.21.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 203961024,
+    "len": 1769472
+   }
+  },
+  "layers.21.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 200413888,
+    "len": 1769472
+   }
+  },
+  "layers.21.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 198930624,
+    "len": 8192
+   }
+  },
+  "layers.21.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 203952832,
+    "len": 8192
+   }
+  },
+  "layers.21.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 200118464,
+    "len": 512
+   }
+  },
+  "layers.21.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 198930112,
+    "len": 512
+   }
+  },
+  "layers.22.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 206623936,
+    "len": 589824
+   }
+  },
+  "layers.22.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 205730496,
+    "len": 294912
+   }
+  },
+  "layers.22.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 207214272,
+    "len": 294912
+   }
+  },
+  "layers.22.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 206034112,
+    "len": 589824
+   }
+  },
+  "layers.22.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 209278656,
+    "len": 1769472
+   }
+  },
+  "layers.22.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 211056320,
+    "len": 1769472
+   }
+  },
+  "layers.22.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 207509184,
+    "len": 1769472
+   }
+  },
+  "layers.22.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 206025920,
+    "len": 8192
+   }
+  },
+  "layers.22.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 211048128,
+    "len": 8192
+   }
+  },
+  "layers.22.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 207213760,
+    "len": 512
+   }
+  },
+  "layers.22.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 206025408,
+    "len": 512
+   }
+  },
+  "layers.23.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 213719232,
+    "len": 589824
+   }
+  },
+  "layers.23.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 212825792,
+    "len": 294912
+   }
+  },
+  "layers.23.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 214309568,
+    "len": 294912
+   }
+  },
+  "layers.23.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 213129408,
+    "len": 589824
+   }
+  },
+  "layers.23.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 216373952,
+    "len": 1769472
+   }
+  },
+  "layers.23.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 218151616,
+    "len": 1769472
+   }
+  },
+  "layers.23.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 214604480,
+    "len": 1769472
+   }
+  },
+  "layers.23.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 213121216,
+    "len": 8192
+   }
+  },
+  "layers.23.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 218143424,
+    "len": 8192
+   }
+  },
+  "layers.23.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 214309056,
+    "len": 512
+   }
+  },
+  "layers.23.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 213120704,
+    "len": 512
+   }
+  },
+  "layers.24.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 220814528,
+    "len": 589824
+   }
+  },
+  "layers.24.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 219921088,
+    "len": 294912
+   }
+  },
+  "layers.24.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 221404864,
+    "len": 294912
+   }
+  },
+  "layers.24.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 220224704,
+    "len": 589824
+   }
+  },
+  "layers.24.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 223469248,
+    "len": 1769472
+   }
+  },
+  "layers.24.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 225246912,
+    "len": 1769472
+   }
+  },
+  "layers.24.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 221699776,
+    "len": 1769472
+   }
+  },
+  "layers.24.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 220216512,
+    "len": 8192
+   }
+  },
+  "layers.24.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 225238720,
+    "len": 8192
+   }
+  },
+  "layers.24.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 221404352,
+    "len": 512
+   }
+  },
+  "layers.24.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 220216000,
+    "len": 512
+   }
+  },
+  "layers.25.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 227909824,
+    "len": 589824
+   }
+  },
+  "layers.25.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 227016384,
+    "len": 294912
+   }
+  },
+  "layers.25.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 228500160,
+    "len": 294912
+   }
+  },
+  "layers.25.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 227320000,
+    "len": 589824
+   }
+  },
+  "layers.25.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 230564544,
+    "len": 1769472
+   }
+  },
+  "layers.25.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 232342208,
+    "len": 1769472
+   }
+  },
+  "layers.25.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 228795072,
+    "len": 1769472
+   }
+  },
+  "layers.25.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 227311808,
+    "len": 8192
+   }
+  },
+  "layers.25.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 232334016,
+    "len": 8192
+   }
+  },
+  "layers.25.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 228499648,
+    "len": 512
+   }
+  },
+  "layers.25.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 227311296,
+    "len": 512
+   }
+  },
+  "layers.26.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 235005120,
+    "len": 589824
+   }
+  },
+  "layers.26.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 234111680,
+    "len": 294912
+   }
+  },
+  "layers.26.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 235595456,
+    "len": 294912
+   }
+  },
+  "layers.26.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 234415296,
+    "len": 589824
+   }
+  },
+  "layers.26.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 237659840,
+    "len": 1769472
+   }
+  },
+  "layers.26.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 239437504,
+    "len": 1769472
+   }
+  },
+  "layers.26.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 235890368,
+    "len": 1769472
+   }
+  },
+  "layers.26.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 234407104,
+    "len": 8192
+   }
+  },
+  "layers.26.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 239429312,
+    "len": 8192
+   }
+  },
+  "layers.26.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 235594944,
+    "len": 512
+   }
+  },
+  "layers.26.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 234406592,
+    "len": 512
+   }
+  },
+  "layers.27.attn.q_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 242100416,
+    "len": 589824
+   }
+  },
+  "layers.27.attn.k_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 241206976,
+    "len": 294912
+   }
+  },
+  "layers.27.attn.v_proj": {
+   "kind": "binary",
+   "N": 1024,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     1024,
+     288
+    ],
+    "src": "data",
+    "off": 242690752,
+    "len": 294912
+   }
+  },
+  "layers.27.attn.o_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     288
+    ],
+    "src": "data",
+    "off": 241510592,
+    "len": 589824
+   }
+  },
+  "layers.27.mlp.gate_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 244755136,
+    "len": 1769472
+   }
+  },
+  "layers.27.mlp.up_proj": {
+   "kind": "binary",
+   "N": 6144,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     6144,
+     288
+    ],
+    "src": "data",
+    "off": 246532800,
+    "len": 1769472
+   }
+  },
+  "layers.27.mlp.down_proj": {
+   "kind": "binary",
+   "N": 2048,
+   "K": 6144,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     2048,
+     864
+    ],
+    "src": "data",
+    "off": 242985664,
+    "len": 1769472
+   }
+  },
+  "layers.27.input_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 241502400,
+    "len": 8192
+   }
+  },
+  "layers.27.post_attention_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 246524608,
+    "len": 8192
+   }
+  },
+  "layers.27.attn.q_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 242690240,
+    "len": 512
+   }
+  },
+  "layers.27.attn.k_norm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     128
+    ],
+    "src": "data",
+    "off": 241501888,
+    "len": 512
+   }
+  },
+  "layers.28.final_norm_layernorm": {
+   "kind": "f32",
+   "weight": {
+    "dtype": "FLOAT",
+    "shape": [
+     2048
+    ],
+    "src": "data",
+    "off": 5945120,
+    "len": 8192
+   }
+  },
+  "embed_tokens": {
+   "kind": "q4",
+   "rows": 151669,
+   "cols": 2048,
+   "block": 128,
+   "bits": 4,
+   "lut": "tgt4",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     151669,
+     288
+    ],
+    "src": "data",
+    "off": 5953312,
+    "len": 43680672
+   }
+  },
+  "lm_head": {
+   "kind": "q2",
+   "N": 151669,
+   "K": 2048,
+   "block": 128,
+   "bits": 2,
+   "lut": "tgt2",
+   "container": "q1_0",
+   "weight": {
+    "dtype": "UINT8",
+    "shape": [
+     151669,
+     288
+    ],
+    "src": "data",
+    "off": 5953312,
+    "len": 43680672
+   }
+  }
+ }
+}

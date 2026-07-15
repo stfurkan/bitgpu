@@ -2,17 +2,29 @@
 """Numpy reference forward pass from a bitgpu manifest (step 3 of 3: the oracle).
 
 Implements the full model math on CPU straight from the manifest (binary matmul,
-RMSNorm, q/k norm, RoPE via the baked cos/sin caches, GQA attention, SwiGLU,
-lm_head) and checks it against golden.py's logits. --dump writes the per-stage
-checkpoint fixtures (params.json + embed/layer0/finalnorm/logits .bin) that
-examples/verify.html reads from test-fixtures/forward/ - regenerate those when
-bringing a new model, or the verify page checks yours against Bonsai's numbers.
+RMSNorm, q/k norm, RoPE, GQA attention, SwiGLU, lm_head) and checks it against
+golden.py's logits. --dump writes the per-stage checkpoint fixtures (params.json +
+embed/layer0/finalnorm/logits .bin) that examples/verify.html reads from
+test-fixtures/forward-<tag>/ - regenerate those when bringing a new model, or the
+verify page checks yours against Bonsai's numbers.
 
-Usage: python tools/reference.py --model <dir> [--golden <dir>] [--dump test-fixtures/forward]
+Reads both manifest containers: planar ONNX-derived tensors and v2 `q1_0` GGUF
+containers (convert-gguf.py). RoPE comes from the baked cos/sin caches when present,
+otherwise it is synthesized from arch.rope with the same recipe the engine runs.
+
+GGUF-derived models have no onnxruntime oracle (golden.py needs the .onnx graph): the
+golden comparison auto-skips when the golden dir is absent, and --ids supplies the
+prompt (e.g. an existing fixture set's ids.i32.bin, so the checkpoints are directly
+comparable across containers).
+
+Usage: python tools/reference.py --model <dir> [--golden <dir>] [--ids <ids.i32.bin|.npy>]
+                                 [--dump test-fixtures/forward-<tag>]
 Requires: numpy.
 """
 import argparse
 import json
+import math
+import os
 
 import numpy as np
 
@@ -23,6 +35,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--golden", default=None)
+    ap.add_argument("--ids", default=None, help="prompt ids (.i32.bin or .npy) when there is no golden dir")
     ap.add_argument("--dump", default=None, help="write per-stage checkpoint fixtures here")
     args = ap.parse_args()
     work = args.model
@@ -59,11 +72,25 @@ def main() -> None:
         N = t.get("N") or t["rows"]
         K = t.get("K") or t["cols"]
         bits, lut = t["bits"], t["lut"]
+        nb = K // 128
+        bidx = np.arange(K) // 128
+        if t.get("container") == "q1_0":
+            # GGUF Q1_0 region: [f16 scale][16 sign bytes] per 128-weight block, interleaved.
+            # De-interleave to the planar layout, then run the exact same LUT-expansion math;
+            # the container carries no zp tensor (the recipe midpoint is a constant).
+            r = t["weight"]
+            data.seek(r["off"])
+            blocks = np.frombuffer(data.read(N * nb * 18), np.uint8).reshape(N * nb, 18)
+            wq = blocks[:, 2:].reshape(N, K // 8)
+            scales = blocks[:, :2].copy().view(np.float16).astype(np.float32).reshape(N, nb)
+            if rows is not None:
+                wq, scales = wq[rows], scales[rows]
+            codes = unpack(wq, lut, bits)
+            return (codes.astype(np.float32) - ((1 << bits) >> 1)) * scales[:, bidx]
         wq = raw(t["weight"]).reshape(N, K // 8)
         scales = raw(t["scales"]).astype(np.float32).reshape(N, K // 128)
         zpw = raw(t["zp"])
         per = 8 // bits
-        nb = K // 128
         zpw = zpw.reshape(N, nb // per)
         if rows is not None:
             wq, scales, zpw = wq[rows], scales[rows], zpw[rows]
@@ -71,7 +98,6 @@ def main() -> None:
         zp = np.empty((wq.shape[0], nb), np.float32)
         for b in range(nb):
             zp[:, b] = (zpw[:, b // per] >> (bits * (b % per))) & ((1 << bits) - 1)
-        bidx = np.arange(K) // 128
         return (codes.astype(np.float32) - zp[:, bidx]) * scales[:, bidx]
 
     def norm_w(name: str) -> np.ndarray:
@@ -85,14 +111,40 @@ def main() -> None:
 
     H, KV, D = A["heads"], A["kv_heads"], A["head_dim"]
     L = A["layers"]
-    ids = np.load(f"{golden}/input_ids.npy")
+    if args.ids:
+        ids = np.fromfile(args.ids, np.int32) if args.ids.endswith(".bin") else np.load(args.ids)
+    else:
+        ids = np.load(f"{golden}/input_ids.npy")
     S = len(ids)
 
-    # RoPE cos/sin (YaRN baked) -> full [S, D] via concat([half, half])
-    cos_c = raw(T["cos_cache"]).reshape(T["cos_cache"]["shape"])
-    sin_c = raw(T["sin_cache"]).reshape(T["sin_cache"]["shape"])
-    cos = np.concatenate([cos_c[:S], cos_c[:S]], -1).astype(np.float32)  # [S, D]
-    sin = np.concatenate([sin_c[:S], sin_c[:S]], -1).astype(np.float32)
+    # RoPE cos/sin [S, head_dim/2]: baked caches when the manifest carries them, otherwise
+    # synthesized from arch.rope (plain or YaRN) - the same recipe the engine's synthRope
+    # runs (f64 angles, one f32 rounding per entry; transformers YaRN: beta 32/1,
+    # mscale = 0.1*ln(factor)+1).
+    if "cos_cache" in T:
+        cos_c = raw(T["cos_cache"]).reshape(T["cos_cache"]["shape"])[:S]
+        sin_c = raw(T["sin_cache"]).reshape(T["sin_cache"]["shape"])[:S]
+    else:
+        rp = A["rope"]
+        base = float(rp["rope_theta"])
+        factor = float(rp.get("factor", 1.0)) if rp.get("rope_type") == "yarn" else 1.0
+        half = D // 2
+        inv = np.empty(half, np.float64)
+        if factor == 1.0:
+            inv[:] = 1.0 / base ** (np.arange(0, D, 2, dtype=np.float64) / D)
+        else:
+            orig = rp["original_max_position_embeddings"]
+            lo = max(0, math.floor(D * math.log(orig / (32 * 2 * math.pi)) / (2 * math.log(base))))
+            hi = min(half - 1, math.ceil(D * math.log(orig / (2 * math.pi)) / (2 * math.log(base))))
+            pf = base ** (np.arange(0, D, 2, dtype=np.float64) / D)
+            ramp = np.clip((np.arange(half, dtype=np.float64) - lo) / (hi - lo), 0, 1)
+            inv[:] = (1.0 / (factor * pf)) * ramp + (1.0 / pf) * (1 - ramp)
+        mscale = 1.0 if factor == 1.0 else float(np.float32(0.1 * math.log(factor) + 1))
+        ang = np.outer(np.arange(S, dtype=np.float64), inv)
+        cos_c = (np.cos(ang) * mscale).astype(np.float32)
+        sin_c = (np.sin(ang) * mscale).astype(np.float32)
+    cos = np.concatenate([cos_c, cos_c], -1).astype(np.float32)          # [S, D]
+    sin = np.concatenate([sin_c, sin_c], -1).astype(np.float32)
 
     def rope(x: np.ndarray) -> np.ndarray:  # x: [S, n_heads, D]
         half = D // 2
@@ -137,7 +189,6 @@ def main() -> None:
     ckpt["logits"] = logits
 
     if args.dump:
-        import os
         os.makedirs(args.dump, exist_ok=True)
         np.asarray(ids, np.int32).tofile(f"{args.dump}/ids.i32.bin")
         for name, arr in ckpt.items():
@@ -153,7 +204,11 @@ def main() -> None:
         json.dump(params, open(f"{args.dump}/params.json", "w"), indent=1)
         print("dumped checkpoints to", args.dump)
 
-    # compare to golden
+    # compare to golden (auto-skips for models without an onnxruntime oracle, e.g. GGUF-derived)
+    if not os.path.exists(f"{golden}/logits_all.npy"):
+        print("golden comparison SKIPPED (no", f"{golden}/logits_all.npy);",
+              "for GGUF-derived models compare the dumped checkpoints against the ONNX-derived fixture set instead")
+        return
     ref = np.load(f"{golden}/logits_all.npy").astype(np.float32)
     last = logits[-1]
     gl = ref[-1]

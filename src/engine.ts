@@ -36,7 +36,15 @@ interface MTensor {
   kind?: string
   N?: number
   K?: number
+  rows?: number
+  cols?: number
   block?: number
+  /** v2 manifests: 'q1_0' marks a tensor whose weight ref covers an interleaved GGUF
+   *  Q1_0 region ([f16 scale][16 sign bytes] per 128-weight block); the loader demuxes
+   *  it in-flight into the planar sign/scale buffers the kernels consume. */
+  container?: string
+  /** normalized at load: the raw interleaved region of a container tensor */
+  q1_0?: Ref
   weight?: Ref
   scales?: Ref
   zp?: Ref
@@ -57,8 +65,13 @@ interface Arch {
   vocab: number
   eos: number
   act: string
+  /** rope parameters for manifests without baked cos/sin caches (v2/GGUF) */
+  rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number }
+  /** position cap for synthesized rope (GGUF context_length) */
+  max_positions?: number
 }
 interface Manifest {
+  version?: number
   data_file: string
   aux_file: string
   arch: Arch
@@ -131,6 +144,41 @@ function makeParams(fields: Field[]): Uint8Array {
 const eqBytes = (a: Uint8Array, b: Uint8Array): boolean => {
   for (let i = 0; i < b.length; i++) if (a[i] !== b[i]) return false
   return true
+}
+/** Synthesize f32 rope tables ([positions, head_dim/2]) from arch.rope for manifests without
+ *  baked caches (v2/GGUF). Plain rope or YaRN (transformers formula: beta_fast 32, beta_slow 1,
+ *  mscale = 0.1*ln(factor)+1). Angles accumulate in f64 and round once to f32 per entry -
+ *  tools/reference.py implements the identical recipe for fixture generation. */
+function synthRope(A: { head_dim: number; rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number } }, positions: number): [Float32Array, Float32Array] {
+  const half = A.head_dim / 2
+  const rope = A.rope!
+  const base = rope.rope_theta
+  const factor = rope.rope_type === 'yarn' ? (rope.factor ?? 1) : 1
+  const inv = new Float64Array(half)
+  // YaRN ramp bounds (only used when factor > 1): dims below lo keep the original
+  // frequencies (extrapolation), dims above hi interpolate by 1/factor, between them blends.
+  const orig = rope.original_max_position_embeddings ?? 0
+  const lo = factor === 1 ? 0 : Math.max(0, Math.floor((A.head_dim * Math.log(orig / (32 * 2 * Math.PI))) / (2 * Math.log(base))))
+  const hi = factor === 1 ? 0 : Math.min(half - 1, Math.ceil((A.head_dim * Math.log(orig / (2 * Math.PI))) / (2 * Math.log(base))))
+  for (let j = 0; j < half; j++) {
+    const pf = base ** ((2 * j) / A.head_dim)
+    if (factor === 1) {
+      inv[j] = 1 / pf
+      continue
+    }
+    const ramp = Math.min(1, Math.max(0, (j - lo) / (hi - lo)))
+    inv[j] = (1 / (factor * pf)) * ramp + (1 / pf) * (1 - ramp)
+  }
+  const mscale = factor === 1 ? 1 : Math.fround(0.1 * Math.log(factor) + 1)
+  const cos = new Float32Array(positions * half)
+  const sin = new Float32Array(positions * half)
+  for (let p = 0; p < positions; p++)
+    for (let j = 0; j < half; j++) {
+      const a = p * inv[j]
+      cos[p * half + j] = Math.fround(Math.cos(a) * mscale)
+      sin[p * half + j] = Math.fround(Math.sin(a) * mscale)
+    }
+  return [cos, sin]
 }
 /** Load a 1-bit model and return an {@link Engine}. Pass a model URL string for defaults. */
 export async function createEngine(options: EngineOptions | string): Promise<Engine> {
@@ -208,9 +256,31 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   if (A.head_dim > 128) throw new Error(`bitgpu: unsupported head_dim ${A.head_dim} (kernels assume <= 128)`)
   if (A.heads % A.kv_heads !== 0) throw new Error(`bitgpu: heads ${A.heads} not divisible by kv_heads ${A.kv_heads} (GQA kernels assume an integer group size)`)
   if (!T[FINAL_NORM]) throw new Error(`bitgpu: manifest is missing the final norm tensor '${FINAL_NORM}'`)
-  if (!T.cos_cache || !T.sin_cache) throw new Error('bitgpu: manifest is missing the baked cos_cache/sin_cache RoPE tensors')
+  if (manifest.version !== undefined && manifest.version !== 1 && manifest.version !== 2)
+    throw new Error(`bitgpu: unsupported manifest version ${manifest.version} (this engine reads versions 1 and 2)`)
+  // Rope comes either baked (cos_cache/sin_cache refs, ONNX exports: exact parity with the
+  // exporter) or synthesized at load from arch.rope (v2/GGUF manifests, which bake no tables).
+  if (!T.cos_cache !== !T.sin_cache) throw new Error('bitgpu: manifest has only one of cos_cache/sin_cache')
+  if (!T.cos_cache && !(A.rope && A.rope.rope_theta))
+    throw new Error('bitgpu: manifest has neither baked cos_cache/sin_cache RoPE tensors nor arch.rope parameters')
   for (const [name, t] of Object.entries(T)) {
     if (t.block !== undefined && t.block !== 128) throw new Error(`bitgpu: tensor ${name} has block ${t.block} (kernels assume 128)`)
+    // v2 container tensors: keep the raw interleaved region aside (q1_0) and synthesize
+    // PLANAR weight/scales refs carrying the byte lengths the kernels consume, so all the
+    // size computations below (limits, buffer creation, fusion) stay container-blind. The
+    // streaming loader demuxes the region into both sinks in-flight (see wireQ10).
+    if (t.container === undefined) continue
+    if (t.container !== 'q1_0') throw new Error(`bitgpu: tensor ${name} has unknown container '${t.container}'`)
+    const N = t.N ?? t.rows
+    const K = t.K ?? t.cols
+    if (!N || !K || K % 128 !== 0) throw new Error(`bitgpu: tensor ${name}: q1_0 container needs N/K (or rows/cols) with K a multiple of 128`)
+    const r = t.weight
+    if (!r || r.src !== 'data' || r.len !== N * (K / 128) * 18)
+      throw new Error(`bitgpu: tensor ${name}: q1_0 region is ${r?.len} bytes in '${r?.src}', expected ${N * (K / 128) * 18} in the data file`)
+    t.q1_0 = r
+    t.weight = { dtype: 'UINT8', src: r.src, off: r.off, len: N * (K / 8) }
+    t.scales = { dtype: 'FLOAT', src: r.src, off: r.off, len: N * (K / 128) * 4 }
+    t.zp = undefined // no zp tensor in the container; the 1-bit recipe's midpoints are constants
   }
 
   const readRef = (ref: Ref): Float32Array | Uint8Array | Uint16Array => {
@@ -295,7 +365,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       track(fusedLen(g, 'scales'))
     }
   }
-  for (const r of [T.embed_tokens.weight!, T.embed_tokens.scales!, T.embed_tokens.zp!, manifest.luts.tgt4]) track(r.len)
+  // embed zp: from the manifest ref, or synthesized for container tensors (2 blocks/byte)
+  const embZpLen = T.embed_tokens.zp?.len ?? (T.embed_tokens.rows! * (T.embed_tokens.cols! / 128)) / 2
+  for (const r of [T.embed_tokens.weight!, T.embed_tokens.scales!, manifest.luts.tgt4]) track(r.len)
+  track(embZpLen)
   if (kv8 && A.head_dim % 32 !== 0)
     throw new Error(`bitgpu: kvCache 'q8' needs head_dim divisible by 32 (got ${A.head_dim}); use 'f16' or 'f32' for this model`)
   // Non-weight bindings that also count against the limit: a per-layer KV buffer at full
@@ -545,32 +618,70 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const s = gpuSink(buf, base)
     wire(ref, s.push, s.finish)
   }
+  // Per-byte weight transforms, shared by the planar (ONNX) and q1_0-container (GGUF)
+  // routes - the sign-byte stream is identical across the two containers.
+  const xfSign =
+    (push: (b: Uint8Array) => void) =>
+    (b: Uint8Array): void => {
+      const o = new Uint8Array(b.length)
+      for (let i = 0; i < b.length; i++) o[i] = signTable[b[i]]
+      push(o)
+    }
+  const xfQ2 =
+    (push: (b: Uint8Array) => void) =>
+    (b: Uint8Array): void => {
+      const o = new Uint8Array(b.length * 2)
+      for (let i = 0; i < b.length; i++) {
+        o[2 * i] = tgt2[2 * b[i]]
+        o[2 * i + 1] = tgt2[2 * b[i] + 1]
+      }
+      push(o)
+    }
   const wireSign = (ref: Ref, buf: GPUBuffer, base = 0): void => {
     const s = gpuSink(buf, base)
-    wire(
-      ref,
-      (b) => {
-        const o = new Uint8Array(b.length)
-        for (let i = 0; i < b.length; i++) o[i] = signTable[b[i]]
-        s.push(o)
-      },
-      s.finish,
-    )
+    wire(ref, xfSign(s.push), s.finish)
   }
   const wireQ2 = (ref: Ref, buf: GPUBuffer): void => {
     const s = gpuSink(buf, 0)
-    wire(
-      ref,
-      (b) => {
-        const o = new Uint8Array(b.length * 2)
-        for (let i = 0; i < b.length; i++) {
-          o[2 * i] = tgt2[2 * b[i]]
-          o[2 * i + 1] = tgt2[2 * b[i] + 1]
+    wire(ref, xfQ2(s.push), s.finish)
+  }
+  // f16 -> f32, exact (every f16 value is exactly representable in f32)
+  const f16f32 = (h: number): number => {
+    const s = h & 0x8000 ? -1 : 1
+    const e = (h >> 10) & 31
+    const m = h & 1023
+    if (e === 0) return s * m * 2 ** -24
+    if (e === 31) return m ? NaN : s * Infinity
+    return s * (1024 + m) * 2 ** (e - 25)
+  }
+  // container 'q1_0' (GGUF): ONE region streams BOTH planar outputs. Each 18-byte block is
+  // [f16 scale][16 sign bytes]; the scale converts to f32 into the scales sink, the sign
+  // bytes feed the weight sink (through the same transform the planar path uses). Block
+  // phase carries across pushed chunks, which split anywhere - including mid-scale.
+  const wireQ10 = (region: Ref, signPush: (b: Uint8Array) => void, signFinish: () => void, scalePush: (b: Uint8Array) => void, scaleFinish: () => void): void => {
+    let phase = 0 // byte position inside the current 18-byte block
+    let scaleLo = 0 // pending low byte of a scale straddling a chunk boundary
+    const push = (b: Uint8Array): void => {
+      const signs = new Uint8Array(b.length)
+      const scales = new Float32Array((b.length >> 4) + 2)
+      let sn = 0
+      let cn = 0
+      for (let i = 0; i < b.length; i++) {
+        if (phase === 0) {
+          scaleLo = b[i]
+          phase = 1
+        } else if (phase === 1) {
+          scales[cn++] = f16f32(scaleLo | (b[i] << 8))
+          phase = 2
+        } else {
+          signs[sn++] = b[i]
+          phase = phase === 17 ? 0 : phase + 1
         }
-        s.push(o)
-      },
-      s.finish,
-    )
+      }
+      if (sn) signPush(signs.subarray(0, sn))
+      if (cn) scalePush(new Uint8Array(scales.buffer, 0, cn * 4))
+    }
+    routes.push({ off: region.off, len: region.len, push, finish: () => { signFinish(); scaleFinish() } })
   }
   const wireCpu = (ref: Ref): Uint8Array => {
     const dst = new Uint8Array(ref.len)
@@ -598,9 +709,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   for (const [name, t] of Object.entries(T)) {
     if (t.kind === 'q2') {
       const codes = gbuf(t.weight!.len * 2) // 1 byte of q2 data expands to 2 code bytes
-      wireQ2(t.weight!, codes)
       const scales = gbuf(t.scales!.len)
-      wireRaw(t.scales!, scales)
+      if (t.q1_0) {
+        const cs = gpuSink(codes, 0)
+        const ss = gpuSink(scales, 0)
+        wireQ10(t.q1_0, xfQ2(cs.push), cs.finish, ss.push, ss.finish)
+      } else {
+        wireQ2(t.weight!, codes)
+        wireRaw(t.scales!, scales)
+      }
       const w: GpuWeight = { N: t.N!, K: t.K!, nb: t.K! / 128, zp: 2, codes, scales }
       // The q2 kernels take ONE zero-point for the whole tensor (a uniform, not a per-block
       // buffer read in the hottest GEMV): the q1 recipe always emits the 2-bit midpoint. Read
@@ -632,9 +749,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     let so = 0
     let co = 0
     for (const p of parts) {
-      wireSign(p.weight!, sign, so)
+      if (p.q1_0) {
+        const ws = gpuSink(sign, so)
+        const ss = gpuSink(scales, co)
+        wireQ10(p.q1_0, xfSign(ws.push), ws.finish, ss.push, ss.finish)
+      } else {
+        wireSign(p.weight!, sign, so)
+        wireRaw(p.scales!, scales, co)
+      }
       so += p.weight!.len
-      wireRaw(p.scales!, scales, co)
       co += p.scales!.len
     }
     return { sign, scales }
@@ -662,19 +785,47 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     wireRaw(ref, buf)
     return buf
   }
-  const embWqG = wireGpu(T.embed_tokens.weight!)
-  const embScalesG = wireGpu(T.embed_tokens.scales!)
-  const embZpG = wireGpu(T.embed_tokens.zp!)
+  let embWqG: GPUBuffer
+  let embScalesG: GPUBuffer
+  let embZpG: GPUBuffer
+  if (T.embed_tokens.q1_0) {
+    embWqG = gbuf(T.embed_tokens.weight!.len)
+    embScalesG = gbuf(T.embed_tokens.scales!.len)
+    const ws = gpuSink(embWqG, 0)
+    const ss = gpuSink(embScalesG, 0)
+    wireQ10(T.embed_tokens.q1_0, ws.push, ws.finish, ss.push, ss.finish)
+    // q4 zero-points: the 1-bit recipe's 4-bit codes sit at {7,9} around the midpoint 8. A
+    // q1_0 container carries no zp tensor, so synthesize the constant table the gather
+    // kernels read (two 4-bit 8s per byte, one nibble per 128-wide block).
+    embZpG = gbuf(embZpLen)
+    device.queue.writeBuffer(embZpG, 0, new Uint8Array((embZpLen + 3) & ~3).fill(0x88))
+  } else {
+    embWqG = wireGpu(T.embed_tokens.weight!)
+    embScalesG = wireGpu(T.embed_tokens.scales!)
+    embZpG = wireGpu(T.embed_tokens.zp!)
+  }
   const tgt4G = wireGpu(manifest.luts.tgt4)
-  const cosBytes = wireCpu(T.cos_cache as Ref)
-  const sinBytes = wireCpu(T.sin_cache as Ref)
-  const cosCache = new Float32Array(cosBytes.buffer)
-  const sinCache = new Float32Array(sinBytes.buffer)
-  // The caches are baked per export ([positions, head_dim/2]); positions beyond them would read
-  // undefined -> NaN into every rope buffer, silent garbage. Cap maxSeqLen at load, loudly.
-  const ropePositions = cosCache.length / (A.head_dim / 2)
-  if (maxSeqLen > ropePositions)
-    throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's baked RoPE cache (${ropePositions} positions); lower maxSeqLen or re-export with a longer cache`)
+  let cosCache: Float32Array
+  let sinCache: Float32Array
+  if (T.cos_cache) {
+    const cosBytes = wireCpu(T.cos_cache as Ref)
+    const sinBytes = wireCpu(T.sin_cache as Ref)
+    cosCache = new Float32Array(cosBytes.buffer)
+    sinCache = new Float32Array(sinBytes.buffer)
+    // The caches are baked per export ([positions, head_dim/2]); positions beyond them would read
+    // undefined -> NaN into every rope buffer, silent garbage. Cap maxSeqLen at load, loudly.
+    const ropePositions = cosCache.length / (A.head_dim / 2)
+    if (maxSeqLen > ropePositions)
+      throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's baked RoPE cache (${ropePositions} positions); lower maxSeqLen or re-export with a longer cache`)
+  } else {
+    // v2/GGUF manifests bake no rope tables: synthesize f32 cos/sin for exactly maxSeqLen
+    // positions from arch.rope (plain or YaRN) - the same recipe tools/reference.py runs
+    // when it generates fixtures, so the reference forward uses the tables the engine uses.
+    const cap = A.max_positions ?? 40960
+    if (maxSeqLen > cap)
+      throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's max_positions (${cap})`)
+    ;[cosCache, sinCache] = synthRope(A, maxSeqLen)
+  }
 
   // ONE sequential pass of the data file through the routes. Tied tensors (e.g. lm_head sharing
   // the embedding bytes) produce EXACT-duplicate ranges: those fan out to every consumer; partial

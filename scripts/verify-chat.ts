@@ -9,7 +9,7 @@
 //      reuse-delta token exactness, eos re-insertion, cache bookkeeping, reset() race,
 //      finishReason, stream()==send().
 //  (C) Parity vs @huggingface/transformers (AutoTokenizer.apply_chat_template + encode) using a
-//      REAL staged model's tokenizer files (examples/model) - auto-skips when not staged, runs
+//      REAL staged model's tokenizer files (examples/model-<tag>) - auto-skips when not staged, runs
 //      as part of the local release ritual alongside the GPU gate.
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -726,7 +726,7 @@ console.log('(D) JSON constrained decoding')
 
 // ── (C) parity vs transformers.js on a real model (auto-skips when not staged) ───────────────
 console.log('(C) parity vs @huggingface/transformers (real model tokenizer)')
-const staged = ['model', 'model-4b', 'model-8b'].find((d) => existsSync(join(root, 'examples', d, 'tokenizer.json')))
+const staged = ['model-1.7b', 'model-4b', 'model-8b'].find((d) => existsSync(join(root, 'examples', d, 'tokenizer.json')))
 if (!staged) {
   console.log('  [skip] no staged model has tokenizer.json; run locally with a staged model for the parity tier')
 } else {

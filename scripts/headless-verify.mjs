@@ -4,9 +4,9 @@
 //
 //   node scripts/headless-verify.mjs [url]
 //
-// With no url argument, runs the gate once per locally staged model: examples/model
-// (the reference Bonsai-1.7B) plus every examples/model-<tag> that has a matching
-// test-fixtures/forward-<tag>, PLUS one no-subgroup fallback run (?nosg=1) on the baseline
+// With no url argument, runs the gate once per locally staged model: every
+// examples/model-<tag> that has a matching test-fixtures/forward-<tag> (the reference
+// Bonsai-1.7B is tag "1.7b"), PLUS one no-subgroup fallback run (?nosg=1) on the baseline
 // model, so the workgroup-reduction path (Firefox and older adapters) is release-gated too.
 // The fallback kernels are geometry-independent (the subgroup runs already prove each
 // geometry), so one fallback geometry is the routine default; set NOSG=all to run EVERY
@@ -67,10 +67,6 @@ if (process.argv[2]) {
   const BASE = `http://127.0.0.1:${started.port}/examples/verify.html`
   const nosgAll = process.env.NOSG === 'all'
   urls = []
-  if (existsSync(join(root, 'examples/model/manifest.json'))) {
-    urls.push(BASE)
-    urls.push(`${BASE}?nosg=1`) // release-gate the no-subgroup fallback path on the baseline model
-  } else console.log('[skip] examples/model not staged: the baseline 1.7B gate (and the nosg fallback run) WILL NOT RUN')
   for (const d of readdirSync(join(root, 'examples'), { withFileTypes: true })) {
     const m = d.name.match(/^model-(.+)$/)
     if (!m) continue
@@ -80,15 +76,18 @@ if (process.argv[2]) {
       continue
     }
     urls.push(`${BASE}?model=${encodeURIComponent(m[1])}`)
-    if (nosgAll) urls.push(`${BASE}?model=${encodeURIComponent(m[1])}&nosg=1`)
+    // release-gate the no-subgroup fallback path on the baseline model (all models with NOSG=all)
+    if (m[1] === '1.7b' || nosgAll) urls.push(`${BASE}?model=${encodeURIComponent(m[1])}&nosg=1`)
   }
+  if (!existsSync(join(root, 'examples/model-1.7b/manifest.json')))
+    console.log('[skip] examples/model-1.7b not staged: the baseline 1.7B gate (and the nosg fallback run) WILL NOT RUN')
   if (urls.length === 0) {
-    console.error('no staged models found (examples/model or examples/model-<tag>)')
+    console.error('no staged models found (examples/model-<tag>)')
     process.exit(2)
   }
   if (process.env.FAST === '1') {
     // Development iteration: ONE run - the baseline model, subgroup path, core sections only
-    // (?fast=1 skips the KV-mode/snapshot/sinks/drafter sections). Not a release gate.
+    // (?fast=1 skips the KV-mode/snapshot/sinks sections). Not a release gate.
     urls = [`${BASE}?fast=1`]
   }
   if (process.env.PLAN === '1') {
