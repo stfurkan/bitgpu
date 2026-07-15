@@ -28,6 +28,11 @@ python tools/reference.py --model <dir> --dump test-fixtures/forward-<tag>
 
 ## From a 1-bit GGUF (PrismML Q1_0)
 
+For plain consumption the offline step is optional: `bitgpu/gguf`'s `fromGguf(url)` performs
+this exact conversion in the browser from the GGUF header alone (`npm run test:gguf` gates
+the two paths deep-equal). Run the converter when you want committed/CDN-hosted manifest
+files, or fixtures for the GPU gate:
+
 One file in, two small files out - the GGUF itself stays the data file, streamed
 byte-for-byte from wherever it is hosted:
 

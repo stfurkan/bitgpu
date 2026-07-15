@@ -37,6 +37,10 @@
     "./chat": {
       "types": "./dist/chat.d.ts",
       "default": "./dist/chat.js"
+    },
+    "./gguf": {
+      "types": "./dist/gguf.d.ts",
+      "default": "./dist/gguf.js"
     }
   },
   "scripts": {
@@ -50,7 +54,8 @@
     "verify:headless": "node scripts/headless-verify.mjs",
     "check:publish": "publint --strict && attw --pack . --profile esm-only",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build && npm run check:publish"
+    "prepublishOnly": "npm run build && npm run check:publish",
+    "test:gguf": "tsx scripts/verify-gguf.ts"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.4",

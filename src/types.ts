@@ -1,5 +1,68 @@
 // Public types for bitgpu.
 
+/** A byte range inside the data or aux file. */
+export interface ManifestRef {
+  src?: string
+  dtype: string
+  shape?: number[]
+  off: number
+  len: number
+}
+/** One tensor entry in a manifest. */
+export interface ManifestTensor {
+  kind?: string
+  N?: number
+  K?: number
+  rows?: number
+  cols?: number
+  block?: number
+  bits?: number
+  lut?: string
+  /** v2 manifests: 'q1_0' marks a tensor whose weight ref covers an interleaved GGUF
+   *  Q1_0 region ([f16 scale][16 sign bytes] per 128-weight block); the loader demuxes
+   *  it in-flight into the planar sign/scale buffers the kernels consume. */
+  container?: string
+  /** normalized at load: the raw interleaved region of a container tensor */
+  q1_0?: ManifestRef
+  weight?: ManifestRef
+  scales?: ManifestRef
+  zp?: ManifestRef
+  // cos_cache / sin_cache are stored as bare refs:
+  src?: string
+  dtype?: string
+  off?: number
+  len?: number
+}
+/** The architecture contract of a manifest. */
+export interface ManifestArch {
+  model_type?: string
+  layers: number
+  hidden: number
+  intermediate: number
+  heads: number
+  kv_heads: number
+  head_dim: number
+  rms_eps: number
+  vocab: number
+  eos: number
+  act: string
+  tie_word_embeddings?: boolean
+  /** rope parameters for manifests without baked cos/sin caches (v2/GGUF) */
+  rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number }
+  /** position cap for synthesized rope (GGUF context_length) */
+  max_positions?: number
+}
+/** The small model-description file bitgpu loads (see docs/FORMAT.md). Usually fetched as
+ *  `manifest.json`; `bitgpu/gguf` builds one in memory straight from a GGUF header. */
+export interface Manifest {
+  version?: number
+  data_file: string
+  aux_file: string
+  arch: ManifestArch
+  luts: Record<string, ManifestRef>
+  tensors: Record<string, ManifestTensor>
+}
+
 /** Progress event emitted while a model loads. */
 export interface LoadProgress {
   phase: 'manifest' | 'weights' | 'pipelines'
@@ -22,6 +85,12 @@ export interface EngineOptions {
   dataUrl?: string
   /** Explicit URL for the aux file (overrides `${modelUrl}/<aux_file>`). */
   auxUrl?: string
+  /** An in-memory manifest (skips the manifest fetch). `bitgpu/gguf`'s `fromGguf` returns one
+   *  parsed straight from a GGUF header. Requires `dataUrl` (or `modelUrl`) for the weights. */
+  manifest?: Manifest
+  /** In-memory aux bytes (skips the aux fetch). `fromGguf` computes them (the LUTs are derived,
+   *  not stored, for GGUF models). */
+  aux?: ArrayBuffer | Uint8Array
   /** Fetch JSON (manifest). Override to add caching. Default: `fetch(url).json()`. */
   fetchJson?: (url: string) => Promise<unknown>
   /** Fetch binary (data/aux). Override to add caching (e.g. OPFS) for the ~290MB data file. Default: `fetch(url).arrayBuffer()`. */

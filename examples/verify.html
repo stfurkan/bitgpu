@@ -739,6 +739,28 @@
         } else log('  f16+sinks SKIPPED (no shader-f16)');
       }
 
+      // bitgpu/gguf: the in-browser header parse must (a) reproduce the committed converter
+      // manifest exactly and (b) actually RUN - an engine created from the parsed in-memory
+      // manifest must decode the known-good ids bit-exactly. GGUF-container models only.
+      if (!FAST && MODEL_TAG.endsWith('-gguf')) {
+        log('\nbitgpu/gguf in-browser parse checks...');
+        const { fromGguf } = await import('../dist/gguf.js');
+        const served = await (await fetch(`${MODEL_DIR}/manifest.json`)).json();
+        const dataUrl = new URL(`${MODEL_DIR}/${served.data_file}`, location.href).href;
+        const parsed = await fromGguf(dataUrl);
+        const canon = (v) => JSON.stringify(v, (_, x) => (x && typeof x === 'object' && !Array.isArray(x)) ? Object.fromEntries(Object.keys(x).sort().map(k => [k, x[k]])) : x);
+        const mEq = canon({ ...parsed.manifest, data_file: served.data_file }) === canon(served);
+        ok = ok && mEq;
+        log(`  ${mEq ? '[PASS]' : '[FAIL]'} fromGguf(header) deep-equals the converter manifest (${Object.keys(parsed.manifest.tensors).length} tensors)`);
+        const nosgG = new URLSearchParams(location.search).get('nosg') === '1';
+        const eG = await createEngine({ ...parsed, forceNoSubgroups: nosgG });
+        const gG = await eG.generate(ids, { maxTokens: 32 });
+        const gEq = gG.tokens.length === KNOWN_GOOD.length && gG.tokens.every((t, i) => t === KNOWN_GOOD[i]);
+        ok = ok && gEq;
+        log(`  ${gEq ? '[PASS]' : '[FAIL]'} engine from the in-memory manifest: 32 greedy ids == known-good (bit-exact)`);
+        eG.dispose();
+      }
+
       if (FAST) log('\nFAST mode: f16/q8/snapshot/sinks sections SKIPPED (run the full gate before any release)');
 
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);

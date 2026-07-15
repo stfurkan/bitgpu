@@ -10,5 +10,9 @@ export type {
   ForwardResult,
   KvSnapshot,
   LoadProgress,
+  Manifest,
+  ManifestArch,
+  ManifestRef,
+  ManifestTensor,
   TokenLogprobs,
 } from './types'

@@ -21,63 +21,15 @@ import type {
   GenerateOptions,
   GenerateResult,
   KvSnapshot,
+  Manifest,
+  ManifestRef as Ref,
+  ManifestTensor,
   TokenLogprobs,
 } from './types'
 
 type Field = ['f' | 'u', number]
-
-interface Ref {
-  src?: string
-  dtype: string
-  off: number
-  len: number
-}
-interface MTensor {
-  kind?: string
-  N?: number
-  K?: number
-  rows?: number
-  cols?: number
-  block?: number
-  /** v2 manifests: 'q1_0' marks a tensor whose weight ref covers an interleaved GGUF
-   *  Q1_0 region ([f16 scale][16 sign bytes] per 128-weight block); the loader demuxes
-   *  it in-flight into the planar sign/scale buffers the kernels consume. */
-  container?: string
-  /** normalized at load: the raw interleaved region of a container tensor */
-  q1_0?: Ref
-  weight?: Ref
-  scales?: Ref
-  zp?: Ref
-  // cos_cache / sin_cache are stored as bare refs:
-  src?: string
-  dtype?: string
-  off?: number
-  len?: number
-}
-interface Arch {
-  layers: number
-  hidden: number
-  intermediate: number
-  heads: number
-  kv_heads: number
-  head_dim: number
-  rms_eps: number
-  vocab: number
-  eos: number
-  act: string
-  /** rope parameters for manifests without baked cos/sin caches (v2/GGUF) */
-  rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number }
-  /** position cap for synthesized rope (GGUF context_length) */
-  max_positions?: number
-}
-interface Manifest {
-  version?: number
-  data_file: string
-  aux_file: string
-  arch: Arch
-  luts: Record<string, Ref>
-  tensors: Record<string, MTensor>
-}
+// Manifest / ManifestTensor / ManifestArch / ManifestRef are public types now (src/types.ts):
+// bitgpu/gguf builds manifests in memory, so callers can hold and pass them.
 
 interface GpuWeight {
   buf?: GPUBuffer
@@ -197,7 +149,10 @@ export async function createEngine(options: EngineOptions | string): Promise<Eng
 async function createEngineInner(options: EngineOptions | string, holder: { device?: GPUDevice }): Promise<Engine> {
   const opts: EngineOptions = typeof options === 'string' ? { modelUrl: options } : options
   const modelDir = opts.modelUrl ? opts.modelUrl.replace(/\/$/, '') : null
-  if (!modelDir && !opts.manifestUrl) throw new Error('createEngine: provide modelUrl or manifestUrl')
+  if (!modelDir && !opts.manifestUrl && !opts.manifest)
+    throw new Error('createEngine: provide modelUrl, manifestUrl, or an in-memory manifest')
+  if (opts.manifest && !modelDir && !opts.dataUrl)
+    throw new Error('createEngine: an in-memory manifest needs dataUrl (or modelUrl) for the weights file')
   const powerPreference = opts.powerPreference ?? 'high-performance'
   const fetchJson =
     opts.fetchJson ??
@@ -240,13 +195,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
 
   opts.onProgress?.({ phase: 'manifest' })
-  const manifest = (await fetchJson(opts.manifestUrl ?? `${modelDir}/manifest.json`)) as Manifest
+  const manifest = opts.manifest ?? ((await fetchJson(opts.manifestUrl ?? `${modelDir}/manifest.json`)) as Manifest)
   opts.onProgress?.({ phase: 'weights' })
   const dataUrl = opts.dataUrl ?? `${modelDir}/${manifest.data_file}`
-  const auxUrl = opts.auxUrl ?? `${modelDir}/${manifest.aux_file}`
   // Only the SMALL aux file (LUTs, ~160KB) is buffered; the ~290MB data file STREAMS through
   // per-tensor routes straight into GPU buffers further down (see the streaming weight loader).
-  let aux = await fetchBytes(auxUrl)
+  let aux: ArrayBuffer
+  if (opts.aux) {
+    // In-memory aux (bitgpu/gguf computes the LUTs instead of fetching them). Normalize a view
+    // to a tight ArrayBuffer so the offset math below stays identical to the fetched path.
+    aux = opts.aux instanceof Uint8Array ? new Uint8Array(opts.aux).buffer : opts.aux
+  } else {
+    aux = await fetchBytes(opts.auxUrl ?? `${modelDir}/${manifest.aux_file}`)
+  }
   const A = manifest.arch
   const T = manifest.tensors
   // Fail loud on manifests the kernels cannot run, instead of producing silent garbage: the WGSL
@@ -743,7 +704,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
   // fuse per-layer matmul weights: qkv (3), gate/up (2); o_proj + down_proj stay individual
   // (residual-folded). Fusion needs no CPU concat: each part streams into its fused-buffer slice.
-  const fuse = (parts: MTensor[]): { sign: GPUBuffer; scales: GPUBuffer } => {
+  const fuse = (parts: ManifestTensor[]): { sign: GPUBuffer; scales: GPUBuffer } => {
     const sign = gbuf(parts.reduce((n, p) => n + p.weight!.len, 0))
     const scales = gbuf(parts.reduce((n, p) => n + p.scales!.len, 0))
     let so = 0

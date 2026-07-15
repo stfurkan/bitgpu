@@ -13,7 +13,13 @@ unchanged, so it can stay wherever it is already hosted, e.g. the Hugging Face H
 
 `createEngine` takes either a `modelUrl` (a directory holding all three) or explicit
 `manifestUrl` / `auxUrl` / `dataUrl`, which lets the two small files live on your origin while
-the big one streams from the model's original hosting.
+the big one streams from the model's original hosting. It also accepts an in-memory
+`manifest` + `aux` directly - which is what `bitgpu/gguf` produces: `fromGguf(url)` runs the
+convert-gguf.py header walk in the browser (ranged fetch of the header only, LUTs derived
+rather than stored), so for GGUF models the two small files are optional entirely. The
+parity contract is gated: `npm run test:gguf` requires the in-browser parse to deep-equal
+the converter's committed output, and the GPU gate boots an engine from the parsed manifest
+and requires bit-exact known-good ids.
 
 ## manifest.json
 

@@ -318,9 +318,32 @@ GPU gate proves the reuse paths bit-exact on real hardware. Prefer your own toke
 
 ## Bring your own model
 
-bitgpu loads its own small format instead of parsing ONNX or GGUF at runtime: a
+### Any 1-bit GGUF, zero steps: `bitgpu/gguf`
+
+For GGUF models there is no conversion step at all - `fromGguf` fetches ONLY the header
+(HTTP ranges, a few MB, never the weights), builds the manifest in memory, and derives the
+lookup tables, so one URL is the whole setup:
+
+```ts
+import { createEngine } from 'bitgpu'
+import { fromGguf } from 'bitgpu/gguf'
+
+const engine = await createEngine({
+  ...(await fromGguf('https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf')),
+  kvCache: 'q8',
+})
+```
+
+The in-browser parse is gated: it must deep-equal the offline converter's manifest AND an
+engine built from it must reproduce the known-good greedy ids bit-exactly on GPU. Prefer the
+committed [`models/`](models/) manifests when one exists (a `manifest.json` is smaller than a
+GGUF header and caches better); `fromGguf` is for models nobody has converted yet.
+
+### Offline converters
+
+bitgpu loads its own small format instead of parsing ONNX (or re-parsing GGUF) at runtime: a
 `manifest.json` (the architecture contract + every tensor mapped to a byte range) and a small
-aux file, both produced ONCE, offline, from a standard export - while the big weights file is
+aux file, both produced ONCE from a standard export - while the big weights file is
 used byte-for-byte unchanged, so it can keep streaming from wherever it already lives (e.g.
 the Hugging Face Hub). Same one-time-conversion model as llama.cpp or MLX. Two converters:
 

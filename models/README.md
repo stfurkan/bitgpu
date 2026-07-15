@@ -54,6 +54,11 @@ files - your repo becomes their source control). Two variants:
   works, since the manifest names its data/aux files and the engine resolves them relative to
   the directory: `createEngine({ modelUrl: '/models/bonsai-1.7b' })`.
 
+For GGUF models these files are a convenience, not a requirement: `bitgpu/gguf`'s
+`fromGguf(ggufUrl)` builds the same manifest in the browser from the GGUF header alone
+(gated deep-equal to these committed ones). The committed manifests remain the recommended
+path when they exist - smaller transfer, better caching.
+
 These files are intentionally **not** shipped in the npm package: bitgpu stays a lean,
 model-neutral engine - hotlink the pinned CDN URLs above, or copy the files and own them.
 They are static and versioned with the engine; regenerating them from the exports reproduces
