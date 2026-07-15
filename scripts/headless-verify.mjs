@@ -4,14 +4,16 @@
 //
 //   node scripts/headless-verify.mjs [url]
 //
-// With no url argument, runs the gate once per locally staged model: every
-// examples/model-<tag> that has a matching test-fixtures/forward-<tag> (the reference
-// Bonsai-1.7B is tag "1.7b"), PLUS one no-subgroup fallback run (?nosg=1) on the baseline
-// model, so the workgroup-reduction path (Firefox and older adapters) is release-gated too.
-// The fallback kernels are geometry-independent (the subgroup runs already prove each
-// geometry), so one fallback geometry is the routine default; set NOSG=all to run EVERY
-// staged model on the fallback too - use that before releases that touch the _wg kernels or
-// dispatch/geometry code (roughly doubles the gate time). Exits non-zero unless every run
+// With no url argument, runs the gate once per locally staged model that the default plan
+// covers: every GGUF-container model (examples/model-<tag>-gguf) with a matching
+// test-fixtures/forward-<tag>, plus the baseline ONNX model ("1.7b") as a container canary,
+// plus one no-subgroup fallback run (?nosg=1) on the baseline, so the workgroup-reduction
+// path (Firefox and older adapters) is release-gated too. GGUF is the primary ingestion
+// path; the ONNX loader is frozen code whose geometries were all proven at 0.11.0, so one
+// ONNX canary catches regressions in the shared machinery. Set FULL=1 to run EVERY staged
+// model in both containers (use before releases that touch the loader/container code), and
+// NOSG=all to add the fallback run to every planned model too (use before releases that
+// touch the _wg kernels or dispatch/geometry code). Exits non-zero unless every run
 // prints PACKAGE OK. PLAN=1 prints the planned runs and exits (driver self-check).
 //
 // With a url argument, that single URL is run against whatever server it points at
@@ -66,6 +68,7 @@ if (process.argv[2]) {
   server = started.server
   const BASE = `http://127.0.0.1:${started.port}/examples/verify.html`
   const nosgAll = process.env.NOSG === 'all'
+  const full = process.env.FULL === '1'
   urls = []
   for (const d of readdirSync(join(root, 'examples'), { withFileTypes: true })) {
     const m = d.name.match(/^model-(.+)$/)
@@ -73,6 +76,11 @@ if (process.argv[2]) {
     if (!existsSync(join(root, 'examples', d.name, 'manifest.json'))) continue
     if (!existsSync(join(root, `test-fixtures/forward-${m[1]}/params.json`))) {
       console.log(`[skip] examples/${d.name}: no test-fixtures/forward-${m[1]}`)
+      continue
+    }
+    // default plan: every GGUF model + the baseline ONNX canary; FULL=1 runs everything
+    if (!full && !m[1].endsWith('-gguf') && m[1] !== '1.7b') {
+      console.log(`[skip] examples/${d.name}: ONNX non-baseline (default plan runs GGUF + the 1.7b canary; FULL=1 to include)`)
       continue
     }
     urls.push(`${BASE}?model=${encodeURIComponent(m[1])}`)

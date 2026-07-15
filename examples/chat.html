@@ -84,9 +84,12 @@
   <div class="wrap">
     <div class="controls">
       <select id="model">
-        <option value="bonsai-1.7b">Bonsai 1.7B · ~290 MB</option>
-        <option value="bonsai-4b">Bonsai 4B · ~660 MB</option>
-        <option value="bonsai-8b">Bonsai 8B · ~1.3 GB</option>
+        <option value="bonsai-1.7b-gguf">Bonsai 1.7B · ~240 MB</option>
+        <option value="bonsai-4b-gguf">Bonsai 4B · ~570 MB</option>
+        <option value="bonsai-8b-gguf">Bonsai 8B · ~1.2 GB</option>
+        <option value="bonsai-1.7b">Bonsai 1.7B · ONNX · ~290 MB</option>
+        <option value="bonsai-4b">Bonsai 4B · ONNX · ~660 MB</option>
+        <option value="bonsai-8b">Bonsai 8B · ONNX · ~1.3 GB</option>
       </select>
       <button id="load" class="primary">Load model</button>
       <label class="chk"><input type="checkbox" id="jsonMode" /> JSON mode</label>
@@ -144,10 +147,17 @@
     const BITGPU = 'https://esm.sh/bitgpu@0.11.0';
     const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@main/models';
     const HF = (r) => `https://huggingface.co/onnx-community/${r}/resolve/main`;
+    const PRISM = (r) => `https://huggingface.co/prism-ml/${r}/resolve/main`;
+    // GGUF first: same weights as the ONNX exports (sign-bit streams are bit-identical),
+    // a little smaller on the wire. Tokenizers come from the ONNX repos either way (the
+    // GGUF repos don't host tokenizer.json).
     const MODELS = {
-      'bonsai-1.7b': { hf: HF('Bonsai-1.7B-ONNX'), aux: 'bonsai.aux.bin' },
-      'bonsai-4b': { hf: HF('Bonsai-4B-ONNX'), aux: 'model_q1.aux.bin' },
-      'bonsai-8b': { hf: HF('Bonsai-8B-ONNX'), aux: 'model_q1.aux.bin' },
+      'bonsai-1.7b-gguf': { data: `${PRISM('Bonsai-1.7B-gguf')}/Bonsai-1.7B-Q1_0.gguf`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'Bonsai-1.7B-Q1_0.aux.bin' },
+      'bonsai-4b-gguf': { data: `${PRISM('Bonsai-4B-gguf')}/Bonsai-4B-Q1_0.gguf`, tok: HF('Bonsai-4B-ONNX'), aux: 'Bonsai-4B-Q1_0.aux.bin' },
+      'bonsai-8b-gguf': { data: `${PRISM('Bonsai-8B-gguf')}/Bonsai-8B-Q1_0.gguf`, tok: HF('Bonsai-8B-ONNX'), aux: 'Bonsai-8B-Q1_0.aux.bin' },
+      'bonsai-1.7b': { data: `${HF('Bonsai-1.7B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'bonsai.aux.bin' },
+      'bonsai-4b': { data: `${HF('Bonsai-4B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-4B-ONNX'), aux: 'model_q1.aux.bin' },
+      'bonsai-8b': { data: `${HF('Bonsai-8B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-8B-ONNX'), aux: 'model_q1.aux.bin' },
     };
     const $ = (id) => document.getElementById(id);
     const status = (html) => { $('status').innerHTML = html; };
@@ -223,7 +233,7 @@
       const c = await caches.open(CACHE);
       for (const opt of $('model').options) {
         const m = MODELS[opt.value];
-        const hit = await c.match(`${m.hf}/onnx/model_q1.onnx_data`);
+        const hit = await c.match(m.data);
         const base = opt.textContent.replace(/ · downloaded$/, '');
         opt.textContent = hit ? `${base} · downloaded` : base;
       }
@@ -242,7 +252,7 @@
           engine = await createEngine({
             manifestUrl: `${REPO}/${key}/manifest.json`,
             auxUrl: `${REPO}/${key}/${m.aux}`,
-            dataUrl: `${m.hf}/onnx/model_q1.onnx_data`,
+            dataUrl: m.data,
             // q8 KV: quarter-of-f32 cache memory on ANY adapter (no shader-f16 needed), which
             // pays for the 4096-token window and keeps session snapshots small.
             kvCache: 'q8',
@@ -259,8 +269,8 @@
           throw e;
         }
         chat = await createChat(engine, {
-          tokenizerJsonUrl: `${m.hf}/tokenizer.json`,
-          tokenizerConfigUrl: `${m.hf}/tokenizer_config.json`,
+          tokenizerJsonUrl: `${m.tok}/tokenizer.json`,
+          tokenizerConfigUrl: `${m.tok}/tokenizer_config.json`,
           fetchJson,
         });
         $('prog').hidden = true;

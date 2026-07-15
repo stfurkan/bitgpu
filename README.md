@@ -34,16 +34,16 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.11.0/models/bonsai-1.7b'
-const HF = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.11.0/models/bonsai-1.7b-gguf'
+const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
-  auxUrl: `${REPO}/bonsai.aux.bin`,
-  dataUrl: `${HF}/onnx/model_q1.onnx_data`,
+  auxUrl: `${REPO}/Bonsai-1.7B-Q1_0.aux.bin`,
+  dataUrl: 'https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf',
 })
 const chat = await createChat(engine, {
-  tokenizerJsonUrl: `${HF}/tokenizer.json`,
-  tokenizerConfigUrl: `${HF}/tokenizer_config.json`,
+  tokenizerJsonUrl: `${TOK}/tokenizer.json`, // tokenizer from the ONNX repo (same base model)
+  tokenizerConfigUrl: `${TOK}/tokenizer_config.json`,
 })
 await chat.send([{ role: 'user', content: 'Hi!' }], { onText: (t) => process.stdout.write(t) })
 ```
@@ -325,8 +325,8 @@ used byte-for-byte unchanged, so it can keep streaming from wherever it already 
 the Hugging Face Hub). Same one-time-conversion model as llama.cpp or MLX. Two converters:
 
 ```sh
-python tools/convert-onnx.py --model <dir with config.json + the q1 .onnx + its data file>
 python tools/convert-gguf.py --gguf <a 1-bit Q1_0 .gguf>   # the .gguf itself stays the data file
+python tools/convert-onnx.py --model <dir with config.json + the q1 .onnx + its data file>
 ```
 
 Host the two small files anywhere (they're static), point `createEngine` at them, done:
@@ -335,21 +335,22 @@ Host the two small files anywhere (they're static), point `createEngine` at them
 createEngine({
   manifestUrl: 'https://your-site.example/model/manifest.json',
   auxUrl: 'https://your-site.example/model/model_q1.aux.bin',
-  dataUrl: 'https://huggingface.co/<repo>/resolve/main/onnx/model_q1.onnx_data', // or .../<model>.gguf
+  dataUrl: 'https://huggingface.co/<repo>/resolve/main/<model>.gguf', // or .../onnx/model_q1.onnx_data
 })
 ```
 
 Compatibility envelope: Qwen3-family models quantized with the 1-bit recipe (silu/SwiGLU,
-head_dim <= 128, 128-wide scale blocks, tied or untied lm_head), in either container: ONNX
-exports with the onnx-community "q1" recipe, or GGUFs with PrismML's Q1_0 tensor type - the
-engine validates the manifest loudly at load. The two containers carry bit-identical weights
-for the Bonsai releases (verified sign-bit-for-sign-bit on 8B), so pick by hosting preference.
-Reference exports: [onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX) /
-[4B](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) /
-[8B](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` + data file), and
-[prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) /
+head_dim <= 128, 128-wide scale blocks, tied or untied lm_head), in either container: GGUFs
+with PrismML's Q1_0 tensor type (the primary path), or ONNX exports with the onnx-community
+"q1" recipe - the engine validates the manifest loudly at load. The two containers carry
+bit-identical weights for the Bonsai releases (verified sign-bit-for-sign-bit on 8B), so pick
+by hosting preference.
+Reference exports: [prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) /
 [4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) /
-[8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) (`Bonsai-*-Q1_0.gguf`). Format spec:
+[8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) (`Bonsai-*-Q1_0.gguf`), and
+[onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX) /
+[4B](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) /
+[8B](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` + data file). Format spec:
 [docs/FORMAT.md](docs/FORMAT.md); the full pipeline including regenerating the verification
 fixtures for a new model: [tools/README.md](tools/README.md).
 
