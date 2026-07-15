@@ -27,7 +27,7 @@ Use them from any static host or a CDN over this repo (pin a tag for immutable c
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.11.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.12.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 
 const engine = await createEngine({
