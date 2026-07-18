@@ -1,6 +1,6 @@
 {
   "name": "bitgpu",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "Fast WebGPU runtime for 1-bit (binary-weight) LLMs in the browser. Bit-exact, zero runtime dependencies.",
   "type": "module",
   "license": "MIT",

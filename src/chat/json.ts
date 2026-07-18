@@ -14,8 +14,12 @@
 // model can produce: value types, object required keys + additionalProperties: false (key names
 // become a prefix-constrained choice set), array minItems/maxItems (closing early or adding past
 // the cap is filtered out), string enums (byte-prefix matching against the literals), integer
-// (no fraction/exponent), nested to any depth. validateJsonSchema THROWS on anything outside the
-// subset - silent partial enforcement would be false confidence.
+// (no fraction/exponent), nested to any depth. validateJsonSchema THROWS on any CONSTRAINING
+// keyword outside the subset - silent partial enforcement would be false confidence. Purely
+// ANNOTATION keywords (description, title, default, examples, $schema, ...) carry no constraint,
+// so they are accepted and ignored: real MCP / OpenAI tool schemas pass through unmodified, and a
+// property's `description` reaches the model through the chat template even though the byte machine
+// never looks at it.
 
 /** The enforceable JSON Schema subset (see validateJsonSchema). */
 export interface JsonSchema {
@@ -40,9 +44,31 @@ export interface JsonSchema {
    *  combinable with enum (the literals already fix the length). */
   minLength?: number
   maxLength?: number
+  // ── annotation / metadata keywords: carried, never enforced (see ANNOTATIONS) ──
+  /** Human-readable docs. Ignored by the enforcer, but the chat template renders the tools list
+   *  (parameters included) into the model's prompt, so a property `description` DOES reach the
+   *  model - the reason MCP/OpenAI tool schemas pass through unmodified. */
+  description?: string
+  title?: string
+  default?: unknown
+  examples?: unknown[]
+  deprecated?: boolean
+  readOnly?: boolean
+  writeOnly?: boolean
+  $comment?: string
+  $schema?: string
+  $id?: string
 }
 
 const SUPPORTED = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems', 'enum', 'oneOf', 'minimum', 'maximum', 'minLength', 'maxLength'])
+// Annotation / metadata keywords carry NO constraint, so accepting-and-ignoring them is lossless -
+// not "silent partial enforcement" (that risk is only for keywords that LOOK enforced but aren't).
+// This lets real MCP / OpenAI tool schemas - which put `description` on nearly every property, and
+// `$schema` at the root - pass through untouched, and their descriptions reach the model via the
+// chat template. Genuinely-constraining-but-unsupported keywords (pattern, format, multipleOf,
+// const, allOf/anyOf/not, $ref, contains, uniqueItems, ...) still THROW - stripping just those is a
+// far smaller ask than stripping all documentation.
+const ANNOTATIONS = new Set(['description', 'title', 'default', 'examples', 'deprecated', 'readOnly', 'writeOnly', '$comment', '$schema', '$id'])
 const TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
 
 /** The discriminator of a branch list: a property required by every branch, with a single-value
@@ -59,10 +85,10 @@ export function findDiscriminator(branches: JsonSchema[]): string | null {
 
 /** Validate a schema against the enforceable subset; throws listing anything unsupported. */
 export function validateJsonSchema(schema: JsonSchema, path = 'schema', isRoot = true): void {
-  const unknown = Object.keys(schema).filter((k) => !SUPPORTED.has(k))
-  if (unknown.length) throw new Error(`bitgpu/chat: unsupported JSON Schema keyword(s) at ${path}: ${unknown.join(', ')} (enforceable subset: ${[...SUPPORTED].join(', ')})`)
+  const unknown = Object.keys(schema).filter((k) => !SUPPORTED.has(k) && !ANNOTATIONS.has(k))
+  if (unknown.length) throw new Error(`bitgpu/chat: unsupported JSON Schema keyword(s) at ${path}: ${unknown.join(', ')} (enforceable subset: ${[...SUPPORTED].join(', ')}; annotations accepted-and-ignored: ${[...ANNOTATIONS].join(', ')})`)
   if (schema.oneOf !== undefined) {
-    const extra = Object.keys(schema).filter((k) => k !== 'oneOf')
+    const extra = Object.keys(schema).filter((k) => k !== 'oneOf' && !ANNOTATIONS.has(k))
     if (extra.length) throw new Error(`bitgpu/chat: oneOf at ${path} cannot combine with other keywords (got ${extra.join(', ')})`)
     if (!Array.isArray(schema.oneOf) || schema.oneOf.length < 2) throw new Error(`bitgpu/chat: oneOf at ${path} needs at least 2 branches`)
     schema.oneOf.forEach((b, i) => {

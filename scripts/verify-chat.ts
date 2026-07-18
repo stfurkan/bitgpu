@@ -449,6 +449,12 @@ console.log('(D) JSON constrained decoding')
   check('schema: enum needing escapes throws', /require JSON escaping/.test(throws(() => validateJsonSchema({ type: 'object', properties: { a: { enum: ['ok', 'not "ok"'] } } })) ?? ''))
   check('schema: required key missing from properties throws', /missing from properties/.test(throws(() => validateJsonSchema({ type: 'object', required: ['x'], properties: { y: {} } })) ?? ''))
   check('schema: minItems > maxItems throws', /minItems > maxItems/.test(throws(() => validateJsonSchema({ type: 'array', minItems: 3, maxItems: 1 })) ?? ''))
+  // annotation-only keywords are ACCEPTED and ignored (so real MCP / OpenAI tool schemas pass
+  // through unmodified); genuinely-constraining unknown keywords still THROW.
+  check('schema: property description accepted (annotation)', throws(() => validateJsonSchema({ type: 'object', properties: { a: { type: 'string', description: 'the a field' } } })) === null)
+  check('schema: root $schema/title/default/examples accepted', throws(() => validateJsonSchema({ $schema: 'https://json-schema.org/draft/2020-12/schema', title: 'Args', type: 'object', properties: { n: { type: 'integer', default: 1, examples: [1, 2] } } } as never)) === null)
+  check('schema: constraining unknown keyword still throws (format)', /unsupported JSON Schema keyword.*format/.test(throws(() => validateJsonSchema({ type: 'object', properties: { d: { type: 'string', format: 'date-time' } } } as never)) ?? ''))
+  check('schema: constraining unknown keyword still throws (pattern)', /unsupported JSON Schema keyword.*pattern/.test(throws(() => validateJsonSchema({ type: 'object', properties: { s: { type: 'string', pattern: '^x' } } } as never)) ?? ''))
 
   const enc2 = new TextEncoder()
   const feedS = (schema: import('../src/chat/json').JsonSchema, s: string): { ok: boolean; complete: boolean } => {
@@ -473,6 +479,11 @@ console.log('(D) JSON constrained decoding')
   check('schema: maxItems 0 keeps the array empty', feedS({ type: 'array', maxItems: 0 }, '[]').complete && !feedS({ type: 'array', maxItems: 0 }, '[1').ok)
   const INT = { type: 'object' as const, required: ['n'], properties: { n: { type: 'integer' as const } } }
   check('schema: integer bans fraction and exponent', feedS(INT, '{"n":42}').complete && !feedS(INT, '{"n":4.').ok && !feedS(INT, '{"n":4e').ok)
+  // enforcement is byte-for-byte UNCHANGED when annotations are present (they are never read)
+  const DOCD = { type: 'object' as const, required: ['n'], additionalProperties: false, properties: { n: { type: 'integer' as const, description: 'a count', minimum: 1, maximum: 3 } } }
+  check('schema: annotated schema still enforces (in-range int accepted)', feedS(DOCD, '{"n":2}').complete)
+  check('schema: annotated schema still enforces (out-of-range int rejected)', !feedS(DOCD, '{"n":9').ok)
+  check('schema: annotated schema still enforces (unknown key rejected)', !feedS(DOCD, '{"x').ok)
   const ENUM = { type: 'object' as const, required: ['mood'], additionalProperties: false, properties: { mood: { enum: ['positive', 'negative', 'neutral'] } } }
   check('schema: enum accepts a listed literal', feedS(ENUM, '{"mood":"neutral"}').complete)
   check('schema: enum rejects a non-prefix first byte', !feedS(ENUM, '{"mood":"x').ok)
@@ -498,6 +509,7 @@ console.log('(D) JSON constrained decoding')
   const QUOTE = { type: 'object' as const, required: ['type', 'quote'], additionalProperties: false, properties: { type: { enum: ['quote'] }, quote: { type: 'string' as const }, title: { type: 'string' as const } } }
   const SLIDE = { oneOf: [BULLETS, QUOTE] }
   check('oneOf: valid discriminated union validates', throws(() => validateJsonSchema(SLIDE)) === null)
+  check('oneOf: an annotation (description) may accompany oneOf', throws(() => validateJsonSchema({ description: 'a slide', oneOf: [BULLETS, QUOTE] } as never)) === null)
   check('oneOf: combining with other keywords throws', /cannot combine/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, QUOTE], type: 'object' } as never)) ?? ''))
   check('oneOf: single branch throws', /at least 2 branches/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS] })) ?? ''))
   check('oneOf: non-strict branch throws', /additionalProperties: false/.test(throws(() => validateJsonSchema({ oneOf: [BULLETS, { type: 'object', properties: { type: { enum: ['x'] } }, required: ['type'] }] })) ?? ''))

@@ -34,7 +34,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.13.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.13.1/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -226,10 +226,15 @@ feasibility, so the model can never be trapped mid-number), and `oneOf` as a **d
 union** - object branches sharing one required property whose single-value `enum` differs per
 branch, e.g. a slide that is either `{type: 'bullets', ...}` or `{type: 'quote', ...}`; the
 machine tracks the live branches until the discriminator commits. All nested to any depth.
-Anything else (`pattern`, float ranges, general `oneOf`, `$ref`, ...) **throws up front** -
-never silently ignored. The guarantee is structural, not semantic: a schema makes the output
-parse into the right shape, not be true. Built on the engine's generic `candidateFilter` hook
-(see `GenerateOptions`), which is open for custom grammars.
+Annotation-only keywords - `description`, `title`, `default`, `examples`, `$schema`, `$id`,
+`deprecated`, `readOnly`, `writeOnly`, `$comment` - are **accepted and ignored** (they carry no
+constraint), so a real MCP / OpenAI tool schema passes through unmodified and a property's
+`description` still reaches the model via the chat template. Genuinely-constraining keywords the
+enforcer does not implement (`pattern`, `format`, float ranges, general `oneOf`, `$ref`, ...)
+**throw up front** - never silently ignored, because those would *look* enforced. The guarantee
+is structural, not semantic: a schema makes the output parse into the right shape, not be true.
+Built on the engine's generic `candidateFilter` hook (see `GenerateOptions`), which is open for
+custom grammars.
 
 ### Confidence (`logprobs`)
 
