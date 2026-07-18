@@ -56,7 +56,8 @@
     "prepare": "npm run build",
     "prepublishOnly": "npm run build && npm run check:publish",
     "test:gguf": "tsx scripts/verify-gguf.ts",
-    "profile": "node scripts/profile.mjs"
+    "profile": "node scripts/profile.mjs",
+    "bench": "node scripts/benchmark.mjs"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.4",

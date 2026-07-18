@@ -25,6 +25,22 @@ npm install bitgpu
 
 ESM-only, zero runtime dependencies.
 
+## Benchmark
+
+Against the mainstream WebGPU path for the same model - transformers.js with `dtype: 'q1'` - on the
+**identical** 1-bit Bonsai-1.7B weights, same GPU, same prompt, both in one page:
+
+| | transformers.js 4.2.0 (`dtype: 'q1'`) | bitgpu |
+| --- | --- | --- |
+| decode | 17.7 tok/s | **23.8 tok/s** (up to ~1.8x at short context) |
+| prefill (156-token prompt) | 5.6 s | **0.9 s** (~6x) |
+
+Point-in-time, one machine (Apple M-series, Chrome 150 / WebGPU, 2026-07) - so treat it as a
+ballpark, not a leaderboard. Reproduce it, or run your own model / GPU, with `npm run bench`
+([examples/benchmark.html](examples/benchmark.html) loads both engines side by side and prints the
+numbers). Weights are bit-identical across the two containers (the GGUF sign-bit stream equals the
+onnx-community q1 export), so this measures the runtime, not the model.
+
 ## Quickstart - no conversion, no hosting
 
 Ready-made manifests for all three Bonsai sizes are committed under [`models/`](models/); the

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>bitgpu vs transformers.js (q1) benchmark</title></head>
+<body>
+  <button id="run">Run benchmark</button>
+  <pre id="out"></pre>
+  <script type="module">
+    // Head-to-head: bitgpu vs transformers.js `dtype: 'q1'` on the SAME Bonsai model, SAME prompt,
+    // SAME GPU (both WebGPU, in this one page). Weights are bit-identical (the GGUF sign-bit stream
+    // equals the onnx-community q1 export). Prefill (TTFT) and decode tok/s are separated with the
+    // two-point method - measure wall-clock for N and 2N new tokens, so t(k)=prefill+k*decode_per_tok
+    // - the SAME measurement for both engines. Best-of-REP to shed thermal noise.
+    //   ?model=<staged bitgpu dir>  ?tjs=<hf onnx repo>  ?n=<decode tokens>
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; };
+    const MODEL_DIR = new URLSearchParams(location.search).get('model') || 'model-1.7b-gguf';
+    const TJS_ID = new URLSearchParams(location.search).get('tjs') || 'onnx-community/Bonsai-1.7B-ONNX';
+    const N = Number(new URLSearchParams(location.search).get('n')) || 64;
+    const REP = 3;
+    const time = async (fn) => { const t = performance.now(); await fn(); return performance.now() - t; };
+
+    async function run() {
+      out.textContent = '';
+      try {
+        log(`bitgpu vs transformers.js (dtype q1)`);
+        log(`model: ${MODEL_DIR} (bitgpu) vs ${TJS_ID} (transformers.js) - bit-identical weights\n`);
+        // transformers.js
+        const T = await import('https://esm.sh/@huggingface/transformers@4.2.0');
+        const tok = await T.AutoTokenizer.from_pretrained(TJS_ID);
+        const tjs = await T.AutoModelForCausalLM.from_pretrained(TJS_ID, { dtype: 'q1', device: 'webgpu' });
+        // A long prompt (~200 tokens) so prefill is a measurable share of wall-clock (a short prompt
+        // makes prefill << decode-total and the two-point prefill estimate goes to noise).
+        const PARA = 'The printing press, developed by Johannes Gutenberg around 1440, was one of the most consequential inventions in human history. By making it possible to reproduce text mechanically rather than by hand, it slashed the cost of books, accelerated the spread of ideas, standardized languages, and helped fuel the Renaissance, the Reformation, and the scientific revolution. ';
+        const PROMPT = 'Read the following passage and then continue it in the same style.\n\n' + PARA + PARA + '\n\nContinue:';
+        const inp = await tok(PROMPT);
+        const ids = Array.from(inp.input_ids.data, Number); // exact same token ids to bitgpu
+        log(`prompt: ${ids.length} tokens; decode window N=${N}`);
+        // bitgpu (same weights, streamed from the staged model dir)
+        const { createEngine } = await import('../dist/index.js');
+        const eng = await createEngine({ modelUrl: `./${MODEL_DIR}` });
+        const cap = eng.capabilities;
+        log(`bitgpu path: ${cap.useSubgroups ? 'SG=' + cap.subgroupSize : 'fallback'} / ${cap.adapter.vendor || '?'}  (kv ${cap.kvCache})\n`);
+
+        const measure = async (label, gen) => {
+          await gen(4); // warm up (graph/shader compile) - not timed
+          let bN = Infinity, b2N = Infinity;
+          for (let i = 0; i < REP; i++) bN = Math.min(bN, await time(() => gen(N)));
+          for (let i = 0; i < REP; i++) b2N = Math.min(b2N, await time(() => gen(2 * N)));
+          const decMsTok = (b2N - bN) / N, prefill = bN - N * decMsTok;
+          log(`  ${label.padEnd(16)} prefill ${prefill.toFixed(0)} ms  |  decode ${(1000 / decMsTok).toFixed(1)} tok/s  (${decMsTok.toFixed(2)} ms/tok)`);
+          return { prefill, dec: 1000 / decMsTok };
+        };
+
+        log(`results (2-point wall-clock, best of ${REP}):`);
+        const rT = await measure('transformers.js', (k) => tjs.generate({ ...inp, max_new_tokens: k, do_sample: false }));
+        const rB = await measure('bitgpu', (k) => eng.generate(ids, { maxTokens: k }));
+        log(`\n  bitgpu vs transformers.js: decode ${(rB.dec / rT.dec).toFixed(2)}x  |  prefill ${(rT.prefill / rB.prefill).toFixed(2)}x`);
+        eng.dispose();
+        out.insertAdjacentHTML('beforeend', `\n<span class="ok">BENCH OK - decode ${rB.dec.toFixed(1)} vs ${rT.dec.toFixed(1)} tok/s</span>`);
+      } catch (e) { log('ERROR ' + (e && e.stack || e)); out.insertAdjacentHTML('beforeend', '\nBENCH FAIL'); }
+    }
+    document.getElementById('run').onclick = run;
+  </script>
+</body>
+</html>
