@@ -91,11 +91,13 @@
         rmsnorm: ['rmsnorm_sg', 'rmsnorm'],
         'copy+swiglu': ['copy', 'swiglu'],
       };
+      // true GPU time (timestamp-query) when available, else CPU wall-clock around the submit
+      const ms = cap.timestampQuery ? (r) => r.tsMs : (r) => r.gpuMs;
       const none = await engine.profileDecode(ids, 12, new Set());
-      log(`  skeleton (dispatch/barrier floor) = ${none.gpuMs.toFixed(1)} ms/token`);
+      log(`  skeleton (dispatch/barrier floor) = ${ms(none).toFixed(2)} ms/token${cap.timestampQuery ? ' (gpu-ts)' : ' (wall)'}`);
       for (const [name, ks] of Object.entries(groups)) {
         const pr = await engine.profileDecode(ids, 12, new Set(ks));
-        log(`  ${name.padEnd(10)} = ${Math.max(0, pr.gpuMs - none.gpuMs).toFixed(1)} ms/token`);
+        log(`  ${name.padEnd(10)} = ${Math.max(0, ms(pr) - ms(none)).toFixed(2)} ms/token`);
       }
 
       // 4) long-prompt prefill (tiled GEMM path). 800 tokens deliberately exceeds the point where a
@@ -766,7 +768,49 @@
       out.insertAdjacentHTML('beforeend', `\n<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PACKAGE OK' : 'REGRESSION'} - greedy ${g.tokensPerSecond.toFixed(2)} / sampled ${s1.tokensPerSecond.toFixed(2)} tok/s</span>`);
     }
 
-    document.getElementById('run').onclick = () => run().catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
+    // ?profile=1: dev perf profiler (not a correctness gate). Prints the true GPU ms/token cost of
+    // each kernel group so perf work is evidence-driven. Uses timestamp-query when the device has it.
+    async function profile() {
+      out.textContent = '';
+      const nosg = new URLSearchParams(location.search).get('nosg') === '1';
+      const fp = await (await fetch(`${FIX}/params.json`)).json();
+      const ids = fp.ids;
+      log(`profiling ${MODEL_DIR} (${nosg ? 'no-subgroup fallback' : 'subgroup'} path)...`);
+      let engine;
+      try { engine = await createEngine({ modelUrl: MODEL_DIR, forceNoSubgroups: nosg }); }
+      catch (e) { if (e instanceof WebGPUUnavailableError) { log('WebGPU not available: ' + e.message); return; } throw e; }
+      const cap = engine.capabilities;
+      log(`path: ${cap.useSubgroups ? 'subgroups (SG=' + cap.subgroupSize + ')' : 'no-subgroup fallback'}  adapter: ${cap.adapter.vendor || '?'}/${cap.adapter.architecture || '?'}`);
+      log(`timestamp-query: ${cap.timestampQuery ? 'AVAILABLE (true GPU time)' : 'UNAVAILABLE (CPU wall-clock fallback)'}\n`);
+      const groups = {
+        'layer matmul': ['matmul_split_sg', 'matmul_resid_mr_sg', 'matmul_swiglu_mr_sg', 'matmul_split_wg', 'matmul_resid_wg'],
+        'lm_head': ['matmul_q2_sg', 'matmul_q2', 'matmul_q2_wg'],
+        attention: ['attention_sg', 'attention_cache'],
+        'norm+rope': ['rmsnorm_rope_sg', 'rope'],
+        rmsnorm: ['rmsnorm_sg', 'rmsnorm'],
+        'copy+swiglu': ['copy', 'swiglu'],
+      };
+      const N = 24, src = cap.timestampQuery ? (r) => r.tsMs : (r) => r.gpuMs;
+      await engine.profileDecode(ids, 8, null); // warm up pipelines + caches before measuring
+      const full = await engine.profileDecode(ids, N, null);
+      const none = await engine.profileDecode(ids, N, new Set());
+      const fullMs = src(full), floorMs = src(none);
+      log(`full decode            = ${fullMs.toFixed(3)} ms/token   (${full.tokPerSec.toFixed(1)} tok/s${cap.timestampQuery ? ', gpu-ts' : ', wall'})`);
+      log(`dispatch/barrier floor = ${floorMs.toFixed(3)} ms/token   (${(100 * floorMs / fullMs).toFixed(0)}% of full)\n`);
+      log('per-group in-context cost (full-size minus skeleton), high to low:');
+      const rows = [];
+      for (const [name, ks] of Object.entries(groups)) {
+        const pr = await engine.profileDecode(ids, N, new Set(ks));
+        rows.push([name, Math.max(0, src(pr) - floorMs)]);
+      }
+      rows.sort((a, b) => b[1] - a[1]);
+      for (const [name, g] of rows) log(`  ${name.padEnd(12)} = ${g.toFixed(3)} ms/token  (${(100 * g / fullMs).toFixed(0)}%)`);
+      engine.dispose();
+      out.insertAdjacentHTML('beforeend', `\n<span class="pass">PROFILE OK - ${MODEL_TAG} ${fullMs.toFixed(2)} ms/tok ${cap.timestampQuery ? '(gpu-ts)' : '(wall)'}</span>`);
+    }
+
+    const PROFILE = new URLSearchParams(location.search).get('profile') === '1';
+    document.getElementById('run').onclick = () => (PROFILE ? profile() : run()).catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
   </script>
 </body>
 </html>

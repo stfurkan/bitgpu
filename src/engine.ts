@@ -60,6 +60,10 @@ interface RawGenResult {
   rng?: MT19937
   /** Per-emitted-token logprob records (sampled path only, when GenerateOptions.logprobs set). */
   lp?: TokenLogprobs[]
+  /** True GPU time per decoded token (ms), from timestamp-query - populated only by profileDecode
+   *  on a timestamp-capable device; 0 otherwise. Unlike gpuMs (CPU wall-clock around the submit,
+   *  which includes queue latency) this is the actual on-GPU compute time of the decode passes. */
+  tsMs?: number
 }
 
 /** Internal engine handle: the public {@link Engine} surface plus diagnostics used by the
@@ -291,6 +295,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
   if (kv16) features.push('shader-f16' as GPUFeatureName)
+  // timestamp-query: purely diagnostic (true GPU-side kernel timing for the dev profiler). Requested
+  // whenever the adapter offers it; it never changes decode behavior and shipping paths never use it.
+  const hasTS = adapter.features.has('timestamp-query' as GPUFeatureName)
+  if (hasTS) features.push('timestamp-query' as GPUFeatureName)
   // ---- device limits negotiation ----
   // Run at WebGPU's guaranteed-minimum limits whenever the model fits them (low-end/mobile devices
   // keep working exactly as before), and request precisely the raised limits a bigger model needs,
@@ -1052,6 +1060,16 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // diagnostic: FULL = null -> every kernel at real size; FULL = Set(names) -> only those at real size,
   // all others dispatched as 1 workgroup. Lets us measure each kernel type's true in-context cost.
   let FULL: Set<string> | null = null
+  // diagnostic: TS_PROFILE (set only by profileDecode, on a timestamp-capable device) wraps each
+  // decode batch's passes with begin/end timestamp writes, so the profiler reads TRUE on-GPU decode
+  // time instead of CPU wall-clock. Off for every shipping path -> those passes are byte-identical.
+  let TS_PROFILE = false
+  let _tsQ: GPUQuerySet | null = null
+  let _tsResolve: GPUBuffer | null = null
+  let _tsRead: GPUBuffer | null = null
+  const tsQ = (): GPUQuerySet => (_tsQ ??= device.createQuerySet({ type: 'timestamp', count: 2 }))
+  const tsResolveBuf = (): GPUBuffer => (_tsResolve ??= device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | CS }))
+  const tsReadBuf = (): GPUBuffer => (_tsRead ??= device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | CD }))
   // embed_gather_batch is exempt from profiling skeletons: it produces the PREFILL INPUT (the
   // CPU used to), and skeleton-skipping it feeds NaN/garbage activations into every profiled
   // kernel - numerically meaningless and, on GPUs with slow non-finite handling, much slower.
@@ -1410,7 +1428,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const gen: number[] = []
       let recMs = 0,
         gpuMs = 0,
-        rbMs = 0
+        rbMs = 0,
+        tsNs = 0
+      const tsOn = TS_PROFILE && hasTS
       const t1 = performance.now()
       let total = 1 // decode positions consumed (incl. prefill's first)
       const stopSet = ctl?.stopTokens ? new Set(ctl.stopTokens) : null
@@ -1431,22 +1451,34 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         for (let j = 0; j < batch; j++) {
           const idxOut = total + j,
             pos = slot + j
-          let pass = enc.beginComputePass()
+          // profiling: stamp the GPU clock at the start of the batch's first pass and the end of its
+          // last pass -> the delta is the batch's true on-GPU decode time (shipping path: tsOn=false).
+          let pass = enc.beginComputePass(tsOn && j === 0 ? { timestampWrites: { querySet: tsQ(), beginningOfPassWriteIndex: 0 } } : undefined)
           runN(pass, 'embed_gather', [['u', Hd], ['u', idxOut - 1], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
           pass.end()
           const r = stack(enc, embG, 1, pos)
           const last = actBuf(Hd)
           enc.copyBufferToBuffer(r.fn, 0, last, 0, Hd * 4)
-          pass = enc.beginComputePass()
+          pass = enc.beginComputePass(tsOn && j === batch - 1 ? { timestampWrites: { querySet: tsQ(), endOfPassWriteIndex: 1 } } : undefined)
           lmHead(pass, last, 1, lg)
           runN(pass, 'argmax', [['u', vocab], ['u', idxOut], ['u', 0], ['u', 0]], [lg], tokBuf, 1)
           pass.end()
+        }
+        if (tsOn) {
+          enc.resolveQuerySet(tsQ(), 0, 2, tsResolveBuf(), 0)
+          enc.copyBufferToBuffer(tsResolveBuf(), 0, tsReadBuf(), 0, 16)
         }
         device.queue.submit([enc.finish()])
         recMs += performance.now() - t
         t = performance.now()
         await device.queue.onSubmittedWorkDone()
         gpuMs += performance.now() - t
+        if (tsOn) {
+          await tsReadBuf().mapAsync(GPUMapMode.READ)
+          const ticks = new BigUint64Array(tsReadBuf().getMappedRange())
+          tsNs += Number(ticks[1] - ticks[0]) // timestamp-query values are nanoseconds
+          tsReadBuf().unmap()
+        }
         t = performance.now()
         const toks = await readbackU32(tokBuf, total + batch)
         rbMs += performance.now() - t
@@ -1463,7 +1495,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       cacheLen = slot // sink-mode bookkeeping: the last history token's (re-feed) slot
       const decodeMs = performance.now() - t1,
         nd = Math.max(1, gen.length - 1)
-      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd }
+      return { prefillMs, decodeMs, tokPerSec: nd / (decodeMs / 1000), tokens: gen, firstArgmax: firstTok, recMs: recMs / nd, gpuMs: gpuMs / nd, rbMs: rbMs / nd, tsMs: tsOn ? tsNs / 1e6 / nd : 0 }
     } finally {
       // Restore the shared flags even when a step throws (a stuck active pool would corrupt every
       // later call), and release this call's GPU scratch instead of waiting on GC.
@@ -2044,6 +2076,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       maxStorageBufferBindingSize: Number(device.limits.maxStorageBufferBindingSize),
       maxComputeWorkgroupStorageSize: device.limits.maxComputeWorkgroupStorageSize,
     },
+    timestampQuery: hasTS,
   }
 
   // Public generate: routes to sampled decode when a sampling temperature is set, else greedy.
@@ -2315,7 +2348,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     dispose: () => device.destroy(),
     device,
     adapter,
-    profileDecode: (ids, nTokens, full = null, syncN = SYNC_N) => generateImpl(ids, 0, nTokens, full, syncN),
+    profileDecode: async (ids, nTokens, full = null, syncN = SYNC_N) => {
+      TS_PROFILE = hasTS // collect true GPU time this run (no-op without the feature)
+      try { return await generateImpl(ids, 0, nTokens, full, syncN) } finally { TS_PROFILE = false }
+    },
     debugDecode,
     debugSampler,
   }

@@ -285,6 +285,9 @@ export interface EngineCapabilities {
   adapter: { vendor?: string; architecture?: string; device?: string; description?: string }
   /** Relevant adapter limits the engine codes against. */
   limits: { maxStorageBufferBindingSize: number; maxComputeWorkgroupStorageSize: number }
+  /** Whether the device has the `timestamp-query` feature (true GPU-side kernel timing is
+   *  available to the dev profiler; see the profileDecode diagnostics). */
+  timestampQuery: boolean
 }
 
 /** A saved KV cache + conversation token history, from {@link Engine.saveCache}. A plain object

@@ -55,7 +55,8 @@
     "check:publish": "publint --strict && attw --pack . --profile esm-only",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build && npm run check:publish",
-    "test:gguf": "tsx scripts/verify-gguf.ts"
+    "test:gguf": "tsx scripts/verify-gguf.ts",
+    "profile": "node scripts/profile.mjs"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "0.18.4",
