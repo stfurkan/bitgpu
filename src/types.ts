@@ -130,6 +130,15 @@ export interface EngineOptions {
    *  seed -> same tokens; cache reuse == full prefill). See `capabilities.kvCache` for what's
    *  active. Default `'f32'`. */
   kvCache?: 'f32' | 'f16' | 'q8'
+  /** Activation-compute precision for the decode matmuls (the 1-bit GEMVs that dominate decode).
+   *  `'f16'` reads activations as f16 and runs the per-block dot in f16 (2x ALU rate on
+   *  Apple/AMD/recent NVIDIA) with f32 accumulation; the residual stream and weights stay f32.
+   *  Like `kvCache: 'f16'` it needs the `shader-f16` adapter feature and the subgroup path, and
+   *  SILENTLY FALLS BACK to f32 without them, so it is safe to request unconditionally. Outputs
+   *  are not bit-identical to f32 (measured near-lossless by the GPU gate, q8-KV tier) but WITHIN
+   *  the mode decoding is exact and deterministic. Applies to decode only (prefill stays f32).
+   *  See `capabilities.activation` for what is active. Default `'f32'`. */
+  activation?: 'f32' | 'f16'
   /** What happens when a conversation outgrows `maxSeqLen`. `'error'` (default): generate
    *  throws, exactly as before. `'sinks'`: StreamingLLM-style rolling window - the first
    *  `sinkTokens` positions (attention sinks) plus the most recent window are kept and the
@@ -275,6 +284,9 @@ export interface EngineCapabilities {
   /** Active KV-cache storage precision ('f16' only when requested AND the adapter has shader-f16;
    *  'q8' whenever requested - it needs no adapter feature). */
   kvCache: 'f32' | 'f16' | 'q8'
+  /** Active activation-compute precision ('f16' only when requested AND the adapter has shader-f16
+   *  AND the subgroup path is in use; else 'f32'). */
+  activation: 'f32' | 'f16'
   /** Active overflow policy ('sinks' = rolling window with attention sinks). */
   overflow: 'error' | 'sinks'
   /** The engine's KV window in positions (the resolved maxSeqLen option). Under

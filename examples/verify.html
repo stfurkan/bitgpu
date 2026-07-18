@@ -527,6 +527,50 @@
         e16.dispose();
       } else log('\nf16 KV cache checks SKIPPED (no shader-f16 on this adapter)');
 
+      // 8b) f16 ACTIVATION-compute mode (activation: 'f16'): the decode matmuls read activations as
+      // f16 and dot in f16 with f32 accumulation. Decode-only precision mode - forward() (S>1) stays
+      // f32, so it is validated like the KV precision modes: within-mode EXACTNESS (determinism +
+      // reuse == cold prefill) plus loose token agreement vs f32 (the known-good prefix bar). It
+      // needs shader-f16 AND the subgroup path, so it is skipped on the nosg fallback (falls back to f32).
+      const nosgA = new URLSearchParams(location.search).get('nosg') === '1';
+      if (!FAST && hasF16 && !nosgA) {
+        log('\nf16 activation-compute checks (second engine, activation: f16)...');
+        const eA = await createEngine({ modelUrl: MODEL_DIR, activation: 'f16' });
+        const capOkA = eA.capabilities.activation === 'f16';
+        ok = ok && capOkA;
+        log(`  ${capOkA ? '[PASS]' : '[FAIL]'} capabilities.activation = ${eA.capabilities.activation}`);
+        const a1 = await eA.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+        const a2 = await eA.generate(ids, { ...SOPT, maxTokens: 24, seed: 42 });
+        const detA = a1.tokens.length === a2.tokens.length && a1.tokens.every((t, i) => t === a2.tokens[i]);
+        ok = ok && detA;
+        log(`  ${detA ? '[PASS]' : '[FAIL]'} af16 determinism (seed 42 identical twice)`);
+        eA.resetCache();
+        const ar1 = await eA.generate(ids, { maxTokens: 8 });
+        const ar2 = await eA.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        eA.resetCache();
+        const arc = await eA.generate([...ids, ...ar1.tokens, ...ids.slice(0, 5)], { maxTokens: 8 });
+        const reuseA = ar2.tokens.length === arc.tokens.length && ar2.tokens.every((t, i) => t === arc.tokens[i]);
+        ok = ok && reuseA;
+        log(`  ${reuseA ? '[PASS]' : '[FAIL]'} af16 reuse turn-2 == full-prefill turn-2 (exact within mode)`);
+        eA.resetCache(); engine.resetCache();
+        const aFixA = await eA.generate(ids, { maxTokens: 32 });
+        let nA = 0; while (nA < 32 && aFixA.tokens[nA] === KNOWN_GOOD[nA]) nA++;
+        const aOkA = nA >= 24; ok = ok && aOkA;
+        log(`  ${aOkA ? '[PASS]' : '[FAIL]'} af16 vs known-good ids: ${nA}/32 prefix`);
+        log(`  af16 decode ${aFixA.tokensPerSecond.toFixed(2)} tok/s (f32 was ${g.tokensPerSecond.toFixed(2)})`);
+        eA.resetCache();
+        await eA.generate(ids, { maxTokens: 6 });
+        const snA = await eA.saveCache();
+        const sA1 = await eA.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        await eA.generate([...ids, ...ids], { maxTokens: 4 }); // pollute
+        await eA.restoreCache(snA);
+        const sA2 = await eA.generate(ids.slice(0, 5), { maxTokens: 8, reuseCache: true });
+        const snOkA = sA1.tokens.length === sA2.tokens.length && sA1.tokens.every((t, i) => t === sA2.tokens[i]);
+        ok = ok && snOkA;
+        log(`  ${snOkA ? '[PASS]' : '[FAIL]'} af16 snapshot save/restore round trip (continuation exact)`);
+        eA.dispose();
+      } else if (!FAST) log('\nf16 activation-compute checks SKIPPED (' + (nosgA ? 'nosg fallback' : 'no shader-f16') + ')');
+
       // 9) q8 KV cache mode (kvCache: 'q8', ~1.125 bytes/value, quarter of f32). Same contract
       // as f16: within-mode behavior must stay EXACT; agreement vs f32 is gated loosely (the
       // known-good prefix bar) and reported as the quality measurement. q8 needs no adapter
@@ -805,12 +849,47 @@
       }
       rows.sort((a, b) => b[1] - a[1]);
       for (const [name, g] of rows) log(`  ${name.padEnd(12)} = ${g.toFixed(3)} ms/token  (${(100 * g / fullMs).toFixed(0)}%)`);
+      log('\n(for a thermally-controlled f32-vs-precision-mode A/B, use ?abtest=1)');
       engine.dispose();
       out.insertAdjacentHTML('beforeend', `\n<span class="pass">PROFILE OK - ${MODEL_TAG} ${fullMs.toFixed(2)} ms/tok ${cap.timestampQuery ? '(gpu-ts)' : '(wall)'}</span>`);
     }
 
+    // ?abtest=1: rigorous f32-vs-af16 A/B. INTERLEAVES the two (measured back-to-back each round so
+    // they share the same thermal state) and reports best-case (min, least-throttled) GPU time plus
+    // the paired median delta - so thermal drift cannot masquerade as a real difference.
+    async function abtest() {
+      out.textContent = '';
+      const fp = await (await fetch(`${FIX}/params.json`)).json();
+      const ids = fp.ids;
+      log(`A/B f32 vs activation:'f16' (interleaved, cancels thermal drift) - ${MODEL_DIR}...`);
+      const e32 = await createEngine({ modelUrl: MODEL_DIR });
+      const eA = await createEngine({ modelUrl: MODEL_DIR, activation: 'f16' });
+      if (eA.capabilities.activation !== 'f16') { log('activation f16 NOT active (no shader-f16 / nosg)'); e32.dispose(); eA.dispose(); return; }
+      const ts = eA.capabilities.timestampQuery;
+      log(`timestamp-query: ${ts ? 'yes (true GPU time)' : 'no (wall-clock)'}  path: SG=${eA.capabilities.subgroupSize}`);
+      const src = ts ? (r) => r.tsMs : (r) => 1000 / r.tokPerSec; // ms/token
+      const N = 32, ROUNDS = 15;
+      await e32.profileDecode(ids, 16, null); await eA.profileDecode(ids, 16, null); // warm both
+      const f32s = [], afs = [];
+      for (let i = 0; i < ROUNDS; i++) {
+        f32s.push(src(await e32.profileDecode(ids, N, null)));
+        afs.push(src(await eA.profileDecode(ids, N, null))); // back-to-back: same thermal state
+      }
+      const med = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+      const mn = (xs) => Math.min(...xs);
+      const f32med = med(f32s), afmed = med(afs), f32min = mn(f32s), afmin = mn(afs);
+      const diffs = f32s.map((a, i) => afs[i] - a), dmed = med(diffs);
+      log(`f32  ms/tok: median ${f32med.toFixed(3)}  min ${f32min.toFixed(3)}`);
+      log(`af16 ms/tok: median ${afmed.toFixed(3)}  min ${afmin.toFixed(3)}`);
+      log(`paired (af16 - f32) median: ${dmed >= 0 ? '+' : ''}${dmed.toFixed(3)} ms/tok (${(100 * dmed / f32med).toFixed(1)}%)  [negative = af16 faster]`);
+      const verdict = afmin < f32min * 0.99 ? 'af16 FASTER (best-case)' : afmin > f32min * 1.01 ? 'af16 SLOWER (best-case)' : 'TIE (within 1%)';
+      e32.dispose(); eA.dispose();
+      out.insertAdjacentHTML('beforeend', `\n<span class="pass">ABTEST OK - ${MODEL_TAG}: ${verdict}  (best f32 ${f32min.toFixed(2)} / af16 ${afmin.toFixed(2)} ms/tok)</span>`);
+    }
+
     const PROFILE = new URLSearchParams(location.search).get('profile') === '1';
-    document.getElementById('run').onclick = () => (PROFILE ? profile() : run()).catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
+    const ABTEST = new URLSearchParams(location.search).get('abtest') === '1';
+    document.getElementById('run').onclick = () => (ABTEST ? abtest() : PROFILE ? profile() : run()).catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
   </script>
 </body>
 </html>

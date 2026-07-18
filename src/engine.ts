@@ -292,9 +292,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   if (roll && maxSeqLen < SINKS + 64)
     throw new Error(`bitgpu: overflow 'sinks' needs maxSeqLen >= sinkTokens + 64 (got ${maxSeqLen} with ${SINKS} sinks)`)
   const KVB = kv16 ? 2 : kv8 ? 1 : 4 // bytes per cached K/V element (q8 block scales tracked separately)
+  // f16 activation-compute for the decode matmuls: needs shader-f16 AND the subgroup path; falls
+  // back to f32 without them (like kvCache:'f16'). Decode-only precision mode; residual stream f32.
+  const actF16 = opts.activation === 'f16' && useSG && adapter.features.has('shader-f16' as GPUFeatureName)
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
-  if (kv16) features.push('shader-f16' as GPUFeatureName)
+  if (kv16 || actF16) features.push('shader-f16' as GPUFeatureName)
   // timestamp-query: purely diagnostic (true GPU-side kernel timing for the dev profiler). Requested
   // whenever the adapter offers it; it never changes decode behavior and shipping paths never use it.
   const hasTS = adapter.features.has('timestamp-query' as GPUFeatureName)
@@ -411,6 +414,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (useSG) for (const n of ['attention_sg_kv8', 'rmsnorm_rope_sg_kv8']) specs.push([n, { SG: sgMax }])
     else specs.push(['attention_wg_kv8'])
   }
+  if (actF16) {
+    // f16-activation decode matmuls (shader-f16; subgroup path only) - the input-side f16 variants
+    // of the 1-bit layer GEMVs, plus the rmsnorm that feeds them an f16 activation.
+    for (const n of ['rmsnorm_sg_af16', 'matmul_split_sg_af16']) specs.push([n, { SG: sgMax }])
+    for (const n of ['matmul_swiglu_mr_sg_af16', 'matmul_resid_mr_sg_af16']) specs.push([n, { SG: sgMax, ROWS: ROWS_MR }])
+  }
   // Rolling-window (sinks) attention reads rotate K at read time, so it has its own kernel per
   // mode+path. The sg roll kernels keep the rotate partner in-lane only when SG <= head_dim/2;
   // outside that geometry the wg roll kernel takes over (attention only - everything else
@@ -507,6 +516,24 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     let b = pool.buf[bufIdx]
     if (!b || b.size !== alloc * 4) {
       b = device.createBuffer({ size: alloc * 4, usage: S_ | CS | CD })
+      pool.buf[bufIdx] = b
+    }
+    bufIdx++
+    return b
+  }
+  // f16 activation scratch (activation:'f16' decode path): n f16 elements = n*2 bytes. Shares the
+  // decode pool by slot index like actBuf; the per-layer call sequence is fixed for a given mode,
+  // so each slot keeps a consistent size across tokens. Decode sizes are fixed (no poolRound).
+  const actBuf16 = (n: number): GPUBuffer => {
+    const bytes = n * 2
+    if (!pool) {
+      const b = device.createBuffer({ size: bytes, usage: S_ | CS | CD })
+      transients?.push(b)
+      return b
+    }
+    let b = pool.buf[bufIdx]
+    if (!b || b.size !== bytes) {
+      b = device.createBuffer({ size: bytes, usage: S_ | CS | CD })
       pool.buf[bufIdx] = b
     }
     bufIdx++
@@ -1143,10 +1170,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const f = isFull(name)
     pass.dispatchWorkgroups(f ? wgX : 1, f ? wgY : 1, 1)
   }
-  const rms = (pass: GPUComputePassEncoder, x: GPUBuffer, g: string, R: number, Dn: number, out: GPUBuffer): void =>
-    useSG
-      ? runN(pass, 'rmsnorm_sg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
-      : runN(pass, 'rmsnorm_wg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
+  // out16: write the normalized activation as f16 (activation:'f16' decode path; feeds the f16
+  // matmuls). Requires the subgroup path, which actF16 already guarantees.
+  const rms = (pass: GPUComputePassEncoder, x: GPUBuffer, g: string, R: number, Dn: number, out: GPUBuffer, out16 = false): void =>
+    out16
+      ? runN(pass, 'rmsnorm_sg_af16', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
+      : useSG
+        ? runN(pass, 'rmsnorm_sg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
+        : runN(pass, 'rmsnorm_wg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
   // fused q/k/v or gate/up matmul
   function fusedMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, S: number, outs: GPUBuffer[]): void {
     const Ntot = w.N0! + w.N1! + w.N2!
@@ -1165,12 +1196,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       runIO(pass, 'matmul_split', [['u', S], ['u', w.K!], ['u', w.nb!], ['u', w.N0!], ['u', w.N1!], ['u', w.N2!]], [inBuf, w.sign!, w.scales!], outs, S * Ntot)
     }
   }
-  // o_proj / down_proj matmul with fused residual add
-  function residMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, resid: GPUBuffer, S: number, out: GPUBuffer): void {
+  // o_proj / down_proj matmul with fused residual add. in16: the activation inBuf is f16 (the
+  // f16 SwiGLU intermediate for down_proj); decode subgroup path only.
+  function residMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, resid: GPUBuffer, S: number, out: GPUBuffer, in16 = false): void {
     if (useSG && S === 1) {
       const nwg = Math.ceil(w.N! / ROWS_MR) // multi-row GEMV: ROWS_MR output cols per workgroup
       const gx = Math.min(nwg, 65535)
-      runWG(pass, 'matmul_resid_mr_sg', [['u', w.N!], ['u', w.K!], ['u', w.nb!], ['u', gx], ['u', 0], ['u', 0]], [inBuf, w.sign!, w.scales!, resid], [out], gx, Math.ceil(nwg / gx))
+      runWG(pass, in16 ? 'matmul_resid_mr_sg_af16' : 'matmul_resid_mr_sg', [['u', w.N!], ['u', w.K!], ['u', w.nb!], ['u', gx], ['u', 0], ['u', 0]], [inBuf, w.sign!, w.scales!, resid], [out], gx, Math.ceil(nwg / gx))
     } else if (S === 1) {
       const gx = Math.min(w.N!, 65535) // no-subgroup decode: workgroup-reduction GEMV + residual
       runWG(pass, 'matmul_resid_wg', [['u', w.N!], ['u', w.K!], ['u', w.nb!], ['u', gx], ['u', 0], ['u', 0]], [inBuf, w.sign!, w.scales!, resid], [out], gx, Math.ceil(w.N! / gx))
@@ -1205,8 +1237,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
   function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const Ltot = posBase + S
-    const n1 = actBuf(S * Hd)
-    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1)
+    // f16-activation decode (activation:'f16'): active exactly when the fused S===1 subgroup path
+    // runs. The normalized activations (n1/n2) and the SwiGLU intermediate (sw) go f16; the
+    // residual stream, attention, o_proj and weights stay f32, so nothing downstream changes.
+    const af = actF16 && S === 1 && !FORCE_SLOW
+    const n1 = af ? actBuf16(Hd) : actBuf(S * Hd)
+    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1, af)
     const qkv = W[`layers.${li}.attn.qkv`]
 
     if (useSG && S === 1 && !FORCE_SLOW) {
@@ -1216,7 +1252,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         v = actBuf(KV * Dh)
       const Ntot = qkv.N0! + qkv.N1! + qkv.N2!,
         gx = Math.min(Ntot, 65535)
-      runWG(pass, 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
+      runWG(pass, af ? 'matmul_split_sg_af16' : 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
       appendKV(pass, v, 1, li, KV, posBase * KV)
       const qr = actBuf(H * Dh)
       runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
@@ -1237,18 +1273,18 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       cap(li, 'att', att)
       const o = W[`layers.${li}.attn.o_proj`],
         h2 = actBuf(Hd)
-      residMM(pass, o, att, h, 1, h2)
-      const n2 = actBuf(Hd)
-      rms(pass, h2, `layers.${li}.post_attention_layernorm`, 1, Hd, n2)
+      residMM(pass, o, att, h, 1, h2) // o_proj: attention output is f32, so this stays f32
+      const n2 = af ? actBuf16(Hd) : actBuf(Hd)
+      rms(pass, h2, `layers.${li}.post_attention_layernorm`, 1, Hd, n2, af)
       const gu = W[`layers.${li}.mlp.gateup`],
-        sw = actBuf(F),
+        sw = af ? actBuf16(F) : actBuf(F),
         nwgF = Math.ceil(F / ROWS_MR),
         gxF = Math.min(nwgF, 65535)
-      runWG(pass, 'matmul_swiglu_mr_sg', [['u', gu.K!], ['u', gu.nb!], ['u', F], ['u', gxF], ['u', 0], ['u', 0]], [n2, gu.sign!, gu.scales!], [sw], gxF, Math.ceil(nwgF / gxF))
+      runWG(pass, af ? 'matmul_swiglu_mr_sg_af16' : 'matmul_swiglu_mr_sg', [['u', gu.K!], ['u', gu.nb!], ['u', F], ['u', gxF], ['u', 0], ['u', 0]], [n2, gu.sign!, gu.scales!], [sw], gxF, Math.ceil(nwgF / gxF))
       cap(li, 'sw', sw)
       const d = W[`layers.${li}.mlp.down_proj`],
         hn = actBuf(Hd)
-      residMM(pass, d, sw, h2, 1, hn)
+      residMM(pass, d, sw, h2, 1, hn, af) // down_proj: sw is the f16 SwiGLU intermediate
       return hn
     }
 
@@ -2068,6 +2104,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     useSubgroups: useSG,
     subgroupSize: sgMax,
     kvCache: kv16 ? 'f16' : kv8 ? 'q8' : 'f32',
+    activation: actF16 ? 'f16' : 'f32',
     overflow: roll ? 'sinks' : 'error',
     maxSeqLen,
     adapter: { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description },
