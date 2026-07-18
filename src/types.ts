@@ -319,7 +319,13 @@ export interface KvSnapshot {
   model: { layers: number; kvHeads: number; headDim: number; hidden: number; vocab: number }
   /** The full conversation token sequence at save time. */
   ids: number[]
-  /** Packed per-layer cached K/V bytes (and q8 block scales). */
+  /** DELTA snapshot: `data` holds only cache positions `[base, len)` - the leading `base` positions
+   *  (e.g. a shared prewarmed system prompt) are NOT stored and must already be present in the
+   *  restore target (restore into an engine freshly prewarmed with the same prefix). Absent/0 = a
+   *  full snapshot (all positions in `data`). Restore validates the target is exactly at the base
+   *  boundary with a matching token prefix. */
+  base?: number
+  /** Packed per-layer cached K/V bytes (and q8 block scales) for the stored positions. */
   data: ArrayBuffer
 }
 
@@ -342,8 +348,15 @@ export interface Engine {
    *  the conversation alive, so conversations survive engine disposal and page reloads (persist
    *  the snapshot in IndexedDB / OPFS). Size ~ tokens x layers x kvHeads x headDim x 2 x
    *  bytes-per-value (~224 KB/token at f32 on Bonsai-1.7B, ~63 KB/token at q8). Returns `null`
-   *  when the cache is empty. Serialized with generate/prefill/forward like every engine op. */
-  saveCache(): Promise<KvSnapshot | null>
+   *  when the cache is empty. Serialized with generate/prefill/forward like every engine op.
+   *
+   *  `from` makes a DELTA snapshot that excludes the first `from` cache positions (a shared
+   *  prewarmed prefix), so per-conversation snapshots drop the redundant system-prompt KV (tens of
+   *  MB at chat scale). Restore it into an engine freshly prewarmed with the SAME prefix - see the
+   *  `base` field on {@link KvSnapshot}. `from` counts cache positions: for a prewarm of P tokens
+   *  pass `from = P - 1` (a fresh prewarm caches P-1 positions; the last prewarm token's K/V is part
+   *  of the delta). `bitgpu/chat`'s `save({ delta: true })` computes this for you. */
+  saveCache(opts?: { from?: number }): Promise<KvSnapshot | null>
   /** Replace the current conversation with a {@link KvSnapshot} (CPU -> GPU upload). The next
    *  `generate(delta, { reuseCache: true })` continues the saved conversation exactly. Throws if
    *  the snapshot's model architecture or `kvCache` mode does not match this engine, or if it

@@ -460,6 +460,29 @@
         const csOk = snapC !== null && backF.text === liveF.text && liveF.reusedCache === true && backF.reusedCache === true;
         ok = ok && csOk;
         log(`  ${csOk ? '[PASS]' : '[FAIL]'} chat save/restore: follow-up after restore == live follow-up (reused=${backF.reusedCache})`);
+        // 7c) chat DELTA save/restore: prewarm a system prompt, converse on top, save({delta:true})
+        // (excludes the prewarm), then re-prewarm the SAME system and restore - the follow-up must
+        // match the live one, and the delta snapshot must carry a base (the excluded prefix).
+        const DSYS = [{ role: 'system', content: 'You are a terse geography assistant. Answer in one short sentence.' }];
+        chat.reset();
+        await chat.prewarm(DSYS);
+        const dConv = [...DSYS, { role: 'user', content: 'The capital of France is Paris. The capital of Japan is' }];
+        const dq1 = await chat.send(dConv, CSEED); // append on the prewarm (reuse)
+        const dSnap = await chat.save({ delta: true });
+        const dFollow = [...dConv, { role: 'assistant', content: dq1.text }, { role: 'user', content: 'And the capital of Germany?' }];
+        const dLive = await chat.send(dFollow, CSEED);
+        chat.reset();
+        await chat.prewarm(DSYS); // fresh prewarm of the same system
+        await chat.restore(dSnap); // splice the delta on top
+        const dBack = await chat.send(dFollow, CSEED);
+        const cdOk = dSnap !== null && (dSnap.engine.base ?? 0) > 0 && dBack.text === dLive.text && dBack.reusedCache === true;
+        ok = ok && cdOk;
+        log(`  ${cdOk ? '[PASS]' : '[FAIL]'} chat save({delta}) restore onto re-prewarm == live (base=${dSnap?.engine.base}, reused=${dBack.reusedCache})`);
+        chat.reset();
+        let cdGuard = false;
+        try { await chat.restore(dSnap); } catch { cdGuard = true; } // no prewarm -> engine rejects
+        ok = ok && cdGuard;
+        log(`  ${cdGuard ? '[PASS]' : '[FAIL]'} chat delta restore without the prewarm rejected`);
         chat.reset();
       }
 
@@ -691,6 +714,41 @@
         const rejOk = rej === 4;
         ok = ok && rejOk;
         log(`  ${rejOk ? '[PASS]' : '[FAIL]'} tampered snapshots rejected (${rej}/4 threw)`);
+        engine.resetCache();
+      }
+
+      // 9c) DELTA snapshots (saveCache({ from }) drops a shared prewarmed prefix from per-conversation
+      // snapshots). Prove: (a) restore-delta-onto-a-fresh-prewarm continuation is BIT-EXACT vs the
+      // live cache; (b) the delta is smaller by the prewarm fraction; (c) restoring a delta without
+      // the matching prewarm is rejected.
+      if (!FAST) {
+        log('\ndelta snapshot checks (shared-prewarm KV)...');
+        const prewarm = [...ids, ...ids, ...ids]; // a long "system prompt" shared across chats
+        const P = prewarm.length;
+        engine.resetCache();
+        await engine.prefill(prewarm); // prewarm the shared prefix
+        await engine.generate(ids.slice(0, 6), { maxTokens: 10, reuseCache: true }); // a conversation on top
+        const dSnap = await engine.saveCache({ from: P - 1 }); // delta: exclude the prewarm
+        const fSnap = await engine.saveCache(); // full baseline (unchanged cache)
+        const cont = ids.slice(0, 4);
+        const ref = await engine.generate(cont, { maxTokens: 10, reuseCache: true }); // reference continuation
+        const nosgD = new URLSearchParams(location.search).get('nosg') === '1';
+        const eD = await createEngine({ modelUrl: MODEL_DIR, forceNoSubgroups: nosgD });
+        await eD.prefill(prewarm); // fresh prewarm of the SAME prefix
+        await eD.restoreCache(dSnap); // splice the delta on top
+        const dCont = await eD.generate(cont, { maxTokens: 10, reuseCache: true });
+        const dOk = ref.tokens.length === dCont.tokens.length && ref.tokens.every((t, i) => t === dCont.tokens[i]);
+        ok = ok && dOk;
+        log(`  ${dOk ? '[PASS]' : '[FAIL]'} delta restore (onto fresh prewarm) == live-cache continuation (bit-exact)`);
+        const smaller = dSnap.data.byteLength < fSnap.data.byteLength;
+        ok = ok && smaller;
+        log(`  ${smaller ? '[PASS]' : '[FAIL]'} delta ${(dSnap.data.byteLength / 1048576).toFixed(2)} MB < full ${(fSnap.data.byteLength / 1048576).toFixed(2)} MB (dropped ${((1 - dSnap.data.byteLength / fSnap.data.byteLength) * 100).toFixed(0)}% = the shared prewarm)`);
+        const eBad = await createEngine({ modelUrl: MODEL_DIR, forceNoSubgroups: nosgD });
+        let guarded = false;
+        try { await eBad.restoreCache(dSnap); } catch { guarded = true; }
+        ok = ok && guarded;
+        log(`  ${guarded ? '[PASS]' : '[FAIL]'} delta restore without the prewarm rejected`);
+        eD.dispose(); eBad.dispose();
         engine.resetCache();
       }
 

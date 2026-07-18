@@ -170,8 +170,14 @@ export interface Chat {
    *  to another worker; restoring it into a chat on the same model and `kvCache` mode makes the
    *  next clean-append turn extend the cache exactly as if the conversation never stopped (no
    *  re-prefill). Returns null when no conversation is committed. Queues behind in-flight turns
-   *  like send/stream. */
-  save(): Promise<ChatSnapshot | null>
+   *  like send/stream.
+   *
+   *  `{ delta: true }` makes a DELTA snapshot that excludes the shared prewarmed prefix (the system
+   *  messages + tools warmed with {@link Chat.prewarm}), so a per-conversation snapshot drops the
+   *  redundant system-prompt KV - tens of MB at chat scale, and a smaller structured-clone. Restore
+   *  it into a chat freshly `prewarm()`ed with the SAME system + tools (restore validates and throws
+   *  on a mismatch). Requires a prior prewarm(); throws otherwise. */
+  save(opts?: { delta?: boolean }): Promise<ChatSnapshot | null>
   /** Replace the current conversation with a saved snapshot (see {@link Chat.save}). Throws when
    *  the snapshot does not match this engine's model or `kvCache` mode. */
   restore(snapshot: ChatSnapshot): Promise<void>
@@ -277,12 +283,17 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
   // tools). The template puts tools in the SYSTEM block, so a cache built with one tools list
   // cannot be extended by a turn using another - reuse requires an exact match.
   let committedToolsKey: string | null = null
+  // Tokens prefilled by the last prewarm() (0 = none / a non-prewarm cache). save({ delta: true })
+  // snapshots only the KV AFTER this shared prefix; a fresh prewarm caches prewarmLen-1 positions,
+  // so the delta base is prewarmLen-1 (the last prewarm token's K/V is written on the first turn).
+  let prewarmLen = 0
   // Bumped by reset(): a turn in flight when reset() lands must not commit its transcript over
   // the cleared state (same hazard as the engine's own resetCache-vs-generate race).
   let resetEpoch = 0
   const dropCache = (): void => {
     committed = null
     committedToolsKey = null
+    prewarmLen = 0
     engine.resetCache()
   }
 
@@ -512,11 +523,13 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // at the eos token; the standard reuse delta (which begins with "\n") then reconstructs the
     // next prompt token-for-token.
     const str = tk.applyChatTemplate(messages, { addGenerationPrompt: false, enableThinking: false, tools: prep?.tools }).replace(/\n$/, '')
+    const toks = tk.encode(str, false)
     const epoch0 = resetEpoch
-    await engine.prefill(tk.encode(str, false))
+    await engine.prefill(toks)
     if (resetEpoch !== epoch0) return // a reset() landed mid-prefill: stay forgotten
     committed = [...messages]
     committedToolsKey = prep ? JSON.stringify(prep.tools) : null
+    prewarmLen = toks.length // the shared prefix delta snapshots exclude
     cacheEndsAtEos = true
   }
 
@@ -578,9 +591,13 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     },
     // Messages are deep-copied through JSON (they are JSON-safe by construction - the template
     // renders them) so a caller mutating its message objects cannot corrupt a saved snapshot.
-    save: serialize(async (): Promise<ChatSnapshot | null> => {
+    save: serialize(async (opts?: { delta?: boolean }): Promise<ChatSnapshot | null> => {
       if (committed === null) return null
-      const eng = await engine.saveCache()
+      // delta: snapshot only the KV after the shared prewarmed prefix (restore into a chat freshly
+      // prewarmed with the same system messages + tools). Drops the redundant prefix per snapshot.
+      if (opts?.delta && prewarmLen <= 0)
+        throw new Error('bitgpu/chat: save({ delta: true }) needs a prewarm() first (no shared prefix to exclude)')
+      const eng = await engine.saveCache(opts?.delta ? { from: prewarmLen - 1 } : undefined)
       if (!eng) return null
       return {
         version: 1,
@@ -593,11 +610,16 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     restore: serialize(async (snap: ChatSnapshot): Promise<void> => {
       if (!snap || snap.version !== 1) throw new Error('bitgpu/chat: unsupported chat snapshot version')
       if (!Array.isArray(snap.committed) || snap.committed.length === 0) throw new Error('bitgpu/chat: chat snapshot holds no committed transcript')
-      await engine.restoreCache(snap.engine) // validates model + kvCache mode, throws on mismatch
+      // A DELTA snapshot (snap.engine.base) restores onto the current prewarm: engine.restoreCache
+      // validates the cache is exactly at that prefix (prewarm() the same system+tools first) and
+      // throws otherwise. Keep prewarmLen from that prewarm so a re-save stays a delta; a full
+      // snapshot replaces the whole cache, so there is no shared prefix afterward.
+      await engine.restoreCache(snap.engine) // validates model + kvCache mode + delta prefix
       resetEpoch++ // same hazard as reset(): a raced turn must not commit over the restored state
       committed = JSON.parse(JSON.stringify(snap.committed)) as ChatMessage[]
       committedToolsKey = snap.toolsKey ?? null
       cacheEndsAtEos = !!snap.cacheEndsAtEos
+      if (!snap.engine.base) prewarmLen = 0
     }),
     eosTokenId: tk.eosTokenId,
     tokenizer: tk,

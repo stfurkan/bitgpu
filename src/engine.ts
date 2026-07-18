@@ -2283,24 +2283,30 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const scRowBytes = kv8 ? KV * (Dh / 32) * 4 : 0 // one position of q8 block scales
   const snapshotBytes = (len: number): number => A.layers * 2 * len * (kvRowBytes + scRowBytes)
 
-  async function saveCache(): Promise<KvSnapshot | null> {
+  async function saveCache(opts?: { from?: number }): Promise<KvSnapshot | null> {
     if (fullHistory.length === 0) return null
     const len = roll ? cacheLen : fullHistory.length - 1 // rolled cache: slots, not history
-    const data = new ArrayBuffer(snapshotBytes(len))
-    if (len > 0) {
-      const rb = device.createBuffer({ size: snapshotBytes(len), usage: GPUBufferUsage.MAP_READ | CD })
+    // DELTA: exclude the first `base` cache positions (a shared prewarmed prefix). Each cache
+    // position is a whole, independent K/V row (q8 block scales included), so slicing at any
+    // position is byte-aligned. Not supported in sinks mode (positions no longer map to history).
+    const base = Math.max(0, Math.min(Math.floor(opts?.from ?? 0), len))
+    if (base > 0 && roll) throw new Error("saveCache: delta snapshots ({ from }) are not supported under overflow 'sinks'")
+    const count = len - base
+    const data = new ArrayBuffer(snapshotBytes(count))
+    if (count > 0) {
+      const rb = device.createBuffer({ size: snapshotBytes(count), usage: GPUBufferUsage.MAP_READ | CD })
       const enc = device.createCommandEncoder()
       let off = 0
       for (let li = 0; li < A.layers; li++) {
-        enc.copyBufferToBuffer(Kc[li], 0, rb, off, len * kvRowBytes)
-        off += len * kvRowBytes
-        enc.copyBufferToBuffer(Vc[li], 0, rb, off, len * kvRowBytes)
-        off += len * kvRowBytes
+        enc.copyBufferToBuffer(Kc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
+        off += count * kvRowBytes
+        enc.copyBufferToBuffer(Vc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
+        off += count * kvRowBytes
         if (kv8) {
-          enc.copyBufferToBuffer(Ksc[li], 0, rb, off, len * scRowBytes)
-          off += len * scRowBytes
-          enc.copyBufferToBuffer(Vsc[li], 0, rb, off, len * scRowBytes)
-          off += len * scRowBytes
+          enc.copyBufferToBuffer(Ksc[li], base * scRowBytes, rb, off, count * scRowBytes)
+          off += count * scRowBytes
+          enc.copyBufferToBuffer(Vsc[li], base * scRowBytes, rb, off, count * scRowBytes)
+          off += count * scRowBytes
         }
       }
       device.queue.submit([enc.finish()])
@@ -2314,6 +2320,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       kvCache: capabilities.kvCache,
       model: { layers: A.layers, kvHeads: KV, headDim: Dh, hidden: Hd, vocab: A.vocab },
       ids: [...fullHistory],
+      ...(base > 0 ? { base } : {}),
       ...(roll ? { roll: { sinkTokens: SINKS, cacheLen } } : {}),
       data,
     }
@@ -2336,22 +2343,37 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       throw new Error('restoreCache: snapshot is from a different model (architecture mismatch)')
     if (!Array.isArray(snap.ids) || snap.ids.length === 0) throw new Error('restoreCache: snapshot holds no tokens')
     const len = snap.version === 2 ? snap.roll!.cacheLen : snap.ids.length - 1
+    // DELTA restore: `data` holds only positions [base, len); [0, base) must already be present
+    // (a fresh prewarm of the same prefix). Splice the delta on top of it. base=0 = full restore.
+    const base = Math.max(0, Math.floor(snap.base ?? 0))
+    const count = len - base
     if (len + 1 > maxSeqLen)
       throw new Error(`restoreCache: snapshot needs ${len + 1} cache slots but maxSeqLen is ${maxSeqLen}`)
-    if (snap.data.byteLength !== snapshotBytes(len))
-      throw new Error(`restoreCache: snapshot data is ${snap.data.byteLength} bytes, expected ${snapshotBytes(len)}`)
+    if (snap.data.byteLength !== snapshotBytes(count))
+      throw new Error(`restoreCache: snapshot data is ${snap.data.byteLength} bytes, expected ${snapshotBytes(count)}`)
+    if (base > 0) {
+      // the cache must be exactly at the delta boundary with a matching token prefix (i.e. freshly
+      // prewarmed with the same shared prefix). Otherwise the spliced positions would not align.
+      if (cacheLen !== base)
+        throw new Error(`restoreCache: delta snapshot expects the cache at position ${base} (prewarm the shared prefix first); it is at ${cacheLen}`)
+      for (let i = 0; i < base; i++)
+        if (fullHistory[i] !== snap.ids[i])
+          throw new Error(`restoreCache: delta snapshot prefix does not match the current prewarm (token ${i})`)
+    }
     await ensureKvCapacity(len)
     let off = 0
     for (let li = 0; li < A.layers; li++) {
-      device.queue.writeBuffer(Kc[li], 0, snap.data, off, len * kvRowBytes)
-      off += len * kvRowBytes
-      device.queue.writeBuffer(Vc[li], 0, snap.data, off, len * kvRowBytes)
-      off += len * kvRowBytes
-      if (kv8) {
-        device.queue.writeBuffer(Ksc[li], 0, snap.data, off, len * scRowBytes)
-        off += len * scRowBytes
-        device.queue.writeBuffer(Vsc[li], 0, snap.data, off, len * scRowBytes)
-        off += len * scRowBytes
+      if (count > 0) {
+        device.queue.writeBuffer(Kc[li], base * kvRowBytes, snap.data, off, count * kvRowBytes)
+        off += count * kvRowBytes
+        device.queue.writeBuffer(Vc[li], base * kvRowBytes, snap.data, off, count * kvRowBytes)
+        off += count * kvRowBytes
+        if (kv8) {
+          device.queue.writeBuffer(Ksc[li], base * scRowBytes, snap.data, off, count * scRowBytes)
+          off += count * scRowBytes
+          device.queue.writeBuffer(Vsc[li], base * scRowBytes, snap.data, off, count * scRowBytes)
+          off += count * scRowBytes
+        }
       }
     }
     fullHistory = [...snap.ids]
