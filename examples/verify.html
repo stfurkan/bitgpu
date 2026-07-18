@@ -945,9 +945,40 @@
       out.insertAdjacentHTML('beforeend', `\n<span class="pass">ABTEST OK - ${MODEL_TAG}: ${verdict}  (best f32 ${f32min.toFixed(2)} / af16 ${afmin.toFixed(2)} ms/tok)</span>`);
     }
 
+    // ?prefill=1: prefill-throughput benchmark (best-of-N, uncontended) at several prompt lengths -
+    // is the agent-loop prefill (re-prefilling tool results) a bottleneck vs decode?
+    async function prefillbench() {
+      out.textContent = '';
+      const fp = await (await fetch(`${FIX}/params.json`)).json();
+      const base = fp.ids;
+      const engine = await createEngine({ modelUrl: MODEL_DIR });
+      const cap = engine.capabilities;
+      log(`prefill benchmark - ${MODEL_DIR} (${cap.useSubgroups ? 'SG=' + cap.subgroupSize : 'fallback'})\n`);
+      const mk = (n) => { const a = []; while (a.length < n) a.push(...base); return a.slice(0, n); };
+      const REP = 5;
+      for (const n of [64, 128, 256, 512, 800]) {
+        const prompt = mk(n);
+        let best = Infinity;
+        for (let i = 0; i < REP; i++) {
+          engine.resetCache();
+          const r = await engine.generate(prompt, { maxTokens: 1 }); // prefill + 1 tok
+          best = Math.min(best, r.prefillMs);
+        }
+        log(`  ${String(n).padStart(4)} tok: ${best.toFixed(0)} ms  (${(best / n).toFixed(2)} ms/tok, ${(1000 * n / best).toFixed(0)} tok/s prefill)`);
+      }
+      // decode ms/tok for reference (best-of-N steady state)
+      engine.resetCache();
+      let dbest = Infinity;
+      for (let i = 0; i < REP; i++) { const r = await engine.profileDecode(base, 24, null); dbest = Math.min(dbest, cap.timestampQuery ? r.tsMs : 1000 / r.tokPerSec); }
+      log(`\n  decode: ${dbest.toFixed(2)} ms/tok (reference)`);
+      engine.dispose();
+      out.insertAdjacentHTML('beforeend', `\n<span class="pass">PREFILLBENCH OK - ${MODEL_TAG}</span>`);
+    }
+
     const PROFILE = new URLSearchParams(location.search).get('profile') === '1';
     const ABTEST = new URLSearchParams(location.search).get('abtest') === '1';
-    document.getElementById('run').onclick = () => (ABTEST ? abtest() : PROFILE ? profile() : run()).catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
+    const PREFILL = new URLSearchParams(location.search).get('prefill') === '1';
+    document.getElementById('run').onclick = () => (PREFILL ? prefillbench() : ABTEST ? abtest() : PROFILE ? profile() : run()).catch(e => log('ERROR: ' + e.message + '\n' + e.stack));
   </script>
 </body>
 </html>
