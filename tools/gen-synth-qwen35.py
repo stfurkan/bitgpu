@@ -25,15 +25,15 @@ os.makedirs(OUT, exist_ok=True)
 np.random.seed(1)
 
 # --- tiny config (mirrors the 27B structure; value_heads=2*key_heads for the GQA-repeat path) ---
-HID = 128
+HID = 256
 LAYERS = 4
 INTERVAL = 4                 # full attention at layer 3
-INTER = 256
-NH, NKV, HDIM = 4, 2, 64     # full attention (q_proj doubled -> 2*NH*HDIM)
-ROT = 32                     # partial rotary (of HDIM=64)
-NK, NV, SDIM = 2, 4, 64      # linear: key/value heads, shared head dim (rep = NV/NK = 2)
+INTER = 512
+NH, NKV, HDIM = 4, 2, 256    # HDIM=256 like the 27B (exercises the head_dim-256 attention path)
+ROT = 64                     # partial rotary (of HDIM=256), like the 27B
+NK, NV, SDIM = 16, 48, 128   # 16 key / 48 value heads (rep=3), shared head dim 128 - the 27B's linear dims
 CONVK = 4
-VOCAB = 128
+VOCAB = 256
 EPS = 1e-6
 THETA = 1e6
 KEYDIM, VALDIM = SDIM * NK, SDIM * NV
@@ -82,6 +82,13 @@ def add_f32(name, arr, shape):
     tensors[name] = {"kind": "f32", "weight": {"dtype": "FLOAT", "shape": shape, "src": "data", "off": off, "len": len(b)}}
     return np.asarray(arr, np.float32)
 
+def add_norm(name, raw, shape):
+    """Plain RMSNorm weight. The 1-bit GGUF ships qwen3.5's (1+w) norms with the +1 ALREADY baked,
+    and the engine multiplies by the stored weight directly - so the data file carries (1+raw). The
+    numpy golden gets the raw (0-centred) weight, since qwen35_numpy.rmsnorm re-applies (1+w)."""
+    add_f32(name, 1.0 + np.asarray(raw, np.float32), shape)
+    return np.asarray(raw, np.float32)
+
 # --- build weights (append in a fixed order = data-file layout) ---
 W = {"layers": []}
 W["embed"] = add_q1("embed_tokens", VOCAB, HID)   # embed as q4? engine uses embed_tokens kind q4; keep q1_0 recipe
@@ -90,9 +97,9 @@ for li in range(LAYERS):
     full = li % INTERVAL == INTERVAL - 1
     layer_types.append("full" if full else "linear")
     d = {"type": "full_attention" if full else "linear_attention"}
-    # plain norms are stored RAW here; the engine bakes +1 at load and qwen35_numpy applies (1+w).
-    d["in_ln"] = add_f32(f"layers.{li}.input_layernorm", np.random.randn(HID) * 0.1, [HID])
-    d["post_ln"] = add_f32(f"layers.{li}.post_attention_layernorm", np.random.randn(HID) * 0.1, [HID])
+    # plain norms: data file carries (1+w) baked (real-GGUF convention); golden gets raw. See add_norm.
+    d["in_ln"] = add_norm(f"layers.{li}.input_layernorm", np.random.randn(HID) * 0.1, [HID])
+    d["post_ln"] = add_norm(f"layers.{li}.post_attention_layernorm", np.random.randn(HID) * 0.1, [HID])
     d["gate"] = add_q1(f"layers.{li}.mlp.gate_proj", INTER, HID)
     d["up"] = add_q1(f"layers.{li}.mlp.up_proj", INTER, HID)
     d["down"] = add_q1(f"layers.{li}.mlp.down_proj", HID, INTER)
@@ -101,8 +108,8 @@ for li in range(LAYERS):
         d["k"] = add_q1(f"layers.{li}.attn.k_proj", NKV * HDIM, HID)
         d["v"] = add_q1(f"layers.{li}.attn.v_proj", NKV * HDIM, HID)
         d["o"] = add_q1(f"layers.{li}.attn.o_proj", HID, NH * HDIM)
-        d["qn"] = add_f32(f"layers.{li}.attn.q_norm", np.random.randn(HDIM) * 0.1, [HDIM])
-        d["kn"] = add_f32(f"layers.{li}.attn.k_norm", np.random.randn(HDIM) * 0.1, [HDIM])
+        d["qn"] = add_norm(f"layers.{li}.attn.q_norm", np.random.randn(HDIM) * 0.1, [HDIM])
+        d["kn"] = add_norm(f"layers.{li}.attn.k_norm", np.random.randn(HDIM) * 0.1, [HDIM])
     else:
         d["qkv"] = add_q1(f"layers.{li}.linear.in_qkv", KEYDIM * 2 + VALDIM, HID)
         d["z"] = add_q1(f"layers.{li}.linear.z", VALDIM, HID)
@@ -117,7 +124,7 @@ for li in range(LAYERS):
         d["gn"] = add_f32(f"layers.{li}.linear.norm", np.random.randn(SDIM) * 0.1, [SDIM])
         d["out"] = add_q1(f"layers.{li}.linear.out_proj", HID, VALDIM)
     W["layers"].append(d)
-W["final_norm"] = add_f32(f"layers.{LAYERS}.final_norm_layernorm", np.random.randn(HID) * 0.1, [HID])
+W["final_norm"] = add_norm(f"layers.{LAYERS}.final_norm_layernorm", np.random.randn(HID) * 0.1, [HID])
 W["lm_head"] = add_q1("lm_head", VOCAB, HID)
 tensors["embed_tokens"]["kind"] = "q4"; tensors["embed_tokens"]["bits"] = 4; tensors["embed_tokens"]["lut"] = "tgt4"
 tensors["embed_tokens"]["rows"] = VOCAB; tensors["embed_tokens"]["cols"] = HID
@@ -153,7 +160,9 @@ json.dump(manifest, open(os.path.join(OUT, "manifest.json"), "w"), indent=1)
 C = qn.Qwen35Cfg(hidden=HID, n_layers=LAYERS, eps=EPS, n_heads=NH, n_kv_heads=NKV, head_dim=HDIM,
                  rot_dim=ROT, rope_theta=THETA, n_k_heads=NK, n_v_heads=NV, k_dim=SDIM, v_dim=SDIM, conv_kernel=CONVK)
 ids = np.array([3, 7, 11, 42, 5, 99, 1, 60, 33, 88], np.int32) % VOCAB
-ck = qn.forward(W, C, ids, delta="recurrent")
+# repeat="tile": the engine (and the real GGUF) group value heads [rep, n_key_heads], so value head
+# h reads key/query head h%n_key ("tile"), not h//rep ("interleave", the HF-weight layout).
+ck = qn.forward(W, C, ids, delta="recurrent", repeat="tile")
 os.makedirs(os.path.join(OUT, "..", "..", "test-fixtures", "forward-synth-qwen35"), exist_ok=True)
 fx = os.path.abspath(os.path.join(OUT, "..", "..", "test-fixtures", "forward-synth-qwen35"))
 os.makedirs(fx, exist_ok=True)

@@ -460,7 +460,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache (f32/f16; q8 branches)
   if (A.hybrid) {
     // qwen3_5 hybrid backbone kernels (gated DeltaNet linear layers + gated full attention).
-    for (const n of ['conv1d_causal', 'deltanet_gbeta', 'rope_partial', 'add1', 'slice_cols', 'split_head', 'gate_sigmoid']) specs.push([n])
+    for (const n of ['conv1d_causal', 'deltanet_gbeta', 'rope_partial', 'slice_cols', 'split_head', 'gate_sigmoid']) specs.push([n])
     specs.push(['deltanet_recur', { WGV: A.hybrid.linear_head_dim }])
     specs.push(['deltanet_norm_gate', { WG: 64 }])
     specs.push(['attention_online', { WGD: A.head_dim }])
@@ -2547,33 +2547,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
-  if (manifest.arch.hybrid) {
-    // Bake (1 + weight) into the plain RMSNorm weights (qwen3_5 stores them 0-centred) so the
-    // existing weight-multiply RMSNorm kernels reproduce the model; the gated DeltaNet norm and the
-    // conv/decay params keep their raw values. One-time, at load, before any generate/forward.
-    const enc = device.createCommandEncoder()
-    const p = enc.beginComputePass()
-    p.setPipeline(pipelines.add1)
-    const bake = (nm: string, n: number): void => {
-      const b = W[nm]?.buf
-      if (!b) return
-      const uni = device.createBuffer({ size: 16, usage: U | CD })
-      device.queue.writeBuffer(uni, 0, makeParams([['u', n], ['u', 0], ['u', 0], ['u', 0]]) as BufferSource)
-      p.setBindGroup(0, device.createBindGroup({ layout: pipelines.add1.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: b } }] }))
-      p.dispatchWorkgroups(Math.ceil(n / 64))
-    }
-    for (let li = 0; li < A.layers; li++) {
-      bake(`layers.${li}.input_layernorm`, Hd)
-      bake(`layers.${li}.post_attention_layernorm`, Hd)
-      if (manifest.arch.hybrid.layer_types[li] === 'full') {
-        bake(`layers.${li}.attn.q_norm`, Dh)
-        bake(`layers.${li}.attn.k_norm`, Dh)
-      }
-    }
-    bake(FINAL_NORM, Hd)
-    p.end()
-    device.queue.submit([enc.finish()])
-  }
+  // qwen3_5 plain RMSNorm is (1 + weight), but the 1-bit GGUF ships those five norm types
+  // (input/post_attention/q/k/final) with the +1 ALREADY baked in - verified against the real
+  // Bonsai-27B: gguf_norm - hf_raw == 1.0 exactly, tensor-wide. So the weight-multiply RMSNorm
+  // kernels reproduce the model as-is; no load-time bake. (The gated DeltaNet norm ships raw.)
 
   const api: EngineInternal = {
     generate: serialize(generate),

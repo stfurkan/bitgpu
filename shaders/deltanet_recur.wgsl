@@ -3,7 +3,9 @@
 // column dv of the per-head state S[dk,dv], held in registers across the token loop. Per token:
 //   S *= exp(g);  kv = Kn·S;  delta = (v - kv)·beta;  S += Kn⊗delta;  out = Qn·S
 // with Kn = l2norm(k), Qn = l2norm(q)/sqrt(dk) (matches tools/qwen35_numpy._delta_recurrent).
-// GQA: value head h reads q/k from key head h/(H/HK). loadState!=0 continues from state_in
+// GQA: value head h reads q/k from key head h%HK. GGUF/bitgpu store value heads grouped
+// [rep, n_key_heads] (transposed from HF's [n_key_heads, rep]), so the shared key/query head is
+// h%HK (a "tile"), NOT h/(H/HK) (a "repeat-interleave"). loadState!=0 continues from state_in
 // (persistent decode/cross-segment state); state_out always carries the final state out.
 override WGV: u32 = 128u;                 // threads per workgroup == head_v_dim (dv)
 struct Params { S: u32, H: u32, DK: u32, DV: u32, HK: u32, betaOff: u32, loadState: u32, _p2: u32 };
@@ -22,7 +24,7 @@ var<workgroup> qsh: array<f32, 128>;      // current token's raw q
 @compute @workgroup_size(WGV)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let h = wg.x;                           // value head
-  let hk = h / (p.H / p.HK);              // GQA: shared key/query head (repeat-interleave)
+  let hk = h % p.HK;                      // GQA: shared key/query head (GGUF [rep,n_key] tile order)
   let dv = lid.x;
   let DK = p.DK;
   let sbase = h * DK * p.DV + dv;         // state column S[:, dv] of head h, stride DV

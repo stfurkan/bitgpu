@@ -1,7 +1,7 @@
 {
  "S": 10,
- "hidden": 128,
- "vocab": 128,
+ "hidden": 256,
+ "vocab": 256,
  "ids": [
   3,
   7,
@@ -14,5 +14,5 @@
   33,
   88
  ],
- "argmax_last": 35
+ "argmax_last": 131
 }

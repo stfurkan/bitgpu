@@ -187,7 +187,7 @@ def _delta_chunk(q, k, v, g, beta, C: Qwen35Cfg, chunk=64):
     return np.transpose(o, (1, 0, 2)).astype(np.float32)
 
 
-def _linear_attention(x, d, C: Qwen35Cfg, delta):
+def _linear_attention(x, d, C: Qwen35Cfg, delta, repeat="interleave"):
     S = x.shape[0]
     KDIM, VDIM = C.key_dim, C.value_dim
     mixed = _conv1d_causal(x @ d["qkv"].T, d["conv"], S)
@@ -199,7 +199,13 @@ def _linear_attention(x, d, C: Qwen35Cfg, delta):
     g = (d["Alog"].astype(np.float32) * _softplus((x @ d["pa"].T) + d["dt"])).astype(f32)  # Alog = -exp(A_log)
     if C.n_v_heads // C.n_k_heads > 1:
         rep = C.n_v_heads // C.n_k_heads
-        q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)
+        # HF stores value heads grouped [n_k_heads, rep] -> value head h pairs with key head h//rep
+        # ("interleave"). GGUF/bitgpu store them transposed [rep, n_k_heads] -> h pairs with h%n_k
+        # ("tile"): value head h reads key/query head (h % n_k_heads) with NO weight permutation.
+        if repeat == "tile":
+            q, k = np.tile(q, (1, rep, 1)), np.tile(k, (1, rep, 1))
+        else:
+            q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)
     core = (_delta_chunk if delta == "chunk" else _delta_recurrent)(q, k, v, g, beta, C)
     core = core.reshape(-1, C.v_dim)
     zf = z.reshape(-1, C.v_dim)
@@ -207,8 +213,10 @@ def _linear_attention(x, d, C: Qwen35Cfg, delta):
     return normed.reshape(S, VDIM) @ d["out"].T
 
 
-def forward(W, C: Qwen35Cfg, ids, delta="chunk"):
-    """Full text forward. W: {'embed','final_norm','lm_head','layers':[...]}. Returns per-stage dict."""
+def forward(W, C: Qwen35Cfg, ids, delta="chunk", repeat="interleave"):
+    """Full text forward. W: {'embed','final_norm','lm_head','layers':[...]}. Returns per-stage dict.
+    repeat: q/k-vs-value head pairing - "interleave" for HF-layout weights (golden-qwen35, Modal),
+    "tile" for GGUF/bitgpu-layout weights (gen-synth, the engine); see _linear_attention."""
     ids = np.asarray(ids, np.int64)
     S = len(ids)
     cos, sin = _rope_tables(C, S)
@@ -217,7 +225,7 @@ def forward(W, C: Qwen35Cfg, ids, delta="chunk"):
     for d in W["layers"]:
         res = h
         x = rmsnorm(h, d["in_ln"], C.eps)
-        mix = _full_attention(x, d, C, cos, sin) if d["type"] == "full_attention" else _linear_attention(x, d, C, delta)
+        mix = _full_attention(x, d, C, cos, sin) if d["type"] == "full_attention" else _linear_attention(x, d, C, delta, repeat)
         h = res + mix
         res = h
         x = rmsnorm(h, d["post_ln"], C.eps)
