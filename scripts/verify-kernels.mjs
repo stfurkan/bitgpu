@@ -22,7 +22,7 @@ const paramBytes = (fields) => {
 }
 
 // runs entirely in the page (WebGPU context)
-const runKernel = async ({ src, pbytes, inputs, outLen, dispatch, overrides }) => {
+const runKernel = async ({ src, pbytes, inputs, outLen, outLen2, dispatch, overrides }) => {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
   if (!adapter) return { err: 'no adapter' }
   const device = await adapter.requestDevice()
@@ -51,6 +51,8 @@ const runKernel = async ({ src, pbytes, inputs, outLen, dispatch, overrides }) =
   const entries = [{ binding: 0, resource: { buffer: pbuf } }]
   ibufs.forEach((b, i) => entries.push({ binding: i + 1, resource: { buffer: b } }))
   entries.push({ binding: ibufs.length + 1, resource: { buffer: obuf } })
+  // optional secondary output (e.g. the DeltaNet state); bound but not compared
+  if (outLen2) entries.push({ binding: ibufs.length + 2, resource: { buffer: device.createBuffer({ size: outLen2 * 4, usage: U.STORAGE }) } })
   const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries })
   const enc = device.createCommandEncoder()
   const pass = enc.beginComputePass()
@@ -90,7 +92,7 @@ try {
     const c = JSON.parse(readFileSync(join(casesDir, f), 'utf8'))
     const src = readFileSync(join(REPO, 'shaders', c.shader), 'utf8')
     const { out, err } = await page.evaluate(runKernel, {
-      src, pbytes: paramBytes(c.params), inputs: c.inputs, outLen: c.outLen, dispatch: c.dispatch, overrides: c.overrides,
+      src, pbytes: paramBytes(c.params), inputs: c.inputs, outLen: c.outLen, outLen2: c.outLen2, dispatch: c.dispatch, overrides: c.overrides,
     })
     if (err || !out) { console.log(`  [FAIL] ${c.name}: ${err}`); fails++; continue }
     let mad = 0, dot = 0, na = 0, nb = 0

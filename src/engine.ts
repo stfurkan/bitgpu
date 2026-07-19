@@ -1310,7 +1310,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const gb = actBuf(2 * S * NV) // [g (S*NV) ; beta (S*NV)]
       run(pass, 'deltanet_gbeta', [['u', S], ['u', NV], ['u', 0], ['u', 0]], [a, b, w('linear.A_log').buf!, w('linear.dt_bias').buf!], gb, S * NV)
       const core = actBuf(S * VALDIM)
-      runN(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', 0], ['u', 0]], [q, k, v, gb, gb], core, NV)
+      const stSz = NV * DKV * DKV
+      const stIn = actBuf(stSz),
+        stOut = actBuf(stSz) // prefill: loadState=0 (zero init), final state discarded (persistent decode state is stage 3c)
+      setup(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', 0], ['u', 0]], [q, k, v, gb, gb, stIn], [core, stOut])
+      pass.dispatchWorkgroups(NV)
       const z = actBuf(S * VALDIM)
       fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2])
       const normed = actBuf(S * VALDIM)

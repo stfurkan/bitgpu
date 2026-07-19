@@ -22,17 +22,20 @@ np.random.seed(0)
 WG = 64
 
 
-def dump(name, shader, params, inputs, expected, out_len, overrides=None, dispatch=None):
+def dump(name, shader, params, inputs, expected, out_len, overrides=None, dispatch=None, out_len2=None):
     if dispatch is None:
         nwg = (out_len + WG - 1) // WG
         gx = min(nwg, 65535)
         dispatch = [gx, (nwg + gx - 1) // gx]
-    json.dump({
+    case = {
         "name": name, "shader": shader, "params": params,
         "inputs": [np.asarray(a, np.float32).ravel().tolist() for a in inputs],
         "expected": np.asarray(expected, np.float32).ravel().tolist(),
         "outLen": int(out_len), "dispatch": dispatch, "overrides": overrides or {},
-    }, open(os.path.join(OUT, f"{name}.json"), "w"))
+    }
+    if out_len2:
+        case["outLen2"] = int(out_len2)
+    json.dump(case, open(os.path.join(OUT, f"{name}.json"), "w"))
     print(f"wrote {name}: outLen={out_len} dispatch={dispatch}")
 
 
@@ -56,10 +59,12 @@ va = np.random.randn(S2, H2, DV).astype(np.float32)    # v has H (value) heads
 ga = (-np.abs(np.random.randn(S2, H2)) * 0.5).astype(np.float32)
 ba = (1.0 / (1.0 + np.exp(-np.random.randn(S2, H2)))).astype(np.float32)
 rep = H2 // HK2
+statein = np.zeros(H2 * DK * DV, np.float32)   # loadState=0: state starts at zero
 exp_dn = q._delta_recurrent(np.repeat(qa, rep, 1), np.repeat(ka, rep, 1), va, ga, ba, cfg(DK, DV))
 dump("deltanet_recur", "deltanet_recur.wgsl",
      [["u", S2], ["u", H2], ["u", DK], ["u", DV], ["u", HK2], ["u", 0], ["u", 0], ["u", 0]],
-     [qa, ka, va, ga, ba], exp_dn, S2 * H2 * DV, overrides={"WGV": DV}, dispatch=[H2, 1])
+     [qa, ka, va, ga, ba, statein], exp_dn, S2 * H2 * DV, overrides={"WGV": DV}, dispatch=[H2, 1],
+     out_len2=H2 * DK * DV)
 
 # gated RMSNorm: gamma * rmsnorm(core) * silu(z)
 rows, DVn = 32, 128
