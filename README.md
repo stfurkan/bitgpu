@@ -5,7 +5,10 @@ A fast, dependency-free WebGPU runtime for **low-bit LLMs** in the browser.
 Today it runs **1-bit (binary-weight)** models.
 Reference targets are Bonsai **1.7B, 4B and 8B** (Qwen3 architecture, sign-packed binary linear
 weights + 2/4-bit embeddings, tied or untied lm_head) - every size is gated bit-exact against the
-reference forward on real hardware. GPU-resident decode (greedy or sampled), streaming, EOS stop,
+reference forward on real hardware - plus **Bonsai-27B** (Qwen3.5 *hybrid* backbone: a 3:1 mix of
+gated-DeltaNet linear attention and gated full attention), validated to matching greedy tokens and
+logits tolerance against transformers (its linear-attention recurrence keeps no fp64 path, so the
+bar is greedy-exact rather than bit-exact). GPU-resident decode (greedy or sampled), streaming, EOS stop,
 `AbortSignal`, cross-turn KV-cache reuse, optional f16/q8 KV-cache compression for long
 contexts in less VRAM, conversation snapshots (save/restore across page reloads), and an
 optional rolling window with attention sinks for unbounded chats in fixed memory. Runs the
@@ -50,7 +53,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.14.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.15.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -355,6 +358,15 @@ const engine = await createEngine({
 })
 ```
 
+The Qwen3.5 hybrid **Bonsai-27B** loads exactly the same way - `fromGguf` is its only path (there is
+no offline converter for the hybrid yet), so point at
+`prism-ml/Bonsai-27B-gguf/resolve/main/Bonsai-27B-Q1_0.gguf` with `kvCache: 'q8'` and, say,
+`maxSeqLen: 4096`. bitgpu runs its **text trunk** (the model is multimodal; the vision path is out of
+scope, and its chat template is not wired into `bitgpu/chat` yet - drive it at the `forward` /
+`generate` token-id level, or supply your own template). It is a ~3.8 GB download and comfortably
+wants a 16 GB (or larger) GPU budget - on an 8 GB laptop it runs but the weights spill to swap, so
+decode is slow.
+
 The in-browser parse is gated: it must deep-equal the offline converter's manifest AND an
 engine built from it must reproduce the known-good greedy ids bit-exactly on GPU. Prefer the
 committed [`models/`](models/) manifests when one exists (a `manifest.json` is smaller than a
@@ -386,12 +398,15 @@ createEngine({
 Compatibility envelope: Qwen3-family models quantized with the 1-bit recipe (silu/SwiGLU,
 head_dim <= 128, 128-wide scale blocks, tied or untied lm_head), in either container: GGUFs
 with PrismML's Q1_0 tensor type (the primary path), or ONNX exports with the onnx-community
-"q1" recipe - the engine validates the manifest loudly at load. The two containers carry
+"q1" recipe - the engine validates the manifest loudly at load. The Qwen3.5 **hybrid** backbone
+(Bonsai-27B: a 3:1 mix of gated-DeltaNet linear attention and gated full attention, head_dim 256,
+partial RoPE) is also supported, GGUF-only, under the same 1-bit recipe. The two containers carry
 bit-identical weights for the Bonsai releases (verified sign-bit-for-sign-bit on 8B), so pick
 by hosting preference.
 Reference exports: [prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) /
 [4B](https://huggingface.co/prism-ml/Bonsai-4B-gguf) /
-[8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) (`Bonsai-*-Q1_0.gguf`), and
+[8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) /
+[27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf) (`Bonsai-*-Q1_0.gguf`; the 27B is the Qwen3.5 hybrid, GGUF-only), and
 [onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX) /
 [4B](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) /
 [8B](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) (`onnx/model_q1.onnx` + data file). Format spec:
