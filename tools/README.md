@@ -50,6 +50,27 @@ GGUF repos usually carry no `tokenizer.json`; take it from the model's source re
 (the chat layer needs `tokenizer.json` + `tokenizer_config.json` next to the manifest, or
 explicit URLs).
 
+## Hybrid Qwen3.5 (`qwen3_5`) models
+
+The Bonsai-27B family is the hybrid `qwen3_5` arch (3:1 gated-DeltaNet linear attention +
+gated full attention). ONNX Runtime cannot express the gated delta rule, so the oracle here is
+HF transformers itself. `tools/qwen35_numpy.py` is a clean-room numpy forward of the whole
+backbone (the reference the WGSL kernels must match); `tools/golden-qwen35.py` runs the HF model
+deterministically (fp32, CPU, pure-PyTorch DeltaNet fallback - do NOT install
+flash-linear-attention/causal-conv1d) and validates the numpy math layer-by-layer against it.
+
+```sh
+pip install "transformers>=5.14" torch safetensors      # heavy, dev-only oracle
+
+# validate the clean-room math against HF on the small architectural twin (both delta paths)
+python tools/golden-qwen35.py --delta chunk        # chunk-parallel scan == HF prefill
+python tools/golden-qwen35.py --delta recurrent    # sequential scan == bitgpu decode
+```
+
+`Qwen/Qwen3.5-0.8B` is the small twin of the 1-bit Bonsai-27B (same arch, 24 layers) - it
+runs on a laptop and is the fast dev/validation target. The 1-bit fixtures for the actual 27B
+are produced from its manifest with the same numpy math (dequantized weights in, golden out).
+
 ## Gating a converted model
 
 After the dump, point `examples/model-<tag>` at the work dir (the reference Bonsai-1.7B is tag

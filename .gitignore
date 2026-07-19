@@ -3,3 +3,5 @@ node_modules
 src/shaders.generated.ts
 examples/model-*
 examples/staged-*
+__pycache__
+*.pyc
