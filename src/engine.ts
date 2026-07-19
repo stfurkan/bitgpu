@@ -105,8 +105,8 @@ const eqBytes = (a: Uint8Array, b: Uint8Array): boolean => {
  *  baked caches (v2/GGUF). Plain rope or YaRN (transformers formula: beta_fast 32, beta_slow 1,
  *  mscale = 0.1*ln(factor)+1). Angles accumulate in f64 and round once to f32 per entry -
  *  tools/reference.py implements the identical recipe for fixture generation. */
-function synthRope(A: { head_dim: number; rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number } }, positions: number): [Float32Array, Float32Array] {
-  const half = A.head_dim / 2
+function synthRope(A: { head_dim: number; rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number } }, positions: number, rotaryDim = A.head_dim): [Float32Array, Float32Array] {
+  const half = rotaryDim / 2
   const rope = A.rope!
   const base = rope.rope_theta
   const factor = rope.rope_type === 'yarn' ? (rope.factor ?? 1) : 1
@@ -114,10 +114,10 @@ function synthRope(A: { head_dim: number; rope?: { rope_theta: number; rope_type
   // YaRN ramp bounds (only used when factor > 1): dims below lo keep the original
   // frequencies (extrapolation), dims above hi interpolate by 1/factor, between them blends.
   const orig = rope.original_max_position_embeddings ?? 0
-  const lo = factor === 1 ? 0 : Math.max(0, Math.floor((A.head_dim * Math.log(orig / (32 * 2 * Math.PI))) / (2 * Math.log(base))))
-  const hi = factor === 1 ? 0 : Math.min(half - 1, Math.ceil((A.head_dim * Math.log(orig / (2 * Math.PI))) / (2 * Math.log(base))))
+  const lo = factor === 1 ? 0 : Math.max(0, Math.floor((rotaryDim * Math.log(orig / (32 * 2 * Math.PI))) / (2 * Math.log(base))))
+  const hi = factor === 1 ? 0 : Math.min(half - 1, Math.ceil((rotaryDim * Math.log(orig / (2 * Math.PI))) / (2 * Math.log(base))))
   for (let j = 0; j < half; j++) {
-    const pf = base ** ((2 * j) / A.head_dim)
+    const pf = base ** ((2 * j) / rotaryDim)
     if (factor === 1) {
       inv[j] = 1 / pf
       continue
@@ -218,7 +218,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // assumes silu activation, head_dim <= 128 (per-thread register arrays), and 128-wide scale blocks.
   const FINAL_NORM = `layers.${A.layers}.final_norm_layernorm`
   if (A.act !== 'silu') throw new Error(`bitgpu: unsupported activation '${A.act}' (kernels implement silu/SwiGLU)`)
-  if (A.head_dim > 128) throw new Error(`bitgpu: unsupported head_dim ${A.head_dim} (kernels assume <= 128)`)
+  // Dense models use the register-array attention kernels (head_dim <= 128); the qwen3_5 hybrid
+  // uses the online-softmax attention kernel, which streams keys and allows head_dim up to 256.
+  if (A.head_dim > (A.hybrid ? 256 : 128)) throw new Error(`bitgpu: unsupported head_dim ${A.head_dim}`)
+  // Rotary dims actually rotated: full head_dim for dense qwen3, the partial rotary_dim for hybrid.
+  const ROPE_D = A.hybrid?.rotary_dim ?? A.head_dim
   if (A.heads % A.kv_heads !== 0) throw new Error(`bitgpu: heads ${A.heads} not divisible by kv_heads ${A.kv_heads} (GQA kernels assume an integer group size)`)
   if (!T[FINAL_NORM]) throw new Error(`bitgpu: manifest is missing the final norm tensor '${FINAL_NORM}'`)
   if (manifest.version !== undefined && manifest.version !== 1 && manifest.version !== 2)
@@ -326,12 +330,21 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
   const fusedLen = (names: string[], f: 'weight' | 'scales'): number => names.reduce((n, nm) => n + T[nm][f]!.len, 0)
   for (let li = 0; li < A.layers; li++) {
-    const groups = [
-      [`layers.${li}.attn.q_proj`, `layers.${li}.attn.k_proj`, `layers.${li}.attn.v_proj`],
-      [`layers.${li}.mlp.gate_proj`, `layers.${li}.mlp.up_proj`],
-      [`layers.${li}.attn.o_proj`],
-      [`layers.${li}.mlp.down_proj`],
-    ]
+    let groups: string[][]
+    if (A.hybrid) {
+      // hybrid: no fusion; each projection is its own binding. Roles differ per layer type.
+      const roles = A.hybrid.layer_types[li] === 'full'
+        ? ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj']
+        : ['linear.in_qkv', 'linear.z', 'linear.a', 'linear.b', 'linear.out_proj']
+      groups = [...roles, 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj'].map((s) => [`layers.${li}.${s}`])
+    } else {
+      groups = [
+        [`layers.${li}.attn.q_proj`, `layers.${li}.attn.k_proj`, `layers.${li}.attn.v_proj`],
+        [`layers.${li}.mlp.gate_proj`, `layers.${li}.mlp.up_proj`],
+        [`layers.${li}.attn.o_proj`],
+        [`layers.${li}.mlp.down_proj`],
+      ]
+    }
     for (const g of groups) {
       track(fusedLen(g, 'weight'))
       track(fusedLen(g, 'scales'))
@@ -443,6 +456,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     : useSG ? 'attention_sg' : 'attention_wg'
   const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache (f32/f16; q8 branches)
   const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache (f32/f16; q8 branches)
+  if (A.hybrid) {
+    // qwen3_5 hybrid backbone kernels (gated DeltaNet linear layers + gated full attention).
+    for (const n of ['conv1d_causal', 'deltanet_gbeta', 'rope_partial', 'add1', 'slice_cols', 'split_head', 'gate_sigmoid']) specs.push([n])
+    specs.push(['deltanet_recur', { WGV: A.hybrid.linear_head_dim }])
+    specs.push(['deltanet_norm_gate', { WG: 64 }])
+    specs.push(['attention_online', { WGD: A.head_dim }])
+  }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
   const S_ = GPUBufferUsage.STORAGE,
@@ -540,6 +560,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     return b
   }
   const dummy = device.createBuffer({ size: 16, usage: S_ })
+  // second unused-output sink for hybrid single-output matmuls: fusedMM binds 3 outputs, and two
+  // writable storage bindings may not alias the same buffer, so slots 1 and 2 need distinct sinks.
+  const dummy2 = device.createBuffer({ size: 16, usage: S_ })
 
   // Cross-turn state. fullHistory is the entire conversation's token sequence (prompt turns + replies),
   // needed because the sampler's repetition_penalty / no_repeat_ngram see the FULL sequence (like
@@ -758,17 +781,33 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
     return { sign, scales }
   }
-  for (let li = 0; li < A.layers; li++) {
-    const q = T[`layers.${li}.attn.q_proj`],
-      k = T[`layers.${li}.attn.k_proj`],
-      v = T[`layers.${li}.attn.v_proj`]
-    W[`layers.${li}.attn.qkv`] = { K: q.K!, nb: q.K! / 128, N0: q.N!, N1: k.N!, N2: v.N!, ...fuse([q, k, v]) }
-    const g = T[`layers.${li}.mlp.gate_proj`],
-      u = T[`layers.${li}.mlp.up_proj`]
-    W[`layers.${li}.mlp.gateup`] = { K: g.K!, nb: g.K! / 128, N0: g.N!, N1: u.N!, N2: 0, ...fuse([g, u]) }
-    for (const nm of [`layers.${li}.attn.o_proj`, `layers.${li}.mlp.down_proj`]) {
+  if (manifest.arch.hybrid) {
+    // Hybrid backbone: no q/k/v or gate/up fusion (the layers differ per type and the linear layer
+    // already ships a fused in_qkv). Each projection is an individual GEMV; N0=N lets fusedMM (with
+    // dummy sinks) run it, while N lets residMM fold the residual for out/o_proj.
+    const bin = (nm: string): void => {
       const r = T[nm]
-      W[nm] = { N: r.N!, K: r.K!, nb: r.K! / 128, ...fuse([r]) }
+      W[nm] = { N: r.N!, K: r.K!, nb: r.K! / 128, N0: r.N!, N1: 0, N2: 0, ...fuse([r]) }
+    }
+    for (let li = 0; li < A.layers; li++) {
+      for (const s of ['mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']) bin(`layers.${li}.${s}`)
+      if (manifest.arch.hybrid.layer_types[li] === 'full')
+        for (const s of ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj']) bin(`layers.${li}.${s}`)
+      else for (const s of ['linear.in_qkv', 'linear.z', 'linear.a', 'linear.b', 'linear.out_proj']) bin(`layers.${li}.${s}`)
+    }
+  } else {
+    for (let li = 0; li < A.layers; li++) {
+      const q = T[`layers.${li}.attn.q_proj`],
+        k = T[`layers.${li}.attn.k_proj`],
+        v = T[`layers.${li}.attn.v_proj`]
+      W[`layers.${li}.attn.qkv`] = { K: q.K!, nb: q.K! / 128, N0: q.N!, N1: k.N!, N2: v.N!, ...fuse([q, k, v]) }
+      const g = T[`layers.${li}.mlp.gate_proj`],
+        u = T[`layers.${li}.mlp.up_proj`]
+      W[`layers.${li}.mlp.gateup`] = { K: g.K!, nb: g.K! / 128, N0: g.N!, N1: u.N!, N2: 0, ...fuse([g, u]) }
+      for (const nm of [`layers.${li}.attn.o_proj`, `layers.${li}.mlp.down_proj`]) {
+        const r = T[nm]
+        W[nm] = { N: r.N!, K: r.K!, nb: r.K! / 128, ...fuse([r]) }
+      }
     }
   }
 
@@ -810,7 +849,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     sinCache = new Float32Array(sinBytes.buffer)
     // The caches are baked per export ([positions, head_dim/2]); positions beyond them would read
     // undefined -> NaN into every rope buffer, silent garbage. Cap maxSeqLen at load, loudly.
-    const ropePositions = cosCache.length / (A.head_dim / 2)
+    const ropePositions = cosCache.length / (ROPE_D / 2)
     if (maxSeqLen > ropePositions)
       throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's baked RoPE cache (${ropePositions} positions); lower maxSeqLen or re-export with a longer cache`)
   } else {
@@ -820,7 +859,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const cap = A.max_positions ?? 40960
     if (maxSeqLen > cap)
       throw new Error(`bitgpu: maxSeqLen ${maxSeqLen} exceeds the model's max_positions (${cap})`)
-    ;[cosCache, sinCache] = synthRope(A, maxSeqLen)
+    ;[cosCache, sinCache] = synthRope(A, maxSeqLen, ROPE_D)
   }
 
   // ONE sequential pass of the data file through the routes. Tied tensors (e.g. lm_head sharing
@@ -904,7 +943,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     return out
   }
   function ropeBufs(posBase: number, S: number): { cos: GPUBuffer; sin: GPUBuffer } {
-    const D = A.head_dim,
+    const D = ROPE_D, // full head_dim for dense qwen3; the partial rotary_dim for the hybrid
       R = D / 2, // rotary halves: caches store [seq, D/2]; the full vector is concat(half, half)
       cos = new Float32Array(S * D),
       sin = new Float32Array(S * D)
@@ -925,6 +964,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     Hd = A.hidden,
     H = A.heads,
     F = A.intermediate
+  // qwen3_5 hybrid gated-DeltaNet (linear-attention) dims; 0 when the model is dense qwen3.
+  const NK = A.hybrid?.linear_key_heads ?? 0, // key/query heads
+    NV = A.hybrid?.linear_value_heads ?? 0, //  value heads (>= NK; q/k repeat-interleaved)
+    DKV = A.hybrid?.linear_head_dim ?? 0, //    shared key/value head dim
+    CONVK = A.hybrid?.conv_kernel ?? 0,
+    KEYDIM = NK * DKV,
+    VALDIM = NV * DKV,
+    CONVDIM = KEYDIM * 2 + VALDIM // conv operates on the q|k|v stream
   // The KV cache GROWS on demand (doubling, up to maxSeqLen) instead of pinning the full maxSeqLen
   // up front: a short conversation keeps a small cache (~KV_INITIAL positions), so idle VRAM stays
   // low on memory-constrained devices (a full 2048-position f32 cache is ~448 MB at 28 layers,
@@ -1235,8 +1282,83 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     return ins
   }
 
+  // qwen3_5 hybrid layer: a gated-DeltaNet (linear) or gated-attention (full) token mixer, then the
+  // SwiGLU MLP. This is the forward()/prefill path - the recurrent scan and causal conv run over the
+  // whole S-token segment from zero state (persistent decode state is a later addition). The 1-bit
+  // projections reuse the existing GEMV; the plain norms carry their (1+weight) scale baked at load.
+  function hybridLayer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
+    const hy = manifest.arch.hybrid!
+    const w = (r: string): GpuWeight => W[`layers.${li}.${r}`]
+    const n1 = actBuf(S * Hd)
+    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1)
+    let h2: GPUBuffer
+    if (hy.layer_types[li] === 'linear') {
+      const mixed = actBuf(S * CONVDIM)
+      fusedMM(pass, w('linear.in_qkv'), n1, S, [mixed, dummy, dummy2]) // hidden -> q|k|v
+      const convd = actBuf(S * CONVDIM)
+      run(pass, 'conv1d_causal', [['u', S], ['u', CONVDIM], ['u', CONVK], ['u', 0]], [mixed, w('linear.conv1d').buf!], convd, S * CONVDIM)
+      const q = actBuf(S * KEYDIM),
+        k = actBuf(S * KEYDIM),
+        v = actBuf(S * VALDIM)
+      run(pass, 'slice_cols', [['u', S], ['u', KEYDIM], ['u', CONVDIM], ['u', 0]], [convd], q, S * KEYDIM)
+      run(pass, 'slice_cols', [['u', S], ['u', KEYDIM], ['u', CONVDIM], ['u', KEYDIM]], [convd], k, S * KEYDIM)
+      run(pass, 'slice_cols', [['u', S], ['u', VALDIM], ['u', CONVDIM], ['u', 2 * KEYDIM]], [convd], v, S * VALDIM)
+      const a = actBuf(S * NV),
+        b = actBuf(S * NV)
+      fusedMM(pass, w('linear.a'), n1, S, [a, dummy, dummy2])
+      fusedMM(pass, w('linear.b'), n1, S, [b, dummy, dummy2])
+      const gb = actBuf(2 * S * NV) // [g (S*NV) ; beta (S*NV)]
+      run(pass, 'deltanet_gbeta', [['u', S], ['u', NV], ['u', 0], ['u', 0]], [a, b, w('linear.A_log').buf!, w('linear.dt_bias').buf!], gb, S * NV)
+      const core = actBuf(S * VALDIM)
+      runN(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', 0], ['u', 0]], [q, k, v, gb, gb], core, NV)
+      const z = actBuf(S * VALDIM)
+      fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2])
+      const normed = actBuf(S * VALDIM)
+      runN(pass, 'deltanet_norm_gate', [['u', S * NV], ['u', DKV], ['f', A.rms_eps], ['u', 0]], [core, z, w('linear.norm').buf!], normed, S * NV)
+      h2 = actBuf(S * Hd)
+      residMM(pass, w('linear.out_proj'), normed, h, S, h2)
+    } else {
+      const qg = actBuf(S * H * Dh * 2)
+      fusedMM(pass, w('attn.q_proj'), n1, S, [qg, dummy, dummy2]) // doubled: query | gate
+      const query = actBuf(S * H * Dh),
+        gate = actBuf(S * H * Dh)
+      run(pass, 'split_head', [['u', S], ['u', H], ['u', Dh], ['u', 0]], [qg], query, S * H * Dh)
+      run(pass, 'split_head', [['u', S], ['u', H], ['u', Dh], ['u', Dh]], [qg], gate, S * H * Dh)
+      const qn = actBuf(S * H * Dh),
+        qr = actBuf(S * H * Dh)
+      rms(pass, query, `layers.${li}.attn.q_norm`, S * H, Dh, qn)
+      run(pass, 'rope_partial', [['u', S], ['u', H], ['u', Dh], ['u', ROPE_D]], [qn, cos, sin], qr, S * H * Dh)
+      const kk = actBuf(S * KV * Dh)
+      fusedMM(pass, w('attn.k_proj'), n1, S, [kk, dummy, dummy2])
+      const kn = actBuf(S * KV * Dh),
+        kr = actBuf(S * KV * Dh)
+      rms(pass, kk, `layers.${li}.attn.k_norm`, S * KV, Dh, kn)
+      run(pass, 'rope_partial', [['u', S], ['u', KV], ['u', Dh], ['u', ROPE_D]], [kn, cos, sin], kr, S * KV * Dh)
+      const vv = actBuf(S * KV * Dh)
+      fusedMM(pass, w('attn.v_proj'), n1, S, [vv, dummy, dummy2])
+      const att = actBuf(S * H * Dh)
+      runN(pass, 'attention_online', [['u', S], ['u', H], ['u', KV], ['u', Dh], ['f', 1 / Math.sqrt(Dh)], ['u', 0], ['u', 0], ['u', 0]], [qr, kr, vv], att, S * H)
+      const gated = actBuf(S * H * Dh)
+      run(pass, 'gate_sigmoid', [['u', S * H * Dh], ['u', 0], ['u', 0], ['u', 0]], [att, gate], gated, S * H * Dh)
+      h2 = actBuf(S * Hd)
+      residMM(pass, w('attn.o_proj'), gated, h, S, h2)
+    }
+    const n2 = actBuf(S * Hd)
+    rms(pass, h2, `layers.${li}.post_attention_layernorm`, S, Hd, n2)
+    const g = actBuf(S * F),
+      u = actBuf(S * F)
+    fusedMM(pass, w('mlp.gate_proj'), n2, S, [g, dummy, dummy2])
+    fusedMM(pass, w('mlp.up_proj'), n2, S, [u, dummy, dummy2])
+    const sw = actBuf(S * F)
+    run(pass, 'swiglu', [['u', S * F], ['u', 0], ['u', 0], ['u', 0]], [g, u], sw, S * F)
+    const hn = actBuf(S * Hd)
+    residMM(pass, w('mlp.down_proj'), sw, h2, S, hn)
+    return hn
+  }
+
   function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const Ltot = posBase + S
+    if (manifest.arch.hybrid) return hybridLayer(pass, li, h, S, cos, sin)
     // f16-activation decode (activation:'f16'): active exactly when the fused S===1 subgroup path
     // runs. The normalized activations (n1/n2) and the SwiGLU intermediate (sw) go f16; the
     // residual stream, attention, o_proj and weights stay f32, so nothing downstream changes.
@@ -2393,6 +2515,34 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       opChain = run.catch(() => undefined)
       return run
     }
+  }
+
+  if (manifest.arch.hybrid) {
+    // Bake (1 + weight) into the plain RMSNorm weights (qwen3_5 stores them 0-centred) so the
+    // existing weight-multiply RMSNorm kernels reproduce the model; the gated DeltaNet norm and the
+    // conv/decay params keep their raw values. One-time, at load, before any generate/forward.
+    const enc = device.createCommandEncoder()
+    const p = enc.beginComputePass()
+    p.setPipeline(pipelines.add1)
+    const bake = (nm: string, n: number): void => {
+      const b = W[nm]?.buf
+      if (!b) return
+      const uni = device.createBuffer({ size: 16, usage: U | CD })
+      device.queue.writeBuffer(uni, 0, makeParams([['u', n], ['u', 0], ['u', 0], ['u', 0]]) as BufferSource)
+      p.setBindGroup(0, device.createBindGroup({ layout: pipelines.add1.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: b } }] }))
+      p.dispatchWorkgroups(Math.ceil(n / 64))
+    }
+    for (let li = 0; li < A.layers; li++) {
+      bake(`layers.${li}.input_layernorm`, Hd)
+      bake(`layers.${li}.post_attention_layernorm`, Hd)
+      if (manifest.arch.hybrid.layer_types[li] === 'full') {
+        bake(`layers.${li}.attn.q_norm`, Dh)
+        bake(`layers.${li}.attn.k_norm`, Dh)
+      }
+    }
+    bake(FINAL_NORM, Hd)
+    p.end()
+    device.queue.submit([enc.finish()])
   }
 
   const api: EngineInternal = {

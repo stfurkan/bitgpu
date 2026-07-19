@@ -48,16 +48,18 @@ wc = (np.random.randn(C, 1, K) * 0.5).astype(np.float32)
 dump("conv1d", "conv1d_causal.wgsl", [["u", S], ["u", C], ["u", K], ["u", 0]],
      [x, wc[:, 0, :]], q._conv1d_causal(x, wc, S), S * C)
 
-# gated DeltaNet recurrent scan (decode path)
-S2, H2, DK, DV = 8, 4, 128, 128
-qa = np.random.randn(S2, H2, DK).astype(np.float32)
-ka = np.random.randn(S2, H2, DK).astype(np.float32)
-va = np.random.randn(S2, H2, DV).astype(np.float32)
+# gated DeltaNet recurrent scan (decode path); HK<H exercises the GQA repeat (value_heads>key_heads)
+S2, H2, HK2, DK, DV = 8, 4, 2, 128, 128       # rep = H2/HK2 = 2
+qa = np.random.randn(S2, HK2, DK).astype(np.float32)   # q/k have HK heads
+ka = np.random.randn(S2, HK2, DK).astype(np.float32)
+va = np.random.randn(S2, H2, DV).astype(np.float32)    # v has H (value) heads
 ga = (-np.abs(np.random.randn(S2, H2)) * 0.5).astype(np.float32)
 ba = (1.0 / (1.0 + np.exp(-np.random.randn(S2, H2)))).astype(np.float32)
-dump("deltanet_recur", "deltanet_recur.wgsl", [["u", S2], ["u", H2], ["u", DK], ["u", DV]],
-     [qa, ka, va, ga, ba], q._delta_recurrent(qa, ka, va, ga, ba, cfg(DK, DV)),
-     S2 * H2 * DV, overrides={"WGV": DV}, dispatch=[H2, 1])
+rep = H2 // HK2
+exp_dn = q._delta_recurrent(np.repeat(qa, rep, 1), np.repeat(ka, rep, 1), va, ga, ba, cfg(DK, DV))
+dump("deltanet_recur", "deltanet_recur.wgsl",
+     [["u", S2], ["u", H2], ["u", DK], ["u", DV], ["u", HK2], ["u", 0], ["u", 0], ["u", 0]],
+     [qa, ka, va, ga, ba], exp_dn, S2 * H2 * DV, overrides={"WGV": DV}, dispatch=[H2, 1])
 
 # gated RMSNorm: gamma * rmsnorm(core) * silu(z)
 rows, DVn = 32, 128
