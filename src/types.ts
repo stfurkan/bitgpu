@@ -51,6 +51,28 @@ export interface ManifestArch {
   rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number }
   /** position cap for synthesized rope (GGUF context_length) */
   max_positions?: number
+  /** Hybrid backbone (qwen3_5 / GGUF `qwen35`): a per-layer mix of gated-DeltaNet linear
+   *  attention and gated full attention. Absent for the dense qwen3 models. When present, the
+   *  full-attention layers use partial RoPE ({@link HybridArch.rotary_dim}) and an output gate. */
+  hybrid?: HybridArch
+}
+/** The extra architecture contract for the hybrid qwen3_5 backbone. `heads`/`kv_heads`/`head_dim`
+ *  on {@link ManifestArch} describe the FULL-attention layers; the linear layers are described here. */
+export interface HybridArch {
+  /** Per-layer token mixer, length = {@link ManifestArch.layers}: `'linear'` = gated DeltaNet,
+   *  `'full'` = gated attention. Derived from the 3:1 `full_attention_interval` pattern. */
+  layer_types: ('linear' | 'full')[]
+  /** Number of key/query heads in the gated-DeltaNet layers (GGUF `ssm.group_count`). */
+  linear_key_heads: number
+  /** Number of value heads (>= key heads; query/key are repeat-interleaved to match). GGUF `ssm.time_step_rank`. */
+  linear_value_heads: number
+  /** Head dim of the linear-attention keys and values (they share it). GGUF `ssm.state_size`. */
+  linear_head_dim: number
+  /** Depthwise causal conv1d kernel width applied to the q/k/v stream (GGUF `ssm.conv_kernel`). */
+  conv_kernel: number
+  /** Rotary dims actually rotated in the full-attention layers (partial RoPE, GGUF `rope.dimension_count`);
+   *  the remaining `head_dim - rotary_dim` dims pass through unrotated. */
+  rotary_dim: number
 }
 /** The small model-description file bitgpu loads (see docs/FORMAT.md). Usually fetched as
  *  `manifest.json`; `bitgpu/gguf` builds one in memory straight from a GGUF header. */

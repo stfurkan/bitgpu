@@ -13,9 +13,10 @@
 // aux LUTs are derived, not stored (generated from their defining property, byte-identical
 // to the tables the ONNX exports carry), so a GGUF model needs zero side files.
 //
-// Compatibility envelope (identical to the converter): architecture `qwen3`, every linear +
-// embedding + lm_head in Q1_0 (ggml tensor type 41), F32 norms, plain or YaRN rope - the
-// PrismML Bonsai 1-bit releases. Anything else fails loudly here, not as garbage output.
+// Compatibility envelope (identical to the converter): architecture `qwen3` (dense) or `qwen35`
+// (the Bonsai-27B hybrid: 3:1 gated-DeltaNet linear + gated full attention), every projection +
+// embedding + lm_head in Q1_0 (ggml tensor type 41), F32 norms/conv/decay params, plain or YaRN
+// rope - the PrismML Bonsai 1-bit releases. Anything else fails loudly here, not as garbage output.
 import type { Manifest, ManifestRef, ManifestTensor } from './types'
 
 export interface GgufModel {
@@ -208,8 +209,9 @@ function basename(url: string): string {
 function buildManifest(h: Header, dataFile: string): Manifest {
   const { meta, tensors: gg, dataStart } = h
   const archName = meta['general.architecture'] as string
+  if (archName === 'qwen35') return buildQwen35Manifest(h, dataFile)
   if (archName !== 'qwen3')
-    throw new Error(`bitgpu/gguf: unsupported architecture '${archName}' (bitgpu kernels implement the qwen3 topology)`)
+    throw new Error(`bitgpu/gguf: unsupported architecture '${archName}' (bitgpu implements qwen3 and the qwen35 hybrid)`)
   const P = (k: string): unknown => {
     const v = meta[`${archName}.${k}`]
     if (v === undefined) throw new Error(`bitgpu/gguf: header is missing ${archName}.${k}`)
@@ -303,6 +305,133 @@ function buildManifest(h: Header, dataFile: string): Manifest {
       rope, max_positions: Number(P('context_length')),
       vocab, eos: Number(eos),
       tie_word_embeddings: tied, act: 'silu',
+    },
+    luts: {
+      tgt2: { dtype: 'UINT8', shape: [256, 2], src: 'aux', off: 0, len: 512 },
+      tgt4: { dtype: 'UINT8', shape: [256, 4], src: 'aux', off: 512, len: 1024 },
+    },
+    tensors,
+  }
+}
+
+/** Build a hybrid `qwen35` (Qwen3.5 / Bonsai-27B) manifest: a 3:1 stack of gated-DeltaNet
+ *  linear-attention layers and gated full-attention layers. Full layers reuse the qwen3 tensor
+ *  roles (with a doubled q_proj carrying the output gate); linear layers get their own
+ *  `layers.<i>.linear.*` roles. Everything is Q1_0 except the F32 norms, conv1d and decay params. */
+function buildQwen35Manifest(h: Header, dataFile: string): Manifest {
+  const { meta, tensors: gg, dataStart } = h
+  const P = (k: string): unknown => {
+    const v = meta[`qwen35.${k}`]
+    if (v === undefined) throw new Error(`bitgpu/gguf: header is missing qwen35.${k}`)
+    return v
+  }
+  const hidden = Number(P('embedding_length'))
+  const layers = Number(P('block_count'))
+  const inter = Number(P('feed_forward_length'))
+  const heads = Number(P('attention.head_count'))
+  const kvHeads = Number(P('attention.head_count_kv'))
+  const headDim = Number(P('attention.key_length'))
+  if (headDim !== Number(P('attention.value_length')))
+    throw new Error('bitgpu/gguf: key_length != value_length (kernels assume one full-attn head_dim)')
+  const interval = Number(P('full_attention_interval'))
+  // Gated-DeltaNet (linear) dims. GGUF reuses ggml's Mamba/SSM metadata slots: group_count = key
+  // heads, time_step_rank = value heads, state_size = the shared k/v head dim, inner_size = value_dim.
+  const nkHeads = Number(P('ssm.group_count'))
+  const nvHeads = Number(P('ssm.time_step_rank'))
+  const stateDim = Number(P('ssm.state_size'))
+  const convK = Number(P('ssm.conv_kernel'))
+  const keyDim = stateDim * nkHeads
+  const valueDim = stateDim * nvHeads
+  if (valueDim !== Number(P('ssm.inner_size')))
+    throw new Error(`bitgpu/gguf: ssm.inner_size ${P('ssm.inner_size')} != value_heads*state_size ${valueDim}`)
+  const rotaryDim = Number(P('rope.dimension_count'))
+  const embd = gg['token_embd.weight']
+  if (!embd) throw new Error('bitgpu/gguf: header has no token_embd.weight tensor')
+  const vocab = embd.dims[1]
+  const tied = !('output.weight' in gg)
+
+  const region = (gname: string, N: number, K: number): ManifestRef => {
+    const t = gg[gname]
+    if (!t) throw new Error(`bitgpu/gguf: header has no ${gname} tensor`)
+    if (t.type !== Q1_0) throw new Error(`bitgpu/gguf: ${gname}: expected ggml type 41 (Q1_0), got ${t.type}`)
+    if (K % 128 !== 0) throw new Error(`bitgpu/gguf: ${gname}: K=${K} not a multiple of the 128-wide blocks`)
+    const [gk, gn] = t.dims.length === 2 ? [t.dims[0], t.dims[1]] : [t.dims[0], 1]
+    if (gk !== K || gn !== N) throw new Error(`bitgpu/gguf: ${gname}: dims [${t.dims}] do not match expected [${K}, ${N}]`)
+    return { dtype: 'UINT8', shape: [N, (K / 128) * BLK], src: 'data', off: dataStart + t.off, len: N * (K / 128) * BLK }
+  }
+  const f32Ref = (gname: string, dims: number[]): ManifestRef => {
+    const t = gg[gname]
+    if (!t) throw new Error(`bitgpu/gguf: header has no ${gname} tensor`)
+    if (t.type !== F32) throw new Error(`bitgpu/gguf: ${gname}: expected F32, got ggml type ${t.type}`)
+    if (t.dims.length !== dims.length || t.dims.some((d, i) => d !== dims[i]))
+      throw new Error(`bitgpu/gguf: ${gname}: dims [${t.dims}] != [${dims}]`)
+    const n = dims.reduce((a, b) => a * b, 1)
+    return { dtype: 'FLOAT', shape: dims, src: 'data', off: dataStart + t.off, len: n * 4 }
+  }
+  const bin = (gname: string, N: number, K: number): ManifestTensor => ({
+    kind: 'binary', N, K, block: 128, bits: 2, lut: 'tgt2', container: 'q1_0', weight: region(gname, N, K),
+  })
+  const f32 = (gname: string, dims: number[]): ManifestTensor => ({ kind: 'f32', weight: f32Ref(gname, dims) })
+
+  const layer_types: ('linear' | 'full')[] = []
+  const tensors: Record<string, ManifestTensor> = {}
+  for (let li = 0; li < layers; li++) {
+    const full = li % interval === interval - 1 // 3:1 pattern -> full attention at 3,7,11,...
+    layer_types.push(full ? 'full' : 'linear')
+    tensors[`layers.${li}.input_layernorm`] = f32(`blk.${li}.attn_norm.weight`, [hidden])
+    tensors[`layers.${li}.post_attention_layernorm`] = f32(`blk.${li}.post_attention_norm.weight`, [hidden])
+    tensors[`layers.${li}.mlp.gate_proj`] = bin(`blk.${li}.ffn_gate.weight`, inter, hidden)
+    tensors[`layers.${li}.mlp.up_proj`] = bin(`blk.${li}.ffn_up.weight`, inter, hidden)
+    tensors[`layers.${li}.mlp.down_proj`] = bin(`blk.${li}.ffn_down.weight`, hidden, inter)
+    if (full) {
+      // gated attention: q_proj is doubled (query + output gate); partial RoPE + QK-norm.
+      tensors[`layers.${li}.attn.q_proj`] = bin(`blk.${li}.attn_q.weight`, heads * headDim * 2, hidden)
+      tensors[`layers.${li}.attn.k_proj`] = bin(`blk.${li}.attn_k.weight`, kvHeads * headDim, hidden)
+      tensors[`layers.${li}.attn.v_proj`] = bin(`blk.${li}.attn_v.weight`, kvHeads * headDim, hidden)
+      tensors[`layers.${li}.attn.o_proj`] = bin(`blk.${li}.attn_output.weight`, hidden, heads * headDim)
+      tensors[`layers.${li}.attn.q_norm`] = f32(`blk.${li}.attn_q_norm.weight`, [headDim])
+      tensors[`layers.${li}.attn.k_norm`] = f32(`blk.${li}.attn_k_norm.weight`, [headDim])
+    } else {
+      // gated DeltaNet: in_proj_qkv (q,k,v concatenated) + z gate + a/b decay/beta inputs +
+      // depthwise conv1d + per-head A_log/dt_bias + gated RMSNorm + out_proj.
+      tensors[`layers.${li}.linear.in_qkv`] = bin(`blk.${li}.attn_qkv.weight`, keyDim * 2 + valueDim, hidden)
+      tensors[`layers.${li}.linear.z`] = bin(`blk.${li}.attn_gate.weight`, valueDim, hidden)
+      tensors[`layers.${li}.linear.a`] = bin(`blk.${li}.ssm_alpha.weight`, nvHeads, hidden)
+      tensors[`layers.${li}.linear.b`] = bin(`blk.${li}.ssm_beta.weight`, nvHeads, hidden)
+      tensors[`layers.${li}.linear.conv1d`] = f32(`blk.${li}.ssm_conv1d.weight`, [convK, keyDim * 2 + valueDim])
+      tensors[`layers.${li}.linear.A_log`] = f32(`blk.${li}.ssm_a`, [nvHeads])
+      tensors[`layers.${li}.linear.dt_bias`] = f32(`blk.${li}.ssm_dt.bias`, [nvHeads])
+      tensors[`layers.${li}.linear.norm`] = f32(`blk.${li}.ssm_norm.weight`, [stateDim])
+      tensors[`layers.${li}.linear.out_proj`] = bin(`blk.${li}.ssm_out.weight`, hidden, valueDim)
+    }
+  }
+  tensors[`layers.${layers}.final_norm_layernorm`] = f32('output_norm.weight', [hidden])
+  tensors['embed_tokens'] = {
+    kind: 'q4', rows: vocab, cols: hidden, block: 128, bits: 4, lut: 'tgt4',
+    container: 'q1_0', weight: region('token_embd.weight', vocab, hidden),
+  }
+  tensors['lm_head'] = {
+    kind: 'q2', N: vocab, K: hidden, block: 128, bits: 2, lut: 'tgt2',
+    container: 'q1_0', weight: region(tied ? 'token_embd.weight' : 'output.weight', vocab, hidden),
+  }
+
+  const eos = meta['tokenizer.ggml.eos_token_id']
+  if (eos === undefined) throw new Error('bitgpu/gguf: header is missing tokenizer.ggml.eos_token_id')
+  const stem = dataFile.replace(/\.gguf$/i, '')
+  return {
+    version: 2,
+    data_file: dataFile,
+    aux_file: `${stem}.aux.bin`,
+    arch: {
+      model_type: 'qwen3_5', layers, hidden, intermediate: inter,
+      heads, kv_heads: kvHeads, head_dim: headDim,
+      rms_eps: Number(P('attention.layer_norm_rms_epsilon')),
+      rope: { rope_theta: Number(P('rope.freq_base')) }, max_positions: Number(P('context_length')),
+      vocab, eos: Number(eos), tie_word_embeddings: tied, act: 'silu',
+      hybrid: {
+        layer_types, linear_key_heads: nkHeads, linear_value_heads: nvHeads,
+        linear_head_dim: stateDim, conv_kernel: convK, rotary_dim: rotaryDim,
+      },
     },
     luts: {
       tgt2: { dtype: 'UINT8', shape: [256, 2], src: 'aux', off: 0, len: 512 },

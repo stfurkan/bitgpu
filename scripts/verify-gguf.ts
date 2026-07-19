@@ -135,5 +135,69 @@ console.log('behavior checks...')
   check('non-GGUF bytes rejected loudly', threw.includes('bad magic'), threw.slice(0, 60))
 }
 
+// ── 4. Hybrid qwen35 (Bonsai-27B arch) parse from a synthetic minimal header ──
+// The real Bonsai-27B GGUF is 3.8 GB (no CI weights), so exercise the qwen35 branch on a tiny
+// hand-built header: 4 blocks (3 linear + 1 full), untied lm_head. The real header is validated
+// out-of-band by tools; this guards the branch + tensor mapping in CI. (Header only - the parser
+// never reads tensor data, so dummy offsets are fine.)
+console.log('hybrid qwen35 parse (synthetic minimal header)...')
+{
+  const enc = new TextEncoder()
+  const bytes: number[] = []
+  const u8 = (v: number): void => void bytes.push(v & 0xff)
+  const u32 = (v: number): void => { for (let i = 0; i < 4; i++) u8(v >>> (8 * i)) }
+  const u64 = (v: number): void => { let b = BigInt(v); for (let i = 0; i < 8; i++) { u8(Number(b & 0xffn)); b >>= 8n } }
+  const f32v = (v: number): void => { const d = new DataView(new ArrayBuffer(4)); d.setFloat32(0, v, true); for (let i = 0; i < 4; i++) u8(d.getUint8(i)) }
+  const str = (s: string): void => { const by = enc.encode(s); u64(by.length); by.forEach((x) => u8(x)) }
+  const kv: Array<() => void> = []
+  const kU32 = (k: string, v: number) => kv.push(() => { str(k); u32(4); u32(v) })
+  const kF32 = (k: string, v: number) => kv.push(() => { str(k); u32(6); f32v(v) })
+  const kStr = (k: string, v: string) => kv.push(() => { str(k); u32(8); str(v) })
+  kStr('general.architecture', 'qwen35')
+  kU32('qwen35.embedding_length', 256); kU32('qwen35.block_count', 4); kU32('qwen35.feed_forward_length', 512)
+  kU32('qwen35.attention.head_count', 2); kU32('qwen35.attention.head_count_kv', 1)
+  kU32('qwen35.attention.key_length', 128); kU32('qwen35.attention.value_length', 128)
+  kU32('qwen35.full_attention_interval', 4)
+  kU32('qwen35.ssm.group_count', 2); kU32('qwen35.ssm.time_step_rank', 4); kU32('qwen35.ssm.state_size', 128)
+  kU32('qwen35.ssm.conv_kernel', 4); kU32('qwen35.ssm.inner_size', 512)
+  kU32('qwen35.rope.dimension_count', 64); kF32('qwen35.rope.freq_base', 1e6)
+  kF32('qwen35.attention.layer_norm_rms_epsilon', 1e-6); kU32('qwen35.context_length', 262144)
+  kU32('tokenizer.ggml.eos_token_id', 42)
+  const [F32T, Q1] = [0, 41]
+  const tn: Array<{ n: string; d: number[]; t: number }> = [
+    { n: 'token_embd.weight', d: [256, 256], t: Q1 }, { n: 'output.weight', d: [256, 256], t: Q1 },
+    { n: 'output_norm.weight', d: [256], t: F32T },
+  ]
+  for (let li = 0; li < 4; li++) {
+    tn.push({ n: `blk.${li}.attn_norm.weight`, d: [256], t: F32T }, { n: `blk.${li}.post_attention_norm.weight`, d: [256], t: F32T })
+    tn.push({ n: `blk.${li}.ffn_gate.weight`, d: [256, 512], t: Q1 }, { n: `blk.${li}.ffn_up.weight`, d: [256, 512], t: Q1 }, { n: `blk.${li}.ffn_down.weight`, d: [512, 256], t: Q1 })
+    if (li % 4 === 3) {
+      tn.push({ n: `blk.${li}.attn_q.weight`, d: [256, 512], t: Q1 }, { n: `blk.${li}.attn_k.weight`, d: [256, 128], t: Q1 },
+        { n: `blk.${li}.attn_v.weight`, d: [256, 128], t: Q1 }, { n: `blk.${li}.attn_output.weight`, d: [256, 256], t: Q1 },
+        { n: `blk.${li}.attn_q_norm.weight`, d: [128], t: F32T }, { n: `blk.${li}.attn_k_norm.weight`, d: [128], t: F32T })
+    } else {
+      tn.push({ n: `blk.${li}.attn_qkv.weight`, d: [256, 1024], t: Q1 }, { n: `blk.${li}.attn_gate.weight`, d: [256, 512], t: Q1 },
+        { n: `blk.${li}.ssm_alpha.weight`, d: [256, 4], t: Q1 }, { n: `blk.${li}.ssm_beta.weight`, d: [256, 4], t: Q1 },
+        { n: `blk.${li}.ssm_conv1d.weight`, d: [4, 1024], t: F32T }, { n: `blk.${li}.ssm_a`, d: [4], t: F32T },
+        { n: `blk.${li}.ssm_dt.bias`, d: [4], t: F32T }, { n: `blk.${li}.ssm_norm.weight`, d: [128], t: F32T }, { n: `blk.${li}.ssm_out.weight`, d: [512, 256], t: Q1 })
+    }
+  }
+  enc.encode('GGUF').forEach((x) => u8(x)); u32(3); u64(tn.length); u64(kv.length)
+  kv.forEach((f) => f())
+  tn.forEach((t, idx) => { str(t.n); u32(t.d.length); t.d.forEach((d) => u64(d)); u32(t.t); u64(idx * 32) }) // distinct offsets
+  for (let i = 0; i < 64; i++) u8(0) // pad past the header
+  const { manifest: m } = fromGgufBytes(new Uint8Array(bytes).buffer as ArrayBuffer, 'tiny-qwen35.gguf')
+  const A = m.arch, Hb = A.hybrid, Tn = m.tensors
+  check('qwen35 model_type', A.model_type === 'qwen3_5')
+  check('qwen35 hybrid present', Hb !== undefined)
+  check('qwen35 layer_types', JSON.stringify(Hb?.layer_types) === JSON.stringify(['linear', 'linear', 'linear', 'full']))
+  check('qwen35 linear dims', Hb?.linear_key_heads === 2 && Hb?.linear_value_heads === 4 && Hb?.linear_head_dim === 128 && Hb?.conv_kernel === 4 && Hb?.rotary_dim === 64)
+  check('qwen35 not tied', A.tie_word_embeddings === false && Tn['lm_head'].weight!.off !== Tn['embed_tokens'].weight!.off)
+  check('qwen35 L0.linear.in_qkv', Tn['layers.0.linear.in_qkv']?.N === 1024 && Tn['layers.0.linear.in_qkv']?.K === 256)
+  check('qwen35 L0.linear.conv1d', Tn['layers.0.linear.conv1d']?.kind === 'f32' && JSON.stringify(Tn['layers.0.linear.conv1d']?.weight?.shape) === '[4,1024]')
+  check('qwen35 L3.attn.q_proj doubled', Tn['layers.3.attn.q_proj']?.N === 512 && Tn['layers.0.attn.q_proj'] === undefined)
+  check('qwen35 bad-arch still rejected', (() => { try { fromGgufBytes(new Uint8Array(bytes.slice(0, 4)).buffer as ArrayBuffer, 'x.gguf'); return false } catch { return true } })())
+}
+
 console.log(failures === 0 ? 'ALL GGUF CHECKS PASSED' : `${failures} GGUF CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
