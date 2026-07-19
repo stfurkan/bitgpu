@@ -1000,6 +1000,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Kc[li]/Vc[li]. Every loop that walks the cache iterates kvLayers, not [0, A.layers).
   const kvLayers: number[] = []
   for (let li = 0; li < A.layers; li++) if (!A.hybrid || A.hybrid.layer_types[li] === 'full') kvLayers.push(li)
+  // Complement of kvLayers: the gated-DeltaNet layers that carry O(1) recurrent+conv state (hyRS/hyCS
+  // below) instead of KV. rsSz/csSz are the per-linear-layer state sizes - also the snapshot's
+  // linear-state block sizes. Both empty/0 for dense qwen3.
+  const linearLayers: number[] = []
+  for (let li = 0; li < A.layers; li++) if (A.hybrid && A.hybrid.layer_types[li] === 'linear') linearLayers.push(li)
+  const rsSz = A.hybrid ? NV * DKV * DKV * 4 : 0
+  const csSz = A.hybrid ? (CONVK - 1) * CONVDIM * 4 : 0
   for (const li of kvLayers) {
     Kc[li] = device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD })
     Vc[li] = device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD })
@@ -1016,12 +1023,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     hyCS: GPUBuffer[][] = [] //     [li] -> [half0, half1] ping-pong conv left-context
   let hyPar = 0
   if (A.hybrid) {
-    const rsSz = NV * DKV * DKV * 4,
-      csSz = (CONVK - 1) * CONVDIM * 4
-    for (let li = 0; li < A.layers; li++) {
-      if (A.hybrid.layer_types[li] !== 'linear') continue
-      hyRS[li] = [device.createBuffer({ size: rsSz, usage: S_ | CD }), device.createBuffer({ size: rsSz, usage: S_ | CD })]
-      hyCS[li] = [device.createBuffer({ size: csSz, usage: S_ | CD }), device.createBuffer({ size: csSz, usage: S_ | CD })]
+    for (const li of linearLayers) {
+      // CS (COPY_SRC) so saveCache can snapshot the state; CD so restoreCache can write it back.
+      hyRS[li] = [device.createBuffer({ size: rsSz, usage: S_ | CS | CD }), device.createBuffer({ size: rsSz, usage: S_ | CS | CD })]
+      hyCS[li] = [device.createBuffer({ size: csSz, usage: S_ | CS | CD }), device.createBuffer({ size: csSz, usage: S_ | CS | CD })]
     }
   }
   // Sink-mode statics: the aux rope tables ([window, Dh/2]) for the read-time K rotation, and
@@ -2446,39 +2451,55 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // cached positions of each layer's K/V (the last token's K/V is re-written by the reuse path's
   // re-fed token; see the fullHistory comment). A snapshot captures exactly that, packed into one
   // ArrayBuffer, so restoring it - into this engine or a fresh one on the same model + mode - is
-  // bit-identical to having kept the conversation alive. Layout: per layer, K then V region
-  // (then Ksc, Vsc under q8), each sized len positions; all region sizes are multiples of 4.
+  // bit-identical to having kept the conversation alive. Layout: per KV-bearing layer, K then V
+  // region (then Ksc, Vsc under q8), each sized len positions; all region sizes are multiples of 4.
+  // Hybrid: only the full-attention layers contribute K/V, then each linear layer's DeltaNet
+  // recurrent + conv state (which already reflects those tokens) is appended as a fixed-size block.
   const kvRowBytes = KV * Dh * KVB // one position of K (or V), per layer
   const scRowBytes = kv8 ? KV * (Dh / 32) * 4 : 0 // one position of q8 block scales
-  const snapshotBytes = (len: number): number => A.layers * 2 * len * (kvRowBytes + scRowBytes)
+  // Snapshot data size for `len` cached positions. Dense: K/V (+q8 scales) for every layer. Hybrid:
+  // K/V only for the full-attention layers (kvLayers), plus a fixed per-linear-layer block of the
+  // DeltaNet recurrent + conv state (rsSz + csSz) - position-independent, so it never scales with len.
+  const snapshotBytes = (len: number): number =>
+    (A.hybrid ? kvLayers.length : A.layers) * 2 * len * (kvRowBytes + scRowBytes) + linearLayers.length * (rsSz + csSz)
 
   async function saveCache(opts?: { from?: number }): Promise<KvSnapshot | null> {
-    if (A.hybrid)
-      throw new Error('saveCache: KV snapshots are not yet supported for the qwen3_5 hybrid backbone (the DeltaNet recurrent/conv state is not captured)')
     if (fullHistory.length === 0) return null
     const len = roll ? cacheLen : fullHistory.length - 1 // rolled cache: slots, not history
     // DELTA: exclude the first `base` cache positions (a shared prewarmed prefix). Each cache
     // position is a whole, independent K/V row (q8 block scales included), so slicing at any
-    // position is byte-aligned. Not supported in sinks mode (positions no longer map to history).
+    // position is byte-aligned. Not supported in sinks mode (positions no longer map to history),
+    // nor for the hybrid (its cumulative recurrent state cannot be sliced by position).
     const base = Math.max(0, Math.min(Math.floor(opts?.from ?? 0), len))
     if (base > 0 && roll) throw new Error("saveCache: delta snapshots ({ from }) are not supported under overflow 'sinks'")
+    if (base > 0 && A.hybrid) throw new Error('saveCache: delta snapshots ({ from }) are not supported for the qwen3_5 hybrid backbone')
     const count = len - base
-    const data = new ArrayBuffer(snapshotBytes(count))
-    if (count > 0) {
-      const rb = device.createBuffer({ size: snapshotBytes(count), usage: GPUBufferUsage.MAP_READ | CD })
+    const bytes = snapshotBytes(count)
+    const data = new ArrayBuffer(bytes)
+    if (bytes > 0) {
+      const rb = device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | CD })
       const enc = device.createCommandEncoder()
       let off = 0
-      for (let li = 0; li < A.layers; li++) {
-        enc.copyBufferToBuffer(Kc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
-        off += count * kvRowBytes
-        enc.copyBufferToBuffer(Vc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
-        off += count * kvRowBytes
-        if (kv8) {
-          enc.copyBufferToBuffer(Ksc[li], base * scRowBytes, rb, off, count * scRowBytes)
-          off += count * scRowBytes
-          enc.copyBufferToBuffer(Vsc[li], base * scRowBytes, rb, off, count * scRowBytes)
-          off += count * scRowBytes
+      if (count > 0)
+        for (const li of kvLayers) {
+          enc.copyBufferToBuffer(Kc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
+          off += count * kvRowBytes
+          enc.copyBufferToBuffer(Vc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
+          off += count * kvRowBytes
+          if (kv8) {
+            enc.copyBufferToBuffer(Ksc[li], base * scRowBytes, rb, off, count * scRowBytes)
+            off += count * scRowBytes
+            enc.copyBufferToBuffer(Vsc[li], base * scRowBytes, rb, off, count * scRowBytes)
+            off += count * scRowBytes
+          }
         }
+      // hybrid: each linear layer's DeltaNet recurrent + conv state (the current ping-pong half),
+      // which already reflects tokens [0, len) - the re-fed last token continues it exactly like KV.
+      for (const li of linearLayers) {
+        enc.copyBufferToBuffer(hyRS[li][hyPar], 0, rb, off, rsSz)
+        off += rsSz
+        enc.copyBufferToBuffer(hyCS[li][hyPar], 0, rb, off, csSz)
+        off += csSz
       }
       device.queue.submit([enc.finish()])
       await rb.mapAsync(GPUMapMode.READ)
@@ -2498,8 +2519,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
 
   async function restoreCache(snap: KvSnapshot): Promise<void> {
-    if (A.hybrid)
-      throw new Error('restoreCache: KV snapshots are not yet supported for the qwen3_5 hybrid backbone (the DeltaNet recurrent/conv state is not captured)')
     if (!snap || (snap.version !== 1 && snap.version !== 2)) throw new Error(`restoreCache: unsupported snapshot version ${snap?.version}`)
     if ((snap.version === 2) !== roll)
       throw new Error(
@@ -2519,6 +2538,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // DELTA restore: `data` holds only positions [base, len); [0, base) must already be present
     // (a fresh prewarm of the same prefix). Splice the delta on top of it. base=0 = full restore.
     const base = Math.max(0, Math.floor(snap.base ?? 0))
+    if (base > 0 && A.hybrid) throw new Error('restoreCache: delta snapshots are not supported for the qwen3_5 hybrid backbone')
     const count = len - base
     if (len + 1 > maxSeqLen)
       throw new Error(`restoreCache: snapshot needs ${len + 1} cache slots but maxSeqLen is ${maxSeqLen}`)
@@ -2535,8 +2555,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
     await ensureKvCapacity(len)
     let off = 0
-    for (let li = 0; li < A.layers; li++) {
-      if (count > 0) {
+    if (count > 0)
+      for (const li of kvLayers) {
         device.queue.writeBuffer(Kc[li], base * kvRowBytes, snap.data, off, count * kvRowBytes)
         off += count * kvRowBytes
         device.queue.writeBuffer(Vc[li], base * kvRowBytes, snap.data, off, count * kvRowBytes)
@@ -2548,7 +2568,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           off += count * scRowBytes
         }
       }
+    // hybrid: restore each linear layer's DeltaNet recurrent + conv state into ping-pong half 0 and
+    // point hyPar there, so the next stack() reads the restored state (and writes the other half).
+    for (const li of linearLayers) {
+      device.queue.writeBuffer(hyRS[li][0], 0, snap.data, off, rsSz)
+      off += rsSz
+      device.queue.writeBuffer(hyCS[li][0], 0, snap.data, off, csSz)
+      off += csSz
     }
+    if (A.hybrid) hyPar = 0
     fullHistory = [...snap.ids]
     cacheLen = len
   }

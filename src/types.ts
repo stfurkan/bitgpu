@@ -347,7 +347,8 @@ export interface KvSnapshot {
    *  full snapshot (all positions in `data`). Restore validates the target is exactly at the base
    *  boundary with a matching token prefix. */
   base?: number
-  /** Packed per-layer cached K/V bytes (and q8 block scales) for the stored positions. */
+  /** Packed cached K/V bytes (and q8 block scales) for the stored positions, per KV-bearing layer;
+   *  for the qwen3_5 hybrid the DeltaNet recurrent + conv state of each linear layer is appended. */
   data: ArrayBuffer
 }
 

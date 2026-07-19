@@ -81,7 +81,22 @@ try {
         let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
         refQ8.push(am); s2.push(am)
       }
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8 }
+      // snapshot persistence: save after turn 1, restore into a FRESH engine, continue with reuse -
+      // must equal a cold full-prefill of [history, delta] then generate. Proves saveCache captured the
+      // full-attention KV AND the DeltaNet recurrent/conv state, and restore + the re-fed reuse path
+      // reconstruct it exactly (a linear layer keeps no KV, only its O(1) state - the real test here).
+      const sp = ids.slice(0, 3), delta = [ids[1] % 256]
+      const g1 = (await engine.generate(sp, { maxTokens: 6 })).tokens
+      const snap = await engine.saveCache()
+      const hist = [...sp, ...g1]
+      const eFull = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
+      const snapFull = (await eFull.generate([...hist, ...delta], { maxTokens: 5 })).tokens
+      // reuse-only (no snapshot): continue THIS engine (still at [sp,g1] - saveCache doesn't mutate)
+      const reuseOnly = (await engine.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
+      const eR = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
+      await eR.restoreCache(snap)
+      const snapRestored = (await eR.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -121,6 +136,12 @@ try {
   const q8decOk = JSON.stringify(out.genQ8) === JSON.stringify(out.refQ8)
   console.log(`  [${q8decOk ? 'PASS' : 'FAIL'}] q8 decode==prefill  gen=${JSON.stringify(out.genQ8)} ref=${JSON.stringify(out.refQ8)}`)
   if (!q8decOk) fail++
+  const reuseOk = JSON.stringify(out.reuseOnly) === JSON.stringify(out.snapFull)
+  console.log(`  [${reuseOk ? 'PASS' : 'FAIL'}] reuseCache continue == cold full-prefill  reuse=${JSON.stringify(out.reuseOnly)} full=${JSON.stringify(out.snapFull)}`)
+  if (!reuseOk) fail++
+  const snapOk = JSON.stringify(out.snapRestored) === JSON.stringify(out.snapFull)
+  console.log(`  [${snapOk ? 'PASS' : 'FAIL'}] snapshot restore+continue == cold full-prefill  restored=${JSON.stringify(out.snapRestored)} full=${JSON.stringify(out.snapFull)} (${out.snapBytes}B)`)
+  if (!snapOk) fail++
 } finally {
   await browser.close(); server.close()
 }
