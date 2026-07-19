@@ -103,7 +103,7 @@ def main() -> None:
         else:
             a = ly.linear_attn
             d.update(qkv=npw(a, "in_proj_qkv"), z=npw(a, "in_proj_z"), pb=npw(a, "in_proj_b"), pa=npw(a, "in_proj_a"),
-                     conv=a.conv1d.weight.detach().float().numpy(), dt=npp(a, "dt_bias"), Alog=npp(a, "A_log"),
+                     conv=a.conv1d.weight.detach().float().numpy(), dt=npp(a, "dt_bias"), Alog=-np.exp(npp(a, "A_log")),
                      gn=a.norm.weight.detach().float().numpy(), out=npw(a, "out_proj"))
         W["layers"].append(d)
 

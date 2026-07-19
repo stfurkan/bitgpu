@@ -111,7 +111,8 @@ for li in range(LAYERS):
         conv = np.random.randn(CONVDIM, CONVK).astype(np.float32) * 0.3   # [C, K] row-major = kernel w[c*K+j]
         add_f32(f"layers.{li}.linear.conv1d", conv, [CONVK, CONVDIM])
         d["conv"] = conv[:, None, :]                                       # [C,1,K] for qwen35_numpy
-        d["Alog"] = add_f32(f"layers.{li}.linear.A_log", np.random.randn(NV) * 0.5, [NV])
+        # ssm_a stores -exp(A_log) (GGUF convention) -> negative values
+        d["Alog"] = add_f32(f"layers.{li}.linear.A_log", -np.exp(np.random.randn(NV) * 0.5), [NV])
         d["dt"] = add_f32(f"layers.{li}.linear.dt_bias", np.random.randn(NV) * 0.5, [NV])
         d["gn"] = add_f32(f"layers.{li}.linear.norm", np.random.randn(SDIM) * 0.1, [SDIM])
         d["out"] = add_q1(f"layers.{li}.linear.out_proj", HID, VALDIM)

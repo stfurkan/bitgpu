@@ -82,9 +82,9 @@ dump("norm_gate", "deltanet_norm_gate.wgsl", [["u", rows], ["u", DVn], ["f", 1e-
 Sg, Hg = 8, 4
 ag = np.random.randn(Sg, Hg).astype(np.float32)
 bg = np.random.randn(Sg, Hg).astype(np.float32)
-alog = np.random.randn(Hg).astype(np.float32)
+alog = (-np.exp(np.random.randn(Hg))).astype(np.float32)   # a_neg = -exp(A_log)
 dtb = np.random.randn(Hg).astype(np.float32)
-exp4 = np.concatenate([(-np.exp(alog) * q._softplus(ag + dtb)).ravel(), q._sigmoid(bg).ravel()])
+exp4 = np.concatenate([(alog * q._softplus(ag + dtb)).ravel(), q._sigmoid(bg).ravel()])
 dump("gbeta", "deltanet_gbeta.wgsl", [["u", Sg], ["u", Hg], ["u", 0], ["u", 0]],
      [ag, bg, alog, dtb], exp4, 2 * Sg * Hg, dispatch=[(Sg * Hg + 63) // 64, 1])
 

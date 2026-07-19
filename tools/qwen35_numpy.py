@@ -33,6 +33,8 @@ class Qwen35Cfg:
     rot_dim: int          # head_dim * partial_rotary_factor
     rope_theta: float
     # linear (gated DeltaNet)
+    # NOTE: the layer weight dict's "Alog" holds -exp(A_log) (the GGUF ssm_a convention), so g is a
+    # plain multiply: g = Alog * softplus(a + dt_bias). Feeders must pre-apply -exp to A_log.
     n_k_heads: int
     n_v_heads: int
     k_dim: int            # linear_key_head_dim
@@ -194,7 +196,7 @@ def _linear_attention(x, d, C: Qwen35Cfg, delta):
     v = mixed[:, 2 * KDIM:].reshape(S, C.n_v_heads, C.v_dim)
     z = (x @ d["z"].T).reshape(S, C.n_v_heads, C.v_dim)
     beta = _sigmoid(x @ d["pb"].T)                                             # [S, n_v]
-    g = (-np.exp(d["Alog"].astype(np.float32)) * _softplus((x @ d["pa"].T) + d["dt"])).astype(f32)
+    g = (d["Alog"].astype(np.float32) * _softplus((x @ d["pa"].T) + d["dt"])).astype(f32)  # Alog = -exp(A_log)
     if C.n_v_heads // C.n_k_heads > 1:
         rep = C.n_v_heads // C.n_k_heads
         q, k = np.repeat(q, rep, axis=1), np.repeat(k, rep, axis=1)
