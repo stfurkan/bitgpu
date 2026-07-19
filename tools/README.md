@@ -71,6 +71,11 @@ python tools/golden-qwen35.py --delta recurrent    # sequential scan == bitgpu d
 runs on a laptop and is the fast dev/validation target. The 1-bit fixtures for the actual 27B
 are produced from its manifest with the same numpy math (dequantized weights in, golden out).
 
+The hybrid-specific WGSL kernels (conv1d, gated-DeltaNet scan, gated RMSNorm, g/beta, partial
+RoPE, head_dim-256 attention) are validated in isolation against the numpy oracle before the
+end-to-end gate: `npm run test:kernels` (needs numpy + system Chrome/WebGPU, a local GPU gate).
+`tools/gen-kernel-cases.py` emits the cases; `scripts/verify-kernels.mjs` runs the real shaders.
+
 ## Gating a converted model
 
 After the dump, point `examples/model-<tag>` at the work dir (the reference Bonsai-1.7B is tag

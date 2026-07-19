@@ -56,6 +56,7 @@
     "prepare": "npm run build",
     "prepublishOnly": "npm run build && npm run check:publish",
     "test:gguf": "tsx scripts/verify-gguf.ts",
+    "test:kernels": "python3 tools/gen-kernel-cases.py && node scripts/verify-kernels.mjs",
     "profile": "node scripts/profile.mjs",
     "bench": "node scripts/benchmark.mjs"
   },

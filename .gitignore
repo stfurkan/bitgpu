@@ -5,3 +5,4 @@ examples/model-*
 examples/staged-*
 __pycache__
 *.pyc
+.kernel-cases
