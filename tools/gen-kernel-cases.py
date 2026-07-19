@@ -54,7 +54,9 @@ dump("conv1d", "conv1d_causal.wgsl", [["u", S], ["u", C], ["u", K], ["u", 0]],
      [x, wc[:, 0, :], statein], q._conv1d_causal(x, wc, S), S * C,
      dispatch=[(total + 63) // 64, 1], out_len2=(K - 1) * C)
 
-# gated DeltaNet recurrent scan (decode path); HK<H exercises the GQA repeat (value_heads>key_heads)
+# gated DeltaNet recurrent scan (decode path); HK<H exercises the GQA repeat (value_heads>key_heads).
+# GGUF value heads are grouped [rep, n_key] (TILE), so value head h shares key/query head h % HK -
+# np.tile, matching the kernel's `hk = h % HK` (see the 52cf908 value-head tile fix), NOT np.repeat.
 S2, H2, HK2, DK, DV = 8, 4, 2, 128, 128       # rep = H2/HK2 = 2
 qa = np.random.randn(S2, HK2, DK).astype(np.float32)   # q/k have HK heads
 ka = np.random.randn(S2, HK2, DK).astype(np.float32)
@@ -63,7 +65,7 @@ ga = (-np.abs(np.random.randn(S2, H2)) * 0.5).astype(np.float32)
 ba = (1.0 / (1.0 + np.exp(-np.random.randn(S2, H2)))).astype(np.float32)
 rep = H2 // HK2
 statein = np.zeros(H2 * DK * DV, np.float32)   # loadState=0: state starts at zero
-exp_dn = q._delta_recurrent(np.repeat(qa, rep, 1), np.repeat(ka, rep, 1), va, ga, ba, cfg(DK, DV))
+exp_dn = q._delta_recurrent(np.tile(qa, (1, rep, 1)), np.tile(ka, (1, rep, 1)), va, ga, ba, cfg(DK, DV))
 dump("deltanet_recur", "deltanet_recur.wgsl",
      [["u", S2], ["u", H2], ["u", DK], ["u", DV], ["u", HK2], ["u", 0], ["u", 0], ["u", 0]],
      [qa, ka, va, ga, ba, statein], exp_dn, S2 * H2 * DV, overrides={"WGV": DV}, dispatch=[H2, 1],
