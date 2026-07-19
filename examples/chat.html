@@ -87,6 +87,7 @@
         <option value="bonsai-1.7b-gguf">Bonsai 1.7B · ~240 MB</option>
         <option value="bonsai-4b-gguf">Bonsai 4B · ~570 MB</option>
         <option value="bonsai-8b-gguf">Bonsai 8B · ~1.2 GB</option>
+        <option value="bonsai-27b-gguf">Bonsai 27B · hybrid · ~3.8 GB · 16 GB+ · experimental</option>
         <option value="bonsai-1.7b">Bonsai 1.7B · ONNX · ~290 MB</option>
         <option value="bonsai-4b">Bonsai 4B · ONNX · ~660 MB</option>
         <option value="bonsai-8b">Bonsai 8B · ONNX · ~1.3 GB</option>
@@ -155,6 +156,9 @@
       'bonsai-1.7b-gguf': { data: `${PRISM('Bonsai-1.7B-gguf')}/Bonsai-1.7B-Q1_0.gguf`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'Bonsai-1.7B-Q1_0.aux.bin' },
       'bonsai-4b-gguf': { data: `${PRISM('Bonsai-4B-gguf')}/Bonsai-4B-Q1_0.gguf`, tok: HF('Bonsai-4B-ONNX'), aux: 'Bonsai-4B-Q1_0.aux.bin' },
       'bonsai-8b-gguf': { data: `${PRISM('Bonsai-8B-gguf')}/Bonsai-8B-Q1_0.gguf`, tok: HF('Bonsai-8B-ONNX'), aux: 'Bonsai-8B-Q1_0.aux.bin' },
+      // Qwen3.5 hybrid 27B: GGUF-only, loaded via fromGguf (in-browser header parse, no committed
+      // manifest); tokenizer from the -unpacked repo (the GGUF repo ships none). ~3.8 GB - wants 16 GB+.
+      'bonsai-27b-gguf': { gguf: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-Q1_0.gguf`, tok: PRISM('Bonsai-27B-unpacked') },
       'bonsai-1.7b': { data: `${HF('Bonsai-1.7B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'bonsai.aux.bin' },
       'bonsai-4b': { data: `${HF('Bonsai-4B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-4B-ONNX'), aux: 'model_q1.aux.bin' },
       'bonsai-8b': { data: `${HF('Bonsai-8B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-8B-ONNX'), aux: 'model_q1.aux.bin' },
@@ -233,7 +237,7 @@
       const c = await caches.open(CACHE);
       for (const opt of $('model').options) {
         const m = MODELS[opt.value];
-        const hit = await c.match(m.data);
+        const hit = await c.match(m.data || m.gguf); // 27B streams from m.gguf (no committed manifest)
         const base = opt.textContent.replace(/ · downloaded$/, '');
         opt.textContent = hit ? `${base} · downloaded` : base;
       }
@@ -245,14 +249,14 @@
       $('load').disabled = true; $('model').disabled = true;
       try {
         status('loading bitgpu...');
-        const [{ createEngine, WebGPUUnavailableError }, { createChat }] = await Promise.all([import(BITGPU), import(`${BITGPU}/chat`)]);
+        const [{ createEngine, WebGPUUnavailableError }, { createChat }, { fromGguf }] = await Promise.all([import(BITGPU), import(`${BITGPU}/chat`), import(`${BITGPU}/gguf`)]);
         status(`loading <b>${key}</b> - first time streams from the Hugging Face Hub, afterwards it comes from your browser's cache...`);
         $('prog').hidden = false;
         try {
           engine = await createEngine({
-            manifestUrl: `${REPO}/${key}/manifest.json`,
-            auxUrl: `${REPO}/${key}/${m.aux}`,
-            dataUrl: m.data,
+            // GGUF-only hybrid (27B) parses its header in-browser via fromGguf (no committed manifest);
+            // every other model loads its small committed manifest.json + aux.
+            ...(m.gguf ? await fromGguf(m.gguf) : { manifestUrl: `${REPO}/${key}/manifest.json`, auxUrl: `${REPO}/${key}/${m.aux}`, dataUrl: m.data }),
             // q8 KV: quarter-of-f32 cache memory on ANY adapter (no shader-f16 needed), which
             // pays for the 4096-token window and keeps session snapshots small.
             kvCache: 'q8',

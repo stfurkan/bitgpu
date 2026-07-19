@@ -362,10 +362,11 @@ The Qwen3.5 hybrid **Bonsai-27B** loads exactly the same way - `fromGguf` is its
 no offline converter for the hybrid yet), so point at
 `prism-ml/Bonsai-27B-gguf/resolve/main/Bonsai-27B-Q1_0.gguf` with `kvCache: 'q8'` and, say,
 `maxSeqLen: 4096`. bitgpu runs its **text trunk** (the model is multimodal; the vision path is out of
-scope, and its chat template is not wired into `bitgpu/chat` yet - drive it at the `forward` /
-`generate` token-id level, or supply your own template). It is a ~3.8 GB download and comfortably
-wants a 16 GB (or larger) GPU budget - on an 8 GB laptop it runs but the weights spill to swap, so
-decode is slow.
+scope). Text chat works through `bitgpu/chat` unchanged - its Jinja template and tool-call rendering
+go through the same path as the dense models (verified end-to-end) - but the GGUF repo ships no
+tokenizer, so point `createChat` at [prism-ml/Bonsai-27B-unpacked](https://huggingface.co/prism-ml/Bonsai-27B-unpacked)
+for `tokenizer.json` + `tokenizer_config.json`. It is a ~3.8 GB download and comfortably wants a 16 GB
+(or larger) GPU budget - on an 8 GB laptop it runs but the weights spill to swap, so decode is slow.
 
 The in-browser parse is gated: it must deep-equal the offline converter's manifest AND an
 engine built from it must reproduce the known-good greedy ids bit-exactly on GPU. Prefer the
