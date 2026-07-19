@@ -11,8 +11,8 @@ struct Params { rows: u32, D: u32, dstRow0: u32, _p: u32 };
 @group(0) @binding(2) var<storage, read_write> dstQ: array<u32>;   // packed 4 x snorm8 per word
 @group(0) @binding(3) var<storage, read_write> dstS: array<f32>;   // [.., D/32] block scales
 
-var<workgroup> wabs: array<f32, 32>; // per-word abs max (D <= 128 -> at most 32 words)
-var<workgroup> wblk: array<f32, 4>;  // per-block scale (D/32 <= 4 blocks)
+var<workgroup> wabs: array<f32, 64>; // per-word abs max (D <= 256 -> at most 64 words)
+var<workgroup> wblk: array<f32, 8>;  // per-block scale (D/32 <= 8 blocks)
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {

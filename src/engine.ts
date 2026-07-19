@@ -285,12 +285,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && A.head_dim % sgMax === 0 && !forceNoSG
   // f16 KV STORAGE (math stays f32; one rounding at cache-write). 'f16' silently falls back to
   // f32 where shader-f16 is missing, so callers can request it unconditionally.
-  // The hybrid full-attention layers read the KV cache through their own online-softmax kernel,
-  // which only handles f32 storage for now, so quantized KV is forced off for qwen3_5 (a follow-up).
+  // The hybrid full-attention layers read the KV cache through their own online-softmax kernel:
+  // q8 has a dedicated dequant variant (attention_online_cache_kv8), so 'q8' works for qwen3_5 too
+  // (only the 16 full-attention layers hold KV - see kvLayers); f16 storage there is not yet wired,
+  // so 'f16' still falls back to f32 for the hybrid (use 'q8' for a quantized hybrid cache).
   const kv16 = opts.kvCache === 'f16' && !A.hybrid && adapter.features.has('shader-f16' as GPUFeatureName)
   // q8: packed snorm8 K/V with one f32 scale per 32-element block (q8_0-style). Pure core WGSL
   // (pack4x8snorm), so unlike f16 it needs no adapter feature - available everywhere.
-  const kv8 = opts.kvCache === 'q8' && !A.hybrid
+  const kv8 = opts.kvCache === 'q8'
   // Rolling window with attention sinks (StreamingLLM): keys cached UNROPED, rotated at read
   // by cache-relative position, middle evicted in batches. See the attention_*_roll shaders.
   const roll = opts.overflow === 'sinks'
@@ -466,7 +468,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     specs.push(['deltanet_recur', { WGV: A.hybrid.linear_head_dim }])
     specs.push(['deltanet_norm_gate', { WG: 64 }])
     specs.push(['attention_online', { WGD: A.head_dim }])
-    specs.push(['attention_online_cache', { WGD: A.head_dim }])
+    specs.push([kv8 ? 'attention_online_cache_kv8' : 'attention_online_cache', { WGD: A.head_dim }])
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
@@ -1374,10 +1376,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       run(pass, 'rope_partial', [['u', S], ['u', KV], ['u', Dh], ['u', ROPE_D]], [kn, cos, sin], kr, S * KV * Dh)
       const vv = actBuf(S * KV * Dh)
       fusedMM(pass, w('attn.v_proj'), n1, S, [vv, dummy, dummy2])
-      appendKV(pass, kr, 0, li, S * KV, posBase * KV) // roped K + V into the f32 cache
+      appendKV(pass, kr, 0, li, S * KV, posBase * KV) // roped K + V into the KV cache (f32 or q8)
       appendKV(pass, vv, 1, li, S * KV, posBase * KV)
       const att = actBuf(S * H * Dh)
-      runN(pass, 'attention_online_cache', [['u', S], ['u', H], ['u', KV], ['u', Dh], ['f', 1 / Math.sqrt(Dh)], ['u', posBase], ['u', 0], ['u', 0]], [qr, Kc[li], Vc[li]], att, S * H)
+      const aP: Array<['u' | 'f', number]> = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['f', 1 / Math.sqrt(Dh)], ['u', posBase], ['u', 0], ['u', 0]]
+      if (kv8) runN(pass, 'attention_online_cache_kv8', aP, [qr, Kc[li], Ksc[li], Vc[li], Vsc[li]], att, S * H)
+      else runN(pass, 'attention_online_cache', aP, [qr, Kc[li], Vc[li]], att, S * H)
       const gated = actBuf(S * H * Dh)
       run(pass, 'gate_sigmoid', [['u', S * H * Dh], ['u', 0], ['u', 0], ['u', 0]], [att, gate], gated, S * H * Dh)
       h2 = actBuf(S * Hd)

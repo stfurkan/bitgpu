@@ -67,7 +67,21 @@ try {
         let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
         growRef.push(am); gseq.push(am)
       }
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef }
+      // q8 KV cache for the 16 full-attention layers: the q8 dequant read (attention_online_cache_kv8)
+      // must round-trip what copy_kv8 wrote - q8 must actually engage (not silently fall back to f32),
+      // decode must still equal teacher-forced greedy, and logits stay close to f32 (one snorm8 rounding).
+      const eq8 = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35`, kvCache: 'q8' })
+      const q8mode = eq8.capabilities.kvCache
+      const rq8 = await eq8.forward(ids)
+      const genQ8 = (await eq8.generate(ids.slice(0, K), { maxTokens: N })).tokens
+      const s2 = ids.slice(0, K), refQ8 = []
+      for (let i = 0; i < N; i++) {
+        const fr = await eq8.forward(s2), Vv = fr.logits.length / s2.length
+        const last = fr.logits.slice((s2.length - 1) * Vv)
+        let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
+        refQ8.push(am); s2.push(am)
+      }
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8 }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -94,6 +108,19 @@ try {
   const growOk = JSON.stringify(out.growGen) === JSON.stringify(out.growRef)
   console.log(`  [${growOk ? 'PASS' : 'FAIL'}] decode==prefill across KV grow (>512)  gen=${JSON.stringify(out.growGen)} ref=${JSON.stringify(out.growRef)}`)
   if (!growOk) fail++
+  // q8 KV cache for the hybrid full-attention layers
+  const q8on = out.q8mode === 'q8'
+  console.log(`  [${q8on ? 'PASS' : 'FAIL'}] q8 KV engaged for hybrid (capabilities.kvCache=${out.q8mode})`)
+  if (!q8on) fail++
+  let q8mad = 0, q8dot = 0, q8na = 0, q8nb = 0
+  for (let i = 0; i < golden.logits.length; i++) { q8mad = Math.max(q8mad, Math.abs(out.q8logits[i] - golden.logits[i])); q8dot += out.q8logits[i] * golden.logits[i]; q8na += out.q8logits[i] ** 2; q8nb += golden.logits[i] ** 2 }
+  const q8cos = q8dot / (Math.sqrt(q8na) * Math.sqrt(q8nb) + 1e-9)
+  const q8cosOk = q8cos > 0.99
+  console.log(`  [${q8cosOk ? 'PASS' : 'FAIL'}] q8 logits vs f32 golden  cos=${q8cos.toFixed(6)} max|Δ|=${q8mad.toExponential(2)} (q8 is lossy; want cos>0.99)`)
+  if (!q8cosOk) fail++
+  const q8decOk = JSON.stringify(out.genQ8) === JSON.stringify(out.refQ8)
+  console.log(`  [${q8decOk ? 'PASS' : 'FAIL'}] q8 decode==prefill  gen=${JSON.stringify(out.genQ8)} ref=${JSON.stringify(out.refQ8)}`)
+  if (!q8decOk) fail++
 } finally {
   await browser.close(); server.close()
 }
