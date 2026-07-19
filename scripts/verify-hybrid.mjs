@@ -54,7 +54,20 @@ try {
         for (let j = 1; j < V; j++) if (last[j] > last[am]) am = j
         ref.push(am); seq.push(am)
       }
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref }
+      // KV-grow gate: force ensureKvCapacity past the 512-position initial cap. generate() reserves
+      // capacity for the whole run upfront, so a >512-token generation grows the cache - which for the
+      // hybrid grows KV ONLY for the full-attention layers (kvLayers in engine.ts). Re-check that
+      // incremental decode still equals teacher-forced greedy ACROSS the grow boundary.
+      const pad = Array.from({ length: 510 }, (_, i) => ids[i % ids.length]), GN = 8
+      const growGen = (await engine.generate(pad, { maxTokens: GN })).tokens
+      const gseq = pad.slice(), growRef = []
+      for (let i = 0; i < GN; i++) {
+        const fr = await engine.forward(gseq), Vv = fr.logits.length / gseq.length
+        const last = fr.logits.slice((gseq.length - 1) * Vv)
+        let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
+        growRef.push(am); gseq.push(am)
+      }
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -78,6 +91,9 @@ try {
   const decOk = JSON.stringify(out.gen) === JSON.stringify(out.ref)
   console.log(`  [${decOk ? 'PASS' : 'FAIL'}] decode==prefill  gen=${JSON.stringify(out.gen)} ref=${JSON.stringify(out.ref)}`)
   if (!decOk) fail++
+  const growOk = JSON.stringify(out.growGen) === JSON.stringify(out.growRef)
+  console.log(`  [${growOk ? 'PASS' : 'FAIL'}] decode==prefill across KV grow (>512)  gen=${JSON.stringify(out.growGen)} ref=${JSON.stringify(out.growRef)}`)
+  if (!growOk) fail++
 } finally {
   await browser.close(); server.close()
 }

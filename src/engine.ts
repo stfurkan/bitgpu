@@ -295,6 +295,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // by cache-relative position, middle evicted in batches. See the attention_*_roll shaders.
   const roll = opts.overflow === 'sinks'
   const SINKS = roll ? Math.max(1, Math.floor(opts.sinkTokens ?? 4)) : 0
+  if (roll && A.hybrid)
+    throw new Error("bitgpu: overflow 'sinks' is not yet supported for the qwen3_5 hybrid backbone (the full-attention read path has no sink/roll K-rotation, and windowing only the full layers while the linear layers keep full-history state is unvalidated)")
   if (roll && maxSeqLen < SINKS + 64)
     throw new Error(`bitgpu: overflow 'sinks' needs maxSeqLen >= sinkTokens + 64 (got ${maxSeqLen} with ${SINKS} sinks)`)
   const KVB = kv16 ? 2 : kv8 ? 1 : 4 // bytes per cached K/V element (q8 block scales tracked separately)
@@ -988,12 +990,20 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const Ksc: GPUBuffer[] = [],
     Vsc: GPUBuffer[] = []
   const kvScaleBytes = (cap: number): number => cap * KV * (Dh / 32) * 4
-  for (let li = 0; li < A.layers; li++) {
-    Kc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
-    Vc.push(device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD }))
+  // Layers that keep a KV cache: every layer for dense qwen3, but only the FULL-attention layers for
+  // the qwen3_5 hybrid - its 48 gated-DeltaNet layers carry O(1) recurrent+conv state (hyRS/hyCS
+  // below) instead of a per-position K/V, so allocating KV rows for them would be dead VRAM (~75% of
+  // the cache, ~1.5 GB on the 27B at 4096 ctx). Kc/Vc stay indexed BY LAYER INDEX; linear-layer slots
+  // are left empty (array holes) and never read - only the full branch of hybridLayer touches
+  // Kc[li]/Vc[li]. Every loop that walks the cache iterates kvLayers, not [0, A.layers).
+  const kvLayers: number[] = []
+  for (let li = 0; li < A.layers; li++) if (!A.hybrid || A.hybrid.layer_types[li] === 'full') kvLayers.push(li)
+  for (const li of kvLayers) {
+    Kc[li] = device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD })
+    Vc[li] = device.createBuffer({ size: kvCapacity * KV * Dh * KVB, usage: S_ | CS | CD })
     if (kv8) {
-      Ksc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
-      Vsc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
+      Ksc[li] = device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD })
+      Vsc[li] = device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD })
     }
   }
   // qwen3_5 hybrid decode state: per-linear-layer recurrent state RS[nv*dk*dv] and conv left-context
@@ -1045,15 +1055,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const copyScales = kvScaleBytes(kvCapacity)
     device.pushErrorScope('out-of-memory')
     const enc = device.createCommandEncoder()
-    // Every cache buffer this layer set held before the growth, in [K, V, (Ksc, Vsc)] groups.
-    const per = kv8 ? 4 : 2
-    const olds: GPUBuffer[] = []
-    for (let li = 0; li < A.layers; li++) {
+    // Every cache buffer this layer set held before the growth, keyed by layer index (sparse: only
+    // KV-bearing layers - all for dense, the full-attention layers for the hybrid).
+    const olds: GPUBuffer[][] = []
+    for (const li of kvLayers) {
       const nk = device.createBuffer({ size: newCap * KV * Dh * KVB, usage: S_ | CS | CD })
       const nv = device.createBuffer({ size: newCap * KV * Dh * KVB, usage: S_ | CS | CD })
       enc.copyBufferToBuffer(Kc[li], 0, nk, 0, copyBytes)
       enc.copyBufferToBuffer(Vc[li], 0, nv, 0, copyBytes)
-      olds.push(Kc[li], Vc[li])
+      const grp = [Kc[li], Vc[li]]
       Kc[li] = nk
       Vc[li] = nv
       if (kv8) {
@@ -1061,32 +1071,33 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         const nvs = device.createBuffer({ size: kvScaleBytes(newCap), usage: S_ | CS | CD })
         enc.copyBufferToBuffer(Ksc[li], 0, nks, 0, copyScales)
         enc.copyBufferToBuffer(Vsc[li], 0, nvs, 0, copyScales)
-        olds.push(Ksc[li], Vsc[li])
+        grp.push(Ksc[li], Vsc[li])
         Ksc[li] = nks
         Vsc[li] = nvs
       }
+      olds[li] = grp
     }
     device.queue.submit([enc.finish()])
     await device.queue.onSubmittedWorkDone()
     const oom = await device.popErrorScope()
     if (oom) {
       // Roll back to the old (still valid) buffers so the engine stays usable at its current size.
-      for (let li = 0; li < A.layers; li++) {
+      for (const li of kvLayers) {
         Kc[li].destroy()
         Vc[li].destroy()
-        Kc[li] = olds[per * li]
-        Vc[li] = olds[per * li + 1]
+        Kc[li] = olds[li][0]
+        Vc[li] = olds[li][1]
         if (kv8) {
           Ksc[li].destroy()
           Vsc[li].destroy()
-          Ksc[li] = olds[per * li + 2]
-          Vsc[li] = olds[per * li + 3]
+          Ksc[li] = olds[li][2]
+          Vsc[li] = olds[li][3]
         }
       }
       poolInvalidate()
       throw new GpuOutOfMemoryError(`KV cache growth to ${newCap} positions failed: ${oom.message}`)
     }
-    for (const b of olds) b.destroy()
+    for (const li of kvLayers) for (const b of olds[li]) b.destroy()
     kvCapacity = newCap
     poolInvalidate()
   }
@@ -1113,7 +1124,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
     const enc = device.createCommandEncoder()
     const groups: Array<[GPUBuffer, number]> = []
-    for (let li = 0; li < A.layers; li++) {
+    for (const li of kvLayers) {
       groups.push([Kc[li], rowK], [Vc[li], rowK])
       if (kv8) groups.push([Ksc[li], rowS], [Vsc[li], rowS])
     }
@@ -2194,10 +2205,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const ck: Record<string, Float32Array> = {}
       for (const [name, b] of Object.entries(DBG0)) ck[name] = await readback(b, b.size / 4)
       const off = pos * KV * Dh
-      if (!kv16 && !kv8) {
-        // f32-mode only: readback() types the bytes as f32, which is wrong for an f16/q8 cache
-        ck.kc = (await readback(Kc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh) // kvCapacity, not maxSeqLen: the cache may not have grown yet
-        ck.vc = (await readback(Vc[0], kvCapacity * KV * Dh)).slice(off, off + KV * Dh)
+      if (!kv16 && !kv8 && kvLayers.length) {
+        // f32-mode only: readback() types the bytes as f32, which is wrong for an f16/q8 cache.
+        // kvLayers[0] is layer 0 for dense, the first full-attention layer for the hybrid.
+        const dl = kvLayers[0]
+        ck.kc = (await readback(Kc[dl], kvCapacity * KV * Dh)).slice(off, off + KV * Dh) // kvCapacity, not maxSeqLen: the cache may not have grown yet
+        ck.vc = (await readback(Vc[dl], kvCapacity * KV * Dh)).slice(off, off + KV * Dh)
       }
       ck.fn = await readback(r.fn, Hd)
       ck.logits = await readback(lg, W.lm_head.N!)
@@ -2436,6 +2449,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const snapshotBytes = (len: number): number => A.layers * 2 * len * (kvRowBytes + scRowBytes)
 
   async function saveCache(opts?: { from?: number }): Promise<KvSnapshot | null> {
+    if (A.hybrid)
+      throw new Error('saveCache: KV snapshots are not yet supported for the qwen3_5 hybrid backbone (the DeltaNet recurrent/conv state is not captured)')
     if (fullHistory.length === 0) return null
     const len = roll ? cacheLen : fullHistory.length - 1 // rolled cache: slots, not history
     // DELTA: exclude the first `base` cache positions (a shared prewarmed prefix). Each cache
@@ -2479,6 +2494,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
 
   async function restoreCache(snap: KvSnapshot): Promise<void> {
+    if (A.hybrid)
+      throw new Error('restoreCache: KV snapshots are not yet supported for the qwen3_5 hybrid backbone (the DeltaNet recurrent/conv state is not captured)')
     if (!snap || (snap.version !== 1 && snap.version !== 2)) throw new Error(`restoreCache: unsupported snapshot version ${snap?.version}`)
     if ((snap.version === 2) !== roll)
       throw new Error(
