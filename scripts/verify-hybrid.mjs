@@ -44,7 +44,17 @@ try {
       const { createEngine } = await import(`${base}/dist/index.js`)
       const engine = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
       const r = await engine.forward(ids)
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits] }
+      // decode gate: incremental stateful generate() must equal teacher-forced greedy via forward()
+      const K = Math.max(1, Math.min(4, ids.length - 1)), N = Math.min(5, ids.length - K)
+      const gen = (await engine.generate(ids.slice(0, K), { maxTokens: N })).tokens
+      const seq = ids.slice(0, K), ref = []
+      for (let i = 0; i < N; i++) {
+        const fr = await engine.forward(seq); const V = fr.logits.length / seq.length
+        const last = fr.logits.slice((seq.length - 1) * V); let am = 0
+        for (let j = 1; j < V; j++) if (last[j] > last[am]) am = j
+        ref.push(am); seq.push(am)
+      }
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -64,8 +74,12 @@ try {
   const myArg = last.indexOf(Math.max(...last))
   console.log(`  argmax(last): engine=${myArg} golden=${params.argmax_last} ${myArg === params.argmax_last ? 'MATCH' : 'MISMATCH'}`)
   if (myArg !== params.argmax_last) fail++
+  // decode == prefill: stateful incremental decode must equal teacher-forced greedy
+  const decOk = JSON.stringify(out.gen) === JSON.stringify(out.ref)
+  console.log(`  [${decOk ? 'PASS' : 'FAIL'}] decode==prefill  gen=${JSON.stringify(out.gen)} ref=${JSON.stringify(out.ref)}`)
+  if (!decOk) fail++
 } finally {
   await browser.close(); server.close()
 }
-console.log(fail === 0 ? '\nHYBRID FORWARD PASS' : `\n${fail} CHECK(S) FAILED`)
+console.log(fail === 0 ? '\nHYBRID FORWARD + DECODE PASS' : `\n${fail} CHECK(S) FAILED`)
 process.exit(fail === 0 ? 0 : 1)

@@ -44,12 +44,15 @@ def cfg(dk, dv, nk=1, nv=1):
                        rot_dim=0, rope_theta=1e7, n_k_heads=nk, n_v_heads=nv, k_dim=dk, v_dim=dv, conv_kernel=4)
 
 
-# conv1d: depthwise causal (K=4) + silu
+# conv1d: depthwise causal (K=4) + silu, with left-context state (loadState=0: zero pad == original)
 S, C, K = 16, 512, 4
 x = np.random.randn(S, C).astype(np.float32)
 wc = (np.random.randn(C, 1, K) * 0.5).astype(np.float32)
+statein = np.zeros((K - 1) * C, np.float32)
+total = S * C + (K - 1) * C
 dump("conv1d", "conv1d_causal.wgsl", [["u", S], ["u", C], ["u", K], ["u", 0]],
-     [x, wc[:, 0, :]], q._conv1d_causal(x, wc, S), S * C)
+     [x, wc[:, 0, :], statein], q._conv1d_causal(x, wc, S), S * C,
+     dispatch=[(total + 63) // 64, 1], out_len2=(K - 1) * C)
 
 # gated DeltaNet recurrent scan (decode path); HK<H exercises the GQA repeat (value_heads>key_heads)
 S2, H2, HK2, DK, DV = 8, 4, 2, 128, 128       # rep = H2/HK2 = 2

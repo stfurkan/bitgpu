@@ -285,10 +285,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const useSG = hasSG && sgMin === sgMax && (sgMax === 16 || sgMax === 32 || sgMax === 64) && A.head_dim % sgMax === 0 && !forceNoSG
   // f16 KV STORAGE (math stays f32; one rounding at cache-write). 'f16' silently falls back to
   // f32 where shader-f16 is missing, so callers can request it unconditionally.
-  const kv16 = opts.kvCache === 'f16' && adapter.features.has('shader-f16' as GPUFeatureName)
+  // The hybrid full-attention layers read the KV cache through their own online-softmax kernel,
+  // which only handles f32 storage for now, so quantized KV is forced off for qwen3_5 (a follow-up).
+  const kv16 = opts.kvCache === 'f16' && !A.hybrid && adapter.features.has('shader-f16' as GPUFeatureName)
   // q8: packed snorm8 K/V with one f32 scale per 32-element block (q8_0-style). Pure core WGSL
   // (pack4x8snorm), so unlike f16 it needs no adapter feature - available everywhere.
-  const kv8 = opts.kvCache === 'q8'
+  const kv8 = opts.kvCache === 'q8' && !A.hybrid
   // Rolling window with attention sinks (StreamingLLM): keys cached UNROPED, rotated at read
   // by cache-relative position, middle evicted in batches. See the attention_*_roll shaders.
   const roll = opts.overflow === 'sinks'
@@ -462,6 +464,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     specs.push(['deltanet_recur', { WGV: A.hybrid.linear_head_dim }])
     specs.push(['deltanet_norm_gate', { WG: 64 }])
     specs.push(['attention_online', { WGD: A.head_dim }])
+    specs.push(['attention_online_cache', { WGD: A.head_dim }])
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
@@ -993,6 +996,22 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       Vsc.push(device.createBuffer({ size: kvScaleBytes(kvCapacity), usage: S_ | CS | CD }))
     }
   }
+  // qwen3_5 hybrid decode state: per-linear-layer recurrent state RS[nv*dk*dv] and conv left-context
+  // CS[(convK-1)*conv_dim], PING-PONGED (WebGPU forbids state_in aliasing state_out). The parity flips
+  // per stack() call so segmented prefill and token decode both continue the recurrence; a fresh
+  // segment (posBase 0 -> loadState 0) re-inits from the zero-filled buffer. Linear layers only.
+  const hyRS: GPUBuffer[][] = [], // [li] -> [half0, half1] ping-pong recurrent state (linear layers)
+    hyCS: GPUBuffer[][] = [] //     [li] -> [half0, half1] ping-pong conv left-context
+  let hyPar = 0
+  if (A.hybrid) {
+    const rsSz = NV * DKV * DKV * 4,
+      csSz = (CONVK - 1) * CONVDIM * 4
+    for (let li = 0; li < A.layers; li++) {
+      if (A.hybrid.layer_types[li] !== 'linear') continue
+      hyRS[li] = [device.createBuffer({ size: rsSz, usage: S_ | CD }), device.createBuffer({ size: rsSz, usage: S_ | CD })]
+      hyCS[li] = [device.createBuffer({ size: csSz, usage: S_ | CD }), device.createBuffer({ size: csSz, usage: S_ | CD })]
+    }
+  }
   // Sink-mode statics: the aux rope tables ([window, Dh/2]) for the read-time K rotation, and
   // cos=1/sin=0 stand-ins so the K WRITE kernels store the un-roped rmsnorm output unchanged
   // (nd*1 + rot*0 == nd; no separate no-rope kernel variants needed).
@@ -1286,9 +1305,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // SwiGLU MLP. This is the forward()/prefill path - the recurrent scan and causal conv run over the
   // whole S-token segment from zero state (persistent decode state is a later addition). The 1-bit
   // projections reuse the existing GEMV; the plain norms carry their (1+weight) scale baked at load.
-  function hybridLayer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
+  function hybridLayer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const hy = manifest.arch.hybrid!
     const w = (r: string): GpuWeight => W[`layers.${li}.${r}`]
+    const ls = posBase > 0 ? 1 : 0 // continue the recurrence unless this is a fresh segment
+    const par = hyPar // ping-pong read/write halves; flipped once per stack() call
     const n1 = actBuf(S * Hd)
     rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1)
     let h2: GPUBuffer
@@ -1296,7 +1317,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const mixed = actBuf(S * CONVDIM)
       fusedMM(pass, w('linear.in_qkv'), n1, S, [mixed, dummy, dummy2]) // hidden -> q|k|v
       const convd = actBuf(S * CONVDIM)
-      run(pass, 'conv1d_causal', [['u', S], ['u', CONVDIM], ['u', CONVK], ['u', 0]], [mixed, w('linear.conv1d').buf!], convd, S * CONVDIM)
+      const cvSt = (CONVK - 1) * CONVDIM
+      setup(pass, 'conv1d_causal', [['u', S], ['u', CONVDIM], ['u', CONVK], ['u', ls]], [mixed, w('linear.conv1d').buf!, hyCS[li][par]], [convd, hyCS[li][par ^ 1]])
+      {
+        const [gx, gy] = grid2d(Math.ceil((S * CONVDIM + cvSt) / 64))
+        pass.dispatchWorkgroups(gx, gy, 1)
+      }
       const q = actBuf(S * KEYDIM),
         k = actBuf(S * KEYDIM),
         v = actBuf(S * VALDIM)
@@ -1310,10 +1336,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const gb = actBuf(2 * S * NV) // [g (S*NV) ; beta (S*NV)]
       run(pass, 'deltanet_gbeta', [['u', S], ['u', NV], ['u', 0], ['u', 0]], [a, b, w('linear.A_log').buf!, w('linear.dt_bias').buf!], gb, S * NV)
       const core = actBuf(S * VALDIM)
-      const stSz = NV * DKV * DKV
-      const stIn = actBuf(stSz),
-        stOut = actBuf(stSz) // prefill: loadState=0 (zero init), final state discarded (persistent decode state is stage 3c)
-      setup(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', 0], ['u', 0]], [q, k, v, gb, gb, stIn], [core, stOut])
+      setup(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', ls], ['u', 0]], [q, k, v, gb, gb, hyRS[li][par]], [core, hyRS[li][par ^ 1]])
       pass.dispatchWorkgroups(NV)
       const z = actBuf(S * VALDIM)
       fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2])
@@ -1340,8 +1363,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       run(pass, 'rope_partial', [['u', S], ['u', KV], ['u', Dh], ['u', ROPE_D]], [kn, cos, sin], kr, S * KV * Dh)
       const vv = actBuf(S * KV * Dh)
       fusedMM(pass, w('attn.v_proj'), n1, S, [vv, dummy, dummy2])
+      appendKV(pass, kr, 0, li, S * KV, posBase * KV) // roped K + V into the f32 cache
+      appendKV(pass, vv, 1, li, S * KV, posBase * KV)
       const att = actBuf(S * H * Dh)
-      runN(pass, 'attention_online', [['u', S], ['u', H], ['u', KV], ['u', Dh], ['f', 1 / Math.sqrt(Dh)], ['u', 0], ['u', 0], ['u', 0]], [qr, kr, vv], att, S * H)
+      runN(pass, 'attention_online_cache', [['u', S], ['u', H], ['u', KV], ['u', Dh], ['f', 1 / Math.sqrt(Dh)], ['u', posBase], ['u', 0], ['u', 0]], [qr, Kc[li], Vc[li]], att, S * H)
       const gated = actBuf(S * H * Dh)
       run(pass, 'gate_sigmoid', [['u', S * H * Dh], ['u', 0], ['u', 0], ['u', 0]], [att, gate], gated, S * H * Dh)
       h2 = actBuf(S * Hd)
@@ -1362,7 +1387,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
   function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
     const Ltot = posBase + S
-    if (manifest.arch.hybrid) return hybridLayer(pass, li, h, S, cos, sin)
+    if (manifest.arch.hybrid) return hybridLayer(pass, li, h, S, posBase, cos, sin)
     // f16-activation decode (activation:'f16'): active exactly when the fused S===1 subgroup path
     // runs. The normalized activations (n1/n2) and the SwiGLU intermediate (sw) go f16; the
     // residual stream, attention, o_proj and weights stay f32, so nothing downstream changes.
@@ -1476,6 +1501,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       cur = layer(pass, li, cur, S, posBase, cos, sin)
       if (li === 0) layer0 = cur
     }
+    if (A.hybrid) hyPar ^= 1 // advance the recurrent/conv ping-pong for the next segment or decode token
     const fn = actBuf(S * Hd)
     rms(pass, cur, FINAL_NORM, S, Hd, fn)
     pass.end()
