@@ -1263,11 +1263,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         ? runN(pass, 'rmsnorm_sg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
         : runN(pass, 'rmsnorm_wg', [['u', R], ['u', Dn], ['f', A.rms_eps], ['u', 0]], [x, W[g].buf!], out, R)
   // fused q/k/v or gate/up matmul
-  function fusedMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, S: number, outs: GPUBuffer[]): void {
+  function fusedMM(pass: GPUComputePassEncoder, w: GpuWeight, inBuf: GPUBuffer, S: number, outs: GPUBuffer[], af = false): void {
     const Ntot = w.N0! + w.N1! + w.N2!
     if (useSG && S === 1) {
       const gx = Math.min(Ntot, 65535)
-      runWG(pass, 'matmul_split_sg', [['u', w.K!], ['u', w.nb!], ['u', w.N0!], ['u', w.N1!], ['u', w.N2!], ['u', gx]], [inBuf, w.sign!, w.scales!], outs, gx, Math.ceil(Ntot / gx))
+      // af: the input activation is f16 (decode f16-activation mode); outputs stay f32.
+      runWG(pass, af ? 'matmul_split_sg_af16' : 'matmul_split_sg', [['u', w.K!], ['u', w.nb!], ['u', w.N0!], ['u', w.N1!], ['u', w.N2!], ['u', gx]], [inBuf, w.sign!, w.scales!], outs, gx, Math.ceil(Ntot / gx))
     } else if (S === 1) {
       const gx = Math.min(Ntot, 65535) // no-subgroup decode: workgroup-reduction GEMV
       runWG(pass, 'matmul_split_wg', [['u', w.K!], ['u', w.nb!], ['u', w.N0!], ['u', w.N1!], ['u', w.N2!], ['u', gx]], [inBuf, w.sign!, w.scales!], outs, gx, Math.ceil(Ntot / gx))
@@ -1328,12 +1329,16 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const w = (r: string): GpuWeight => W[`layers.${li}.${r}`]
     const ls = posBase > 0 ? 1 : 0 // continue the recurrence unless this is a fresh segment
     const par = hyPar // ping-pong read/write halves; flipped once per stack() call
-    const n1 = actBuf(S * Hd)
-    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1)
+    // f16-activation decode (activation:'f16'): the RMSNorm outputs feeding the 1-bit projection GEMVs
+    // go f16 (the matmuls read f16, accumulate + output f32); the conv1d, DeltaNet recurrence and
+    // attention stay f32, and the residual stream stays f32. Pays on packed-f16 GPUs (NVIDIA/AMD).
+    const af = actF16 && S === 1 && !FORCE_SLOW
+    const n1 = af ? actBuf16(S * Hd) : actBuf(S * Hd)
+    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1, af)
     let h2: GPUBuffer
     if (hy.layer_types[li] === 'linear') {
       const mixed = actBuf(S * CONVDIM)
-      fusedMM(pass, w('linear.in_qkv'), n1, S, [mixed, dummy, dummy2]) // hidden -> q|k|v
+      fusedMM(pass, w('linear.in_qkv'), n1, S, [mixed, dummy, dummy2], af) // hidden -> q|k|v
       const convd = actBuf(S * CONVDIM)
       const cvSt = (CONVK - 1) * CONVDIM
       setup(pass, 'conv1d_causal', [['u', S], ['u', CONVDIM], ['u', CONVK], ['u', ls]], [mixed, w('linear.conv1d').buf!, hyCS[li][par]], [convd, hyCS[li][par ^ 1]])
@@ -1349,22 +1354,22 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       run(pass, 'slice_cols', [['u', S], ['u', VALDIM], ['u', CONVDIM], ['u', 2 * KEYDIM]], [convd], v, S * VALDIM)
       const a = actBuf(S * NV),
         b = actBuf(S * NV)
-      fusedMM(pass, w('linear.a'), n1, S, [a, dummy, dummy2])
-      fusedMM(pass, w('linear.b'), n1, S, [b, dummy, dummy2])
+      fusedMM(pass, w('linear.a'), n1, S, [a, dummy, dummy2], af)
+      fusedMM(pass, w('linear.b'), n1, S, [b, dummy, dummy2], af)
       const gb = actBuf(2 * S * NV) // [g (S*NV) ; beta (S*NV)]
       run(pass, 'deltanet_gbeta', [['u', S], ['u', NV], ['u', 0], ['u', 0]], [a, b, w('linear.A_log').buf!, w('linear.dt_bias').buf!], gb, S * NV)
       const core = actBuf(S * VALDIM)
       setup(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', ls], ['u', 0]], [q, k, v, gb, gb, hyRS[li][par]], [core, hyRS[li][par ^ 1]])
       pass.dispatchWorkgroups(NV)
       const z = actBuf(S * VALDIM)
-      fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2])
+      fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2], af)
       const normed = actBuf(S * VALDIM)
       runN(pass, 'deltanet_norm_gate', [['u', S * NV], ['u', DKV], ['f', A.rms_eps], ['u', 0]], [core, z, w('linear.norm').buf!], normed, S * NV)
       h2 = actBuf(S * Hd)
       residMM(pass, w('linear.out_proj'), normed, h, S, h2)
     } else {
       const qg = actBuf(S * H * Dh * 2)
-      fusedMM(pass, w('attn.q_proj'), n1, S, [qg, dummy, dummy2]) // doubled: query | gate
+      fusedMM(pass, w('attn.q_proj'), n1, S, [qg, dummy, dummy2], af) // doubled: query | gate
       const query = actBuf(S * H * Dh),
         gate = actBuf(S * H * Dh)
       run(pass, 'split_head', [['u', S], ['u', H], ['u', Dh], ['u', 0]], [qg], query, S * H * Dh)
@@ -1374,13 +1379,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       rms(pass, query, `layers.${li}.attn.q_norm`, S * H, Dh, qn)
       run(pass, 'rope_partial', [['u', S], ['u', H], ['u', Dh], ['u', ROPE_D]], [qn, cos, sin], qr, S * H * Dh)
       const kk = actBuf(S * KV * Dh)
-      fusedMM(pass, w('attn.k_proj'), n1, S, [kk, dummy, dummy2])
+      fusedMM(pass, w('attn.k_proj'), n1, S, [kk, dummy, dummy2], af)
       const kn = actBuf(S * KV * Dh),
         kr = actBuf(S * KV * Dh)
       rms(pass, kk, `layers.${li}.attn.k_norm`, S * KV, Dh, kn)
       run(pass, 'rope_partial', [['u', S], ['u', KV], ['u', Dh], ['u', ROPE_D]], [kn, cos, sin], kr, S * KV * Dh)
       const vv = actBuf(S * KV * Dh)
-      fusedMM(pass, w('attn.v_proj'), n1, S, [vv, dummy, dummy2])
+      fusedMM(pass, w('attn.v_proj'), n1, S, [vv, dummy, dummy2], af)
       appendKV(pass, kr, 0, li, S * KV, posBase * KV) // roped K + V into the KV cache (f32 or q8)
       appendKV(pass, vv, 1, li, S * KV, posBase * KV)
       const att = actBuf(S * H * Dh)
@@ -1392,12 +1397,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       h2 = actBuf(S * Hd)
       residMM(pass, w('attn.o_proj'), gated, h, S, h2)
     }
-    const n2 = actBuf(S * Hd)
-    rms(pass, h2, `layers.${li}.post_attention_layernorm`, S, Hd, n2)
+    const n2 = af ? actBuf16(S * Hd) : actBuf(S * Hd)
+    rms(pass, h2, `layers.${li}.post_attention_layernorm`, S, Hd, n2, af)
     const g = actBuf(S * F),
       u = actBuf(S * F)
-    fusedMM(pass, w('mlp.gate_proj'), n2, S, [g, dummy, dummy2])
-    fusedMM(pass, w('mlp.up_proj'), n2, S, [u, dummy, dummy2])
+    fusedMM(pass, w('mlp.gate_proj'), n2, S, [g, dummy, dummy2], af)
+    fusedMM(pass, w('mlp.up_proj'), n2, S, [u, dummy, dummy2], af)
     const sw = actBuf(S * F)
     run(pass, 'swiglu', [['u', S * F], ['u', 0], ['u', 0], ['u', 0]], [g, u], sw, S * F)
     const hn = actBuf(S * Hd)

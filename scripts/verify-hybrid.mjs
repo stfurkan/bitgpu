@@ -81,6 +81,20 @@ try {
         let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
         refQ8.push(am); s2.push(am)
       }
+      // f16 activations for hybrid decode (activation:'f16'): the projection GEMVs read f16 norm
+      // outputs (matmuls accumulate + output f32); the DeltaNet recurrence stays f32. Must actually
+      // engage on a shader-f16 adapter and stay greedy-exact vs f32 (one f16 rounding of the norm).
+      const ef16 = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35`, activation: 'f16' })
+      const af16mode = ef16.capabilities.activation
+      const rf16 = await ef16.forward(ids)
+      const genF16 = (await ef16.generate(ids.slice(0, K), { maxTokens: N })).tokens
+      const s3 = ids.slice(0, K), refF16 = []
+      for (let i = 0; i < N; i++) {
+        const fr = await ef16.forward(s3), Vv = fr.logits.length / s3.length
+        const last = fr.logits.slice((s3.length - 1) * Vv)
+        let am = 0; for (let j = 1; j < Vv; j++) if (last[j] > last[am]) am = j
+        refF16.push(am); s3.push(am)
+      }
       // snapshot persistence: save after turn 1, restore into a FRESH engine, continue with reuse -
       // must equal a cold full-prefill of [history, delta] then generate. Proves saveCache captured the
       // full-attention KV AND the DeltaNet recurrent/conv state, and restore + the re-fed reuse path
@@ -96,7 +110,7 @@ try {
       const eR = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
       await eR.restoreCache(snap)
       const snapRestored = (await eR.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -136,6 +150,18 @@ try {
   const q8decOk = JSON.stringify(out.genQ8) === JSON.stringify(out.refQ8)
   console.log(`  [${q8decOk ? 'PASS' : 'FAIL'}] q8 decode==prefill  gen=${JSON.stringify(out.genQ8)} ref=${JSON.stringify(out.refQ8)}`)
   if (!q8decOk) fail++
+  // f16 activations for the hybrid decode
+  const af16on = out.af16mode === 'f16'
+  console.log(`  [${af16on ? 'PASS' : 'WARN'}] f16 activations engaged for hybrid (capabilities.activation=${out.af16mode}${af16on ? '' : ' - adapter lacks shader-f16, fell back to f32'})`)
+  if (!af16on) fail++
+  let afmad = 0, afdot = 0, afna = 0, afnb = 0, afArg = 0, gArg = 0
+  for (let i = 0; i < golden.logits.length; i++) { afmad = Math.max(afmad, Math.abs(out.af16logits[i] - golden.logits[i])); afdot += out.af16logits[i] * golden.logits[i]; afna += out.af16logits[i] ** 2; afnb += golden.logits[i] ** 2; if (out.af16logits[i] > out.af16logits[afArg]) afArg = i; if (golden.logits[i] > golden.logits[gArg]) gArg = i }
+  const afcos = afdot / (Math.sqrt(afna) * Math.sqrt(afnb) + 1e-9), afArgOk = afArg === gArg
+  console.log(`  [${afcos > 0.99 && afArgOk ? 'PASS' : 'FAIL'}] f16-act logits vs f32 golden  cos=${afcos.toFixed(6)} max|Δ|=${afmad.toExponential(2)} argmax ${afArg}${afArgOk ? '==' : '!='}${gArg} (greedy-exact)`)
+  if (!(afcos > 0.99 && afArgOk)) fail++
+  const af16decOk = JSON.stringify(out.genF16) === JSON.stringify(out.refF16)
+  console.log(`  [${af16decOk ? 'PASS' : 'FAIL'}] f16-act decode==prefill  gen=${JSON.stringify(out.genF16)} ref=${JSON.stringify(out.refF16)}`)
+  if (!af16decOk) fail++
   const reuseOk = JSON.stringify(out.reuseOnly) === JSON.stringify(out.snapFull)
   console.log(`  [${reuseOk ? 'PASS' : 'FAIL'}] reuseCache continue == cold full-prefill  reuse=${JSON.stringify(out.reuseOnly)} full=${JSON.stringify(out.snapFull)}`)
   if (!reuseOk) fail++
