@@ -105,19 +105,42 @@ function softmax(arr: Float32Array | number[]): number[] {
 }
 
 /** Final sampling tail. `candVals` are the K largest PENALTY-FILTERED logits (descending), `candIds`
- *  their token ids. Applies temperature to the K values, softmaxes, then draws via the exact
- *  transformers.js inverse-CDF weighted pick (x = random()*sum; subtract until <0). Returns a token id. */
-export function sampleFromCandidates(candIds: Uint32Array | number[], candVals: Float32Array | number[], temperature: number, rng: MT19937): number {
+ *  their token ids. Applies temperature to the K values, softmaxes, optionally trims the pool with
+ *  top-p (nucleus) and/or min-p, then draws via the exact transformers.js inverse-CDF weighted pick
+ *  (x = random()*sum; subtract until <0). `topP` (default 1 = off) keeps the shortest leading run
+ *  whose cumulative probability reaches topP; `minP` (default 0 = off) keeps tokens with probability
+ *  >= minP*maxProb - both operate on the already-descending candidates, so each keeps a prefix and
+ *  the kept set is their shorter prefix. With both off the draw is bit-identical to the plain path
+ *  (m == k, sum over all K). Returns a token id. */
+export function sampleFromCandidates(candIds: Uint32Array | number[], candVals: Float32Array | number[], temperature: number, rng: MT19937, topP = 1, minP = 0): number {
   const k = candVals.length
   const tv = new Float32Array(k)
   for (let i = 0; i < k; ++i) tv[i] = candVals[i] / temperature // divide (exact for any T), matches TemperatureLogitsWarper
   const probs = softmax(tv)
+  let m = k
+  if (minP > 0) {
+    const thresh = minP * probs[0] // probs[0] is the max (candidates descending)
+    let c = 1
+    while (c < k && probs[c] >= thresh) c++
+    if (c < m) m = c
+  }
+  if (topP < 1) {
+    let cum = 0
+    let c = 0
+    while (c < k) {
+      cum += probs[c]
+      c++
+      if (cum >= topP) break // include the token that crosses the threshold (HF TopP shift-by-one)
+    }
+    if (c < m) m = c
+  }
+  if (m < 1) m = 1
   let sum = 0
-  for (const pr of probs) sum += pr
+  for (let i = 0; i < m; ++i) sum += probs[i]
   let x = rng.random() * sum
-  for (let i = 0; i < k; ++i) {
+  for (let i = 0; i < m; ++i) {
     x -= probs[i]
     if (x < 0) return candIds[i]
   }
-  return candIds[k - 1] // floating-point guard, matches _weightedIndexWith
+  return candIds[m - 1] // floating-point guard, matches _weightedIndexWith
 }

@@ -84,6 +84,12 @@ const VIEW: Record<string, TypedArrayCtor> = { FLOAT: Float32Array, UINT8: Uint8
 const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rope', 'swiglu', 'copy']
 const DEFAULT_MAX_SEQ = 2048
 const PREFILL_SEG = 256 // prefill segment length; see runPrefill for why prefills are segmented
+// The hybrid DeltaNet scan accumulates its per-head state in registers across a whole prefill
+// segment; over a long segment x 64 layers the running state loses enough precision to corrupt the
+// output (coherent for short prompts, degenerate past ~50 tokens). Flushing the recurrence to the
+// f32 state buffer more often - a shorter prefill segment - keeps it stable (decode, which round-
+// trips the state every token, is unaffected). Dense models keep the full 256 segment.
+const PREFILL_SEG_HYBRID = 16
 
 const PARAM_AB = new ArrayBuffer(64)
 const PARAM_DV = new DataView(PARAM_AB)
@@ -1551,9 +1557,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       finalnorm = new Float32Array(S * Hd),
       logits = new Float32Array(S * vocab)
     transients = []
+    const prefillSeg = A.hybrid ? PREFILL_SEG_HYBRID : PREFILL_SEG
     try {
-      for (let off = 0; off < S; off += PREFILL_SEG) {
-        const seg = ids.slice(off, off + PREFILL_SEG)
+      for (let off = 0; off < S; off += prefillSeg) {
+        const seg = ids.slice(off, off + prefillSeg)
         const enc = device.createCommandEncoder()
         const embedOut = embedBatch(enc, seg)
         const { fn, layer0: l0 } = stack(enc, embedOut, seg.length, off)
@@ -1589,18 +1596,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
-    for (let off = 0; off < ids.length; off += PREFILL_SEG) {
+    const prefillSeg = A.hybrid ? PREFILL_SEG_HYBRID : PREFILL_SEG
+    for (let off = 0; off < ids.length; off += prefillSeg) {
       if (off > 0 && signal?.aborted) {
         fullHistory = []
         cacheLen = 0
         return null
       }
-      const seg = ids.slice(off, off + PREFILL_SEG)
+      const seg = ids.slice(off, off + prefillSeg)
       const enc = device.createCommandEncoder()
       fn = stack(enc, embedBatch(enc, seg), seg.length, posBase + off).fn
       lastRow = seg.length - 1
       device.queue.submit([enc.finish()])
-      if (off + PREFILL_SEG < ids.length) {
+      if (off + prefillSeg < ids.length) {
         await device.queue.onSubmittedWorkDone()
         flushTransients() // this segment's scratch is dead; the peak stays at one segment
       }
@@ -1744,6 +1752,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const KT = Math.max(K, lpN)
     const temperature = genOpts.temperature ?? 1
     const penalty = genOpts.repetitionPenalty ?? 1
+    const presence = genOpts.presencePenalty ?? 0
+    const topP = genOpts.topP ?? 1
+    const minP = genOpts.minP ?? 0
     const ngramN = genOpts.noRepeatNgramSize ?? 0
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
@@ -1763,7 +1774,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
     // upload the CPU-computed deduped id set + ngram bans for the current history; return their lengths
     const writeAffBan = (history: number[]): { affLen: number; banLen: number } => {
-      const aff = penalty !== 1 ? affectedIds(history) : new Uint32Array(0)
+      const aff = penalty !== 1 || presence !== 0 ? affectedIds(history) : new Uint32Array(0)
       if (aff.length) device.queue.writeBuffer(affBuf, 0, aff)
       const ban = ngramN > 0 ? ngramBans(history, ngramN) : []
       if (ban.length) device.queue.writeBuffer(banBuf, 0, Uint32Array.from(ban))
@@ -1773,7 +1784,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // lm_head wrote lg). The log-sum-exp runs BEFORE the argmax rounds: those mask their winners
     // in lg in place, which would corrupt the sum.
     const samplerChain = (pass: GPUComputePassEncoder, affLen: number, banLen: number): void => {
-      setup(pass, 'sampler_penalty', [['u', affLen], ['u', banLen], ['f', penalty], ['u', 0xff800000]], [affBuf, banBuf], [lg])
+      setup(pass, 'sampler_penalty', [['u', affLen], ['u', banLen], ['f', penalty], ['u', 0xff800000], ['f', presence]], [affBuf, banBuf], [lg])
       pass.dispatchWorkgroups(1)
       if (lpN) {
         setup(pass, 'logsumexp', [['u', vocab], ['u', 0], ['u', 0], ['u', 0]], [lg], [lseBuf])
@@ -1813,7 +1824,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const pick = (ciAll: Uint32Array, cvAll: Float32Array): number => {
       const ci = ciAll.subarray(0, K)
       const cv = cvAll.subarray(0, K)
-      const tk = sampled ? sampleFromCandidates(ci, cv, temperature, rng) : ci[0]
+      const tk = sampled ? sampleFromCandidates(ci, cv, temperature, rng, topP, minP) : ci[0]
       chosenLogit = cv[ci.indexOf(tk)]
       return tk
     }
@@ -1837,7 +1848,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             pIds.push(ci[i])
             pVals.push(cv[i])
           }
-        const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+        const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng, topP, minP) : pIds[0]
         chosenLogit = pVals[pIds.indexOf(tk)]
         return tk
       }
@@ -1863,7 +1874,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         }
       }
       if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
-      const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng) : pIds[0]
+      const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng, topP, minP) : pIds[0]
       chosenLogit = pVals[pIds.indexOf(tk)]
       return tk
     }
@@ -1975,6 +1986,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const K = Math.max(1, Math.min(genOpts.topK ?? 20, vocab))
     const temperature = genOpts.temperature ?? 1
     const penalty = genOpts.repetitionPenalty ?? 1
+    const presence = genOpts.presencePenalty ?? 0
+    const topP = genOpts.topP ?? 1
+    const minP = genOpts.minP ?? 0
     const ngramN = genOpts.noRepeatNgramSize ?? 0
     const pl = typeof genOpts.promptLookup === 'object' && genOpts.promptLookup !== null ? genOpts.promptLookup : {}
     const ngramSize = Math.max(2, pl.ngramSize ?? 3)
@@ -1983,9 +1997,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const onToken = genOpts.onToken
     const signal = genOpts.signal
     const rng = rngIn ?? new MT19937(genOpts.seed)
-    // Greedy with processors (repetition_penalty / no_repeat_ngram) also needs the per-row sampler
-    // chain - the penalties see each row's history - but picks the penalized argmax, no RNG draw.
-    const useChain = sampled || penalty !== 1 || ngramN > 0
+    // Greedy with processors (repetition_penalty / presence_penalty / no_repeat_ngram) also needs the
+    // per-row sampler chain - the penalties see each row's history - but picks the penalized argmax.
+    const useChain = sampled || penalty !== 1 || presence !== 0 || ngramN > 0
 
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS | CD }) // one row, target of the per-row copy
     const lgAll = device.createBuffer({ size: (maxDraft + 1) * vocab * 4, usage: S_ | CS }) // lm_head over all rows
@@ -2003,14 +2017,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const embIn = device.createBuffer({ size: (maxDraft + 1) * Hd * 4, usage: S_ | CD })
 
     const writeAffBan = (h: number[]): { affLen: number; banLen: number } => {
-      const aff = penalty !== 1 ? affectedIds(h) : new Uint32Array(0)
+      const aff = penalty !== 1 || presence !== 0 ? affectedIds(h) : new Uint32Array(0)
       if (aff.length) device.queue.writeBuffer(affBuf, 0, aff)
       const ban = ngramN > 0 ? ngramBans(h, ngramN) : []
       if (ban.length) device.queue.writeBuffer(banBuf, 0, Uint32Array.from(ban))
       return { affLen: aff.length, banLen: ban.length }
     }
     const samplerChain = (pass: GPUComputePassEncoder, affLen: number, banLen: number): void => {
-      setup(pass, 'sampler_penalty', [['u', affLen], ['u', banLen], ['f', penalty], ['u', 0xff800000]], [affBuf, banBuf], [lg])
+      setup(pass, 'sampler_penalty', [['u', affLen], ['u', banLen], ['f', penalty], ['u', 0xff800000], ['f', presence]], [affBuf, banBuf], [lg])
       pass.dispatchWorkgroups(1)
       for (let r = 0; r < K; r++) {
         setup(pass, 'argmax_masked', [['u', vocab], ['u', r], ['u', 0], ['u', 0]], [lg], [candIds, candVals])
@@ -2021,7 +2035,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // index 0 is the penalized argmax for a greedy-with-processors turn - no RNG draw)
     const rowDraw = (m: ArrayBuffer, j: number): number =>
       sampled
-        ? sampleFromCandidates(new Uint32Array(m, j * K * 8, K), new Float32Array(m, j * K * 8 + K * 4, K), temperature, rng)
+        ? sampleFromCandidates(new Uint32Array(m, j * K * 8, K), new Float32Array(m, j * K * 8 + K * 4, K), temperature, rng, topP, minP)
         : new Uint32Array(m, j * K * 8, 1)[0]
 
     transients = []
@@ -2245,11 +2259,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const vocab = W.lm_head.N!
     const K = Math.max(1, Math.min(genOpts.topK ?? 20, vocab))
     const penalty = genOpts.repetitionPenalty ?? 1
+    const presence = genOpts.presencePenalty ?? 0
     const ngramN = genOpts.noRepeatNgramSize ?? 0
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS })
     const candIds = device.createBuffer({ size: K * 4, usage: S_ | CS })
     const candVals = device.createBuffer({ size: K * 4, usage: S_ | CS })
-    const aff = penalty !== 1 ? affectedIds(ids) : new Uint32Array(0)
+    const aff = penalty !== 1 || presence !== 0 ? affectedIds(ids) : new Uint32Array(0)
     const ban = ngramN > 0 ? ngramBans(ids, ngramN) : []
     const affBuf = upload(aff.length ? aff : new Uint32Array(1), S_ | CD)
     const banBuf = upload(ban.length ? Uint32Array.from(ban) : new Uint32Array(1), S_ | CD)
@@ -2267,7 +2282,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // pass 2: penalty (in place on lg) + K masked-argmax
     const enc2 = device.createCommandEncoder()
     pass = enc2.beginComputePass()
-    setup(pass, 'sampler_penalty', [['u', aff.length], ['u', ban.length], ['f', penalty], ['u', 0xff800000]], [affBuf, banBuf], [lg])
+    setup(pass, 'sampler_penalty', [['u', aff.length], ['u', ban.length], ['f', penalty], ['u', 0xff800000], ['f', presence]], [affBuf, banBuf], [lg])
     pass.dispatchWorkgroups(1)
     for (let r = 0; r < K; r++) {
       setup(pass, 'argmax_masked', [['u', vocab], ['u', r], ['u', 0], ['u', 0]], [lg], [candIds, candVals])

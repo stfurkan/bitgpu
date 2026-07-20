@@ -212,11 +212,22 @@ export interface GenerateOptions {
   /** Top-k sampling cutoff (candidate count). Default `20` when sampling; clamped to `[1, vocab]`
    *  (the GPU reduces the logits to this many candidates, so `0` cannot mean "disabled"). */
   topK?: number
-  /** Top-p (nucleus) cutoff. Accepted for API compatibility but not applied (a no-op, matching transformers.js v4.2.0). */
+  /** Top-p (nucleus) cutoff, applied over the top-K candidates when sampling: keeps the shortest
+   *  leading run whose cumulative probability reaches `topP`. Default `1` (off). Only affects
+   *  sampling (greedy takes the penalized argmax regardless). */
   topP?: number
+  /** Min-p cutoff, applied over the top-K candidates when sampling: keeps tokens whose probability
+   *  is at least `minP` * (the top token's probability), so the pool tightens when the model is
+   *  confident and widens when it is not. Default `0` (off). Robust for low-precision models. Only
+   *  affects sampling. */
+  minP?: number
   /** Repetition penalty over the deduped prompt+generated id set (`logit<0 ? *p : /p`). Default `1`
    *  (off). Applied under greedy decoding too (the penalized argmax), matching transformers.js. */
   repetitionPenalty?: number
+  /** Presence penalty: subtracts this flat amount from the logit of every token seen so far (the
+   *  additive anti-repetition knob the Qwen3.5 family recommends, applied after `repetitionPenalty`).
+   *  Default `0` (off). Applied on the full vocab before top-k, under greedy decoding too. */
+  presencePenalty?: number
   /** Block any n-gram of this size from repeating. Default `0` (off). Applied under greedy decoding
    *  too, matching transformers.js. */
   noRepeatNgramSize?: number

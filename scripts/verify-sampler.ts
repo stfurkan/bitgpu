@@ -121,5 +121,51 @@ try {
   console.log(`  [SKIP] ONNX topk unavailable in this environment: ${(e as Error).message}`)
 }
 
+// ---- (E) top-p / min-p candidate warpers (bitgpu extensions, applied over the top-K) ----
+console.log('\n(E) top-p / min-p warpers')
+{
+  const myData = baseRow.slice()
+  for (const id of affectedIds(history)) { const v = myData[id]; myData[id] = v < 0 ? v * PEN : v / PEN }
+  for (const id of ngramBans(history, NG)) myData[id] = -Infinity
+  const { ids: candIds, vals: candVals } = topKSort(myData, K)
+  const seeds = [0, 1, 7, 42, 123, 777, 2026, 65535]
+  const many = Array.from({ length: 300 }, (_, i) => i)
+
+  // the load-bearing invariant: OFF (topP=1, minP=0) is bit-identical to the plain draw, so every
+  // model that does not set these keeps its exact sampling behaviour
+  let exact = 0
+  for (const seed of seeds) if (sampleFromCandidates(candIds, candVals, T, new MT19937(seed)) === sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 1, 0)) exact++
+  check('topP=1,minP=0 is bit-identical to the plain draw', exact === seeds.length, `${exact}/${seeds.length}`)
+
+  const tv = Float32Array.from(candVals, (v) => v / T)
+  const probs = Array.from(hfSoftmax(tv))
+  const maxP = probs[0]
+
+  let topOnly = 0, minOnly = 0
+  for (const seed of seeds) {
+    if (sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 1e-6, 0) === candIds[0]) topOnly++
+    if (sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 1, 1) === candIds[0]) minOnly++
+  }
+  check('topP~0 collapses to the argmax', topOnly === seeds.length)
+  check('minP=1 collapses to the argmax', minOnly === seeds.length)
+
+  // top-p keeps exactly the nucleus (cumulative >= 0.8): nothing beyond it is ever drawn
+  let cum = 0, mP = 0
+  for (let i = 0; i < probs.length; i++) { cum += probs[i]; mP = i + 1; if (cum >= 0.8) break }
+  const nucleus = new Set(candIds.slice(0, mP))
+  let inNucleus = 0
+  for (const seed of many) if (nucleus.has(sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 0.8, 0))) inNucleus++
+  check('topP=0.8 never draws outside the nucleus', inNucleus === many.length, `${inNucleus}/${many.length} (nucleus ${mP})`)
+
+  // min-p keeps exactly {prob >= minP*maxProb}
+  const MP = 0.3, thr = MP * maxP
+  let mMin = 1
+  while (mMin < probs.length && probs[mMin] >= thr) mMin++
+  const kept = new Set(candIds.slice(0, mMin))
+  let inMin = 0
+  for (const seed of many) if (kept.has(sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 1, MP))) inMin++
+  check('minP=0.3 never draws below the threshold', inMin === many.length, `${inMin}/${many.length} (kept ${mMin})`)
+}
+
 console.log(`\n${failures === 0 ? 'ALL SAMPLER CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`)
 process.exit(failures === 0 ? 0 : 1)

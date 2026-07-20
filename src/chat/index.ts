@@ -46,7 +46,9 @@ export interface ChatSendOptions {
   temperature?: number
   topK?: number
   topP?: number
+  minP?: number
   repetitionPenalty?: number
+  presencePenalty?: number
   noRepeatNgramSize?: number
   seed?: number
   promptLookup?: GenerateOptions['promptLookup']
@@ -465,7 +467,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         temperature: o.temperature,
         topK: o.topK,
         topP: o.topP,
+        minP: o.minP,
         repetitionPenalty: o.repetitionPenalty,
+        presencePenalty: o.presencePenalty,
         noRepeatNgramSize: o.noRepeatNgramSize,
         seed: o.seed,
         logprobs: o.logprobs,

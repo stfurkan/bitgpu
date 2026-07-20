@@ -159,7 +159,7 @@ json.dump(manifest, open(os.path.join(OUT, "manifest.json"), "w"), indent=1)
 # --- golden via the numpy oracle on the SAME dequantized weights ---
 C = qn.Qwen35Cfg(hidden=HID, n_layers=LAYERS, eps=EPS, n_heads=NH, n_kv_heads=NKV, head_dim=HDIM,
                  rot_dim=ROT, rope_theta=THETA, n_k_heads=NK, n_v_heads=NV, k_dim=SDIM, v_dim=SDIM, conv_kernel=CONVK)
-ids = np.array([3, 7, 11, 42, 5, 99, 1, 60, 33, 88], np.int32) % VOCAB
+ids = np.random.RandomState(1234).randint(0, VOCAB, 300).astype(np.int32)
 # repeat="tile": the engine (and the real GGUF) group value heads [rep, n_key_heads], so value head
 # h reads key/query head h%n_key ("tile"), not h//rep ("interleave", the HF-weight layout).
 ck = qn.forward(W, C, ids, delta="recurrent", repeat="tile")
