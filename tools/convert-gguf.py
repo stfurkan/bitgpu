@@ -125,6 +125,7 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="output dir (default: the gguf's dir)")
     ap.add_argument("--aux-name", default=None, help="aux filename (default: <gguf stem>.aux.bin)")
     ap.add_argument("--ref-url", default=None, help="optional f16/f32 safetensors URL for a network round-trip check")
+    ap.add_argument("--no-check", action="store_true", help="skip the round-trip self-check (e.g. when the .gguf is a header-only slice)")
     args = ap.parse_args()
     out = args.out or (os.path.dirname(args.gguf) or ".")
     stem = os.path.splitext(os.path.basename(args.gguf))[0]
@@ -132,8 +133,8 @@ def main() -> None:
 
     meta, gg, data_start = read_gguf_header(args.gguf)
     arch_name = meta["general.architecture"]
-    if arch_name != "qwen3":
-        raise ValueError(f"unsupported architecture '{arch_name}' (bitgpu kernels implement the qwen3 topology)")
+    if arch_name not in ("qwen3", "qwen35"):
+        raise ValueError(f"unsupported architecture '{arch_name}' (bitgpu kernels implement qwen3 + the qwen35 hybrid)")
     P = lambda k: meta[f"{arch_name}.{k}"]
 
     head_dim = int(P("attention.key_length"))
@@ -177,20 +178,77 @@ def main() -> None:
     hidden, inter = int(P("embedding_length")), int(P("feed_forward_length"))
     heads, kv_heads = int(P("attention.head_count")), int(P("attention.head_count_kv"))
     tensors: dict[str, dict] = {}
-    for li in range(layers):
-        for gk, lk in LINEAR.items():
-            N, K = {
-                "attn_q": (heads * head_dim, hidden), "attn_k": (kv_heads * head_dim, hidden),
-                "attn_v": (kv_heads * head_dim, hidden), "attn_output": (hidden, heads * head_dim),
-                "ffn_gate": (inter, hidden), "ffn_up": (inter, hidden), "ffn_down": (hidden, inter),
-            }[gk]
-            tensors[f"layers.{li}.{lk}"] = {
-                "kind": "binary", "N": N, "K": K, "block": 128, "bits": 2, "lut": "tgt2",
-                "container": "q1_0", "weight": region(f"blk.{li}.{gk}.weight", N, K),
-            }
-        for gk, lk in NORM.items():
-            n = head_dim if "q_norm" in gk or "k_norm" in gk else hidden
-            tensors[f"layers.{li}.{lk}"] = {"kind": "f32", "weight": norm_ref(f"blk.{li}.{gk}.weight", n)}
+    hybrid = None
+    if arch_name == "qwen35":
+        # qwen3.5 hybrid: 3:1 gated-DeltaNet linear attention + gated full attention. Mirrors
+        # buildQwen35Manifest in src/gguf.ts; GGUF reuses ggml's Mamba/SSM slots for the linear dims.
+        def bin_t(gname: str, N: int, K: int) -> dict:
+            return {"kind": "binary", "N": N, "K": K, "block": 128, "bits": 2, "lut": "tgt2",
+                    "container": "q1_0", "weight": region(gname, N, K)}
+
+        def f32_t(gname: str, dims: list[int]) -> dict:
+            t = gg[gname]
+            if t["type"] != F32:
+                raise ValueError(f"{gname}: expected F32, got ggml type {t['type']}")
+            if [int(d) for d in t["dims"]] != dims:
+                raise ValueError(f"{gname}: dims {t['dims']} != {dims}")
+            n = 1
+            for d in dims:
+                n *= d
+            return {"kind": "f32", "weight": {"dtype": "FLOAT", "shape": dims, "src": "data",
+                                              "off": data_start + int(t["off"]), "len": n * 4}}
+
+        interval = int(P("full_attention_interval"))
+        nk, nv = int(P("ssm.group_count")), int(P("ssm.time_step_rank"))
+        state, convk = int(P("ssm.state_size")), int(P("ssm.conv_kernel"))
+        key_dim, val_dim = state * nk, state * nv
+        if val_dim != int(P("ssm.inner_size")):
+            raise ValueError(f"ssm.inner_size {P('ssm.inner_size')} != value_heads*state_size {val_dim}")
+        layer_types: list[str] = []
+        for li in range(layers):
+            full = li % interval == interval - 1  # full attention at 3,7,11,...
+            layer_types.append("full" if full else "linear")
+            tensors[f"layers.{li}.input_layernorm"] = f32_t(f"blk.{li}.attn_norm.weight", [hidden])
+            tensors[f"layers.{li}.post_attention_layernorm"] = f32_t(f"blk.{li}.post_attention_norm.weight", [hidden])
+            tensors[f"layers.{li}.mlp.gate_proj"] = bin_t(f"blk.{li}.ffn_gate.weight", inter, hidden)
+            tensors[f"layers.{li}.mlp.up_proj"] = bin_t(f"blk.{li}.ffn_up.weight", inter, hidden)
+            tensors[f"layers.{li}.mlp.down_proj"] = bin_t(f"blk.{li}.ffn_down.weight", hidden, inter)
+            if full:
+                tensors[f"layers.{li}.attn.q_proj"] = bin_t(f"blk.{li}.attn_q.weight", heads * head_dim * 2, hidden)
+                tensors[f"layers.{li}.attn.k_proj"] = bin_t(f"blk.{li}.attn_k.weight", kv_heads * head_dim, hidden)
+                tensors[f"layers.{li}.attn.v_proj"] = bin_t(f"blk.{li}.attn_v.weight", kv_heads * head_dim, hidden)
+                tensors[f"layers.{li}.attn.o_proj"] = bin_t(f"blk.{li}.attn_output.weight", hidden, heads * head_dim)
+                tensors[f"layers.{li}.attn.q_norm"] = f32_t(f"blk.{li}.attn_q_norm.weight", [head_dim])
+                tensors[f"layers.{li}.attn.k_norm"] = f32_t(f"blk.{li}.attn_k_norm.weight", [head_dim])
+            else:
+                tensors[f"layers.{li}.linear.in_qkv"] = bin_t(f"blk.{li}.attn_qkv.weight", key_dim * 2 + val_dim, hidden)
+                tensors[f"layers.{li}.linear.z"] = bin_t(f"blk.{li}.attn_gate.weight", val_dim, hidden)
+                tensors[f"layers.{li}.linear.a"] = bin_t(f"blk.{li}.ssm_alpha.weight", nv, hidden)
+                tensors[f"layers.{li}.linear.b"] = bin_t(f"blk.{li}.ssm_beta.weight", nv, hidden)
+                tensors[f"layers.{li}.linear.conv1d"] = f32_t(f"blk.{li}.ssm_conv1d.weight", [convk, key_dim * 2 + val_dim])
+                tensors[f"layers.{li}.linear.A_log"] = f32_t(f"blk.{li}.ssm_a", [nv])
+                tensors[f"layers.{li}.linear.dt_bias"] = f32_t(f"blk.{li}.ssm_dt.bias", [nv])
+                tensors[f"layers.{li}.linear.norm"] = f32_t(f"blk.{li}.ssm_norm.weight", [state])
+                tensors[f"layers.{li}.linear.out_proj"] = bin_t(f"blk.{li}.ssm_out.weight", hidden, val_dim)
+        hybrid = {
+            "layer_types": layer_types, "linear_key_heads": nk, "linear_value_heads": nv,
+            "linear_head_dim": state, "conv_kernel": convk, "rotary_dim": int(P("rope.dimension_count")),
+        }
+    else:
+        for li in range(layers):
+            for gk, lk in LINEAR.items():
+                N, K = {
+                    "attn_q": (heads * head_dim, hidden), "attn_k": (kv_heads * head_dim, hidden),
+                    "attn_v": (kv_heads * head_dim, hidden), "attn_output": (hidden, heads * head_dim),
+                    "ffn_gate": (inter, hidden), "ffn_up": (inter, hidden), "ffn_down": (hidden, inter),
+                }[gk]
+                tensors[f"layers.{li}.{lk}"] = {
+                    "kind": "binary", "N": N, "K": K, "block": 128, "bits": 2, "lut": "tgt2",
+                    "container": "q1_0", "weight": region(f"blk.{li}.{gk}.weight", N, K),
+                }
+            for gk, lk in NORM.items():
+                n = head_dim if "q_norm" in gk or "k_norm" in gk else hidden
+                tensors[f"layers.{li}.{lk}"] = {"kind": "f32", "weight": norm_ref(f"blk.{li}.{gk}.weight", n)}
     tensors[f"layers.{layers}.final_norm_layernorm"] = {"kind": "f32", "weight": norm_ref("output_norm.weight", hidden)}
     tensors["embed_tokens"] = {
         "kind": "q4", "rows": vocab, "cols": hidden, "block": 128, "bits": 4, "lut": "tgt4",
@@ -208,12 +266,14 @@ def main() -> None:
         "data_file": os.path.basename(args.gguf),
         "aux_file": aux_name,
         "arch": {
-            "model_type": arch_name, "layers": layers, "hidden": hidden, "intermediate": inter,
+            "model_type": "qwen3_5" if arch_name == "qwen35" else arch_name,
+            "layers": layers, "hidden": hidden, "intermediate": inter,
             "heads": heads, "kv_heads": kv_heads, "head_dim": head_dim,
             "rms_eps": float(P("attention.layer_norm_rms_epsilon")),
             "rope": rope, "max_positions": int(P("context_length")),
             "vocab": vocab, "eos": int(meta["tokenizer.ggml.eos_token_id"]),
             "tie_word_embeddings": tied, "act": "silu",
+            **({"hybrid": hybrid} if hybrid else {}),
         },
         "luts": {
             "tgt2": {"dtype": "UINT8", "shape": [256, 2], "src": "aux", "off": 0, "len": 512},
@@ -230,7 +290,8 @@ def main() -> None:
     print(f"manifest: {len(tensors)} tensors (v2, q1_0 containers, {'tied' if tied else 'untied'} lm_head) | {aux_name}: {len(aux)} B")
     print("tensor kinds:", kinds, "| rope:", rope, f"| max_positions: {manifest['arch']['max_positions']}")
 
-    _selfcheck(args.gguf, manifest, tgt2, args.ref_url)
+    if not args.no_check:
+        _selfcheck(args.gguf, manifest, tgt2, args.ref_url)
 
 
 def _selfcheck(gguf_path: str, manifest: dict, tgt2: np.ndarray, ref_url: str | None) -> None:
@@ -238,7 +299,7 @@ def _selfcheck(gguf_path: str, manifest: dict, tgt2: np.ndarray, ref_url: str | 
     and the engine's route (de-interleave, tgt2 code expansion, (code-2)*scale) - and require
     bit-identical results; with --ref-url, also cosine-check against the full-precision
     safetensors row fetched over HTTP ranges."""
-    t = manifest["tensors"]["layers.0.attn.q_proj"]
+    t = next(v for v in manifest["tensors"].values() if v.get("kind") == "binary")  # hybrid layer 0 has no attn.q_proj
     K = t["K"]
     nb = K // 128
     f = open(gguf_path, "rb")
