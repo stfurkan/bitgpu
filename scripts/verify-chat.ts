@@ -91,7 +91,26 @@ const CHATML_TEMPLATE = [
   "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if not enable_thinking %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
 ].join('')
 
-function miniTokenizer(): { json: unknown; config: Record<string, unknown> } {
+// Mirrors the Qwen3.5 template's POSITION-DEPENDENT structure: a reverse scan for the last real
+// user query (raising when there is none, so tool turns cannot be rendered standalone) and a
+// think block gated by last_query_index. Exercises the tool-append delta's full-render-diff
+// fallback (a standalone render throws; the delta must be reconstructed from the whole conversation).
+const QWEN35_TEMPLATE = [
+  "{%- if tools %}{{ '<|im_start|>system\\n<tools>' }}{%- for tool in tools %}{{ '\\n' }}{{ tool | tojson }}{%- endfor %}{{ '\\n</tools>\\nWrap each call in <tool_call></tool_call> tags.<|im_end|>\\n' }}{%- endif %}",
+  "{%- set ns = namespace(multi_step_tool=true, last_query_index=(messages|length - 1)) %}",
+  "{%- for message in messages[::-1] %}{%- set index = (messages|length - 1) - loop.index0 %}",
+  "{%- if ns.multi_step_tool and message.role == 'user' and not message.content.startswith('<tool_response>') %}{%- set ns.multi_step_tool = false %}{%- set ns.last_query_index = index %}{%- endif %}{%- endfor %}",
+  "{%- if ns.multi_step_tool %}{{ raise_exception('No user query found in messages.') }}{%- endif %}",
+  "{%- for message in messages %}",
+  "{%- if message.role == 'tool' %}{{ '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}",
+  "{%- elif message.role == 'assistant' %}",
+  "{%- if loop.index0 > ns.last_query_index %}{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' + message.content }}{%- else %}{{ '<|im_start|>assistant\\n' + message.content }}{%- endif %}",
+  "{%- if message.tool_calls %}{%- for tc in message.tool_calls %}{{ '\\n<tool_call>\\n{\"name\": \"' + tc.name + '\", \"arguments\": ' }}{{ tc.arguments | tojson }}{{ '}\\n</tool_call>' }}{%- endfor %}{%- endif %}{{ '<|im_end|>\\n' }}",
+  "{%- else %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endif %}{%- endfor %}",
+  "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if not enable_thinking %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
+].join('')
+
+function miniTokenizer(template: string = CHATML_TEMPLATE): { json: unknown; config: Record<string, unknown> } {
   const b2u = bytesToUnicode()
   const vocab: Record<string, number> = {}
   for (const [, ch] of b2u) if (!(ch in vocab)) vocab[ch] = Object.keys(vocab).length
@@ -121,7 +140,7 @@ function miniTokenizer(): { json: unknown; config: Record<string, unknown> } {
       model: { type: 'BPE', dropout: null, unk_token: null, continuing_subword_prefix: null, end_of_word_suffix: null, fuse_unk: false, byte_fallback: false, vocab, merges: [] },
     },
     config: {
-      chat_template: CHATML_TEMPLATE,
+      chat_template: template,
       eos_token: '<|im_end|>',
       model_max_length: 32768,
     },
@@ -697,6 +716,32 @@ console.log('(D) JSON constrained decoding')
     check('round trip: changed tools list -> full prefill (system block differs)', !t3.reusedCache)
     const t4 = await chat.send([u, asst, { role: 'tool', content: '42' }, { role: 'assistant', content: t2.text }, { role: 'user', content: 'thanks' }, { role: 'assistant', content: t3.text }, { role: 'user', content: 'more' }], { tools: [...TOOLS, OTHER] })
     check('round trip: same tools -> user append still reuses', t4.reusedCache)
+  }
+
+  // Qwen3.5-style position-dependent template: a standalone tool render raises (the whole-
+  // conversation user-query scan), so the tool-append delta cannot be rendered in isolation and is
+  // reconstructed by diffing full renders. Verifies the round trip does not crash, still reuses the
+  // cache, and rebuilds the exact same delta bytes as a position-independent template would.
+  {
+    const { json: qj, config: qc } = miniTokenizer(QWEN35_TEMPLATE)
+    const qtk = new ChatTokenizer(qj, qc)
+    let standaloneThrew = false
+    try { qtk.applyChatTemplate([{ role: 'tool', content: '42' }], { addGenerationPrompt: true, enableThinking: false, tools: TOOLS }) } catch { standaloneThrew = true }
+    check('qwen3.5: a standalone tool render raises (the diff-fallback trigger)', standaloneThrew)
+
+    const engine = mockEngine(qtk)
+    const chat = await createChat(engine, { tokenizer: { json: qj, config: qc } })
+    engine.script(['<tool_call>\n{"name": "get", "arguments": {"q": "x"}}\n</tool_call>', 'It is 42.', 'you are welcome'])
+    const u: ChatMessage = { role: 'user', content: 'what is x?' }
+    const t1 = await chat.send([u], { tools: TOOLS })
+    check('qwen3.5: pure call turn parsed', t1.toolCalls.length === 1 && t1.text === '' && t1.finishReason === 'tool_calls')
+    const asst: ChatMessage = { role: 'assistant', content: t1.text, tool_calls: t1.toolCalls }
+    const t2 = await chat.send([u, asst, { role: 'tool', content: '42' }], { tools: TOOLS })
+    check('qwen3.5: tool result reuses the cache (no crash, no full prefill)', t2.reusedCache && t2.text === 'It is 42.')
+    const delta = qtk.decode(t2.inputTokenIds, false)
+    check('qwen3.5: diff-reconstructed delta == the tool_response turn + gen prompt', delta === '<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n', JSON.stringify(delta))
+    const t3 = await chat.send([u, asst, { role: 'tool', content: '42' }, { role: 'assistant', content: t2.text }, { role: 'user', content: 'thanks' }], { tools: TOOLS })
+    check('qwen3.5: a user turn after the tool round still reuses', t3.reusedCache)
   }
 
   // prewarm with tools

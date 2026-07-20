@@ -357,7 +357,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const wantReuse = (o.reuseCache ?? true) && !think && wrap !== null && toolsKey === committedToolsKey
     const userAppend = wantReuse && isCleanAppend(committed, messages)
     const toolAppend = wantReuse && !userAppend && isToolAppend(committed, messages)
-    const canReuse = userAppend || toolAppend
+    let canReuse = userAppend || toolAppend
 
     let inputTokenIds: number[]
     if (userAppend) {
@@ -369,13 +369,34 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       const deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}\n${w.userPrefix}${userText}${w.userSuffix}${w.genPrompt}`
       inputTokenIds = tk.encode(deltaStr, false)
     } else if (toolAppend) {
-      // The continuation leg of a tool round trip: everything appended after the cached
-      // assistant turn is the tool messages rendered standalone (the template wraps them in a
-      // user turn) plus the generation prompt - byte-identical to what a cold render appends,
-      // since tool-turn rendering does not depend on position.
+      // The continuation leg of a tool round trip: everything appended after the cached assistant
+      // turn is the tool messages plus the generation prompt.
       const toolMsgs = messages.slice((committed as ChatMessage[]).length)
-      const deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}\n` + tk.applyChatTemplate(toolMsgs, { addGenerationPrompt: true, enableThinking: false })
-      inputTokenIds = tk.encode(deltaStr, false)
+      let deltaStr: string | null = null
+      try {
+        // Fast path: the tool turns rendered standalone (the template wraps them in a user turn),
+        // byte-identical to a cold append for position-independent ChatML templates (e.g. Qwen3).
+        deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}\n` + tk.applyChatTemplate(toolMsgs, { addGenerationPrompt: true, enableThinking: false })
+      } catch {
+        // Some templates render tool turns only in the context of the whole conversation (e.g.
+        // Qwen3.5 scans all messages for the user query and raises without one), so a standalone
+        // render throws. Reconstruct the delta by diffing the full renders: what a cold render of
+        // `messages` adds after the committed prefix. Sound only when the committed render is a
+        // byte-prefix of the new one (true here - appending tool results after the last user query
+        // leaves every earlier turn's rendering unchanged).
+        const tools = prep?.tools
+        const fullNew = tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: false, tools })
+        const committedRender = tk.applyChatTemplate(committed as ChatMessage[], { addGenerationPrompt: false, enableThinking: false, tools }).replace(/\n$/, '')
+        if (fullNew.startsWith(committedRender)) deltaStr = `${cacheEndsAtEos ? '' : tk.eosToken}` + fullNew.slice(committedRender.length)
+      }
+      if (deltaStr !== null) {
+        inputTokenIds = tk.encode(deltaStr, false)
+      } else {
+        // Neither reconstruction is valid: full-prefill the conversation (correct, no cache reuse).
+        dropCache()
+        canReuse = false
+        inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think, tools: prep?.tools }), false)
+      }
     } else {
       dropCache()
       inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think, tools: prep?.tools }), false)
