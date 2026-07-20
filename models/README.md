@@ -12,6 +12,7 @@ convert.
 | `bonsai-1.7b-gguf` | 2048 / 28 | ~250 MB | [prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) (`Bonsai-1.7B-Q1_0.gguf`) |
 | `bonsai-4b-gguf` | 2560 / 36 | ~580 MB | [prism-ml/Bonsai-4B-gguf](https://huggingface.co/prism-ml/Bonsai-4B-gguf) (`Bonsai-4B-Q1_0.gguf`) |
 | `bonsai-8b-gguf` | 4096 / 36 | ~1.16 GB | [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf) (`Bonsai-8B-Q1_0.gguf`) |
+| `bonsai-27b-gguf` | 5120 / 64 | ~3.8 GB | [prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf) (`Bonsai-27B-Q1_0.gguf`; **Qwen3.5 hybrid**, GGUF-only) |
 | `bonsai-1.7b` | 2048 / 28 | ~290 MB | [onnx-community/Bonsai-1.7B-ONNX](https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX) |
 | `bonsai-4b` | 2560 / 36 | ~660 MB | [onnx-community/Bonsai-4B-ONNX](https://huggingface.co/onnx-community/Bonsai-4B-ONNX) |
 | `bonsai-8b` | 4096 / 36 | ~1.3 GB | [onnx-community/Bonsai-8B-ONNX](https://huggingface.co/onnx-community/Bonsai-8B-ONNX) |
@@ -27,7 +28,7 @@ Use them from any static host or a CDN over this repo (pin a tag for immutable c
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.15.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.16.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 
 const engine = await createEngine({

@@ -53,7 +53,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.15.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.16.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -135,6 +135,21 @@ reads a quarter of the bytes) - while shallow-context decode measures a few perc
 Reach for `'q8'` to run a 4x longer window in the same VRAM (or the same window on smaller
 GPUs); keep the default `'f32'` when bit-exact reproducibility is the point.
 `engine.capabilities.kvCache` reports what is actually active.
+
+### f16 activation-compute (`activation: 'f16'`)
+
+`activation: 'f16'` runs the decode matmuls with **f16 activations** (the 1-bit weights stay packed,
+the accumulator and residual stream stay f32). It needs `shader-f16` + the subgroup path and silently
+falls back to f32 without them, so it is always safe to request. On GPUs with **packed-f16 throughput
+(NVIDIA / AMD)** it is a real decode win; on Apple it is ~neutral (the 1-bit GEMV is unpack- not
+dot-bound), which is why it is opt-in rather than the default. It is measured **greedy-exact** against
+f32 on every model - dense **and** the qwen3.5 hybrid. If your users run NVIDIA/AMD, turn it on:
+
+```ts
+const engine = await createEngine({ modelUrl, activation: 'f16', kvCache: 'q8', maxSeqLen: 4096 })
+```
+
+`engine.capabilities.activation` reports whether it engaged.
 
 ### Unbounded conversations (`overflow: 'sinks'`)
 
@@ -367,6 +382,9 @@ go through the same path as the dense models (verified end-to-end) - but the GGU
 tokenizer, so point `createChat` at [prism-ml/Bonsai-27B-unpacked](https://huggingface.co/prism-ml/Bonsai-27B-unpacked)
 for `tokenizer.json` + `tokenizer_config.json`. It is a ~3.8 GB download and comfortably wants a 16 GB
 (or larger) GPU budget - on an 8 GB laptop it runs but the weights spill to swap, so decode is slow.
+A hybrid upside: its 48 gated-DeltaNet layers cost O(1) per token, so decode throughput stays nearly
+flat as context grows (only the 16 full-attention layers scale with length) - a long-context
+durability edge over a same-size pure-attention model.
 
 The in-browser parse is gated: it must deep-equal the offline converter's manifest AND an
 engine built from it must reproduce the known-good greedy ids bit-exactly on GPU. Prefer the
