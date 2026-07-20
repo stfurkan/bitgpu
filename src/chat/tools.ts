@@ -329,7 +329,7 @@ export interface PreparedTools {
  *  text again (another call, prose, or eos). Forced mode: the FIRST token must be <tool_call>,
  *  the body is constrained to the named tool, and after </tool_call> only eos is permitted.
  *  Call advance() with each emitted token to move the real machine. */
-export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
+export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, startInThink = false): {
   filter: (ids: Uint32Array | number[]) => number[]
   advance: (id: number) => void
 } {
@@ -354,7 +354,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
   }
   let state: S = forced ? S.OPEN : S.TEXT
   let body: ToolBody | null = null
-  let inThink = false
+  let inThink = startInThink // a pre-opened <think> (Qwen3.5 thinking mode): musing, not a call, until </think>
   return {
     filter: (candidates: Uint32Array | number[]): number[] => {
       if (state === S.TEXT || inThink) return Array.from(candidates, Number)

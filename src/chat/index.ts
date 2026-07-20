@@ -272,6 +272,18 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     tk = new ChatTokenizer(json, cfg as Record<string, unknown>)
   }
   const wrap = deriveChatWrap(tk)
+  // Some templates (Qwen3.5) PRE-OPEN <think> in the thinking-mode generation prompt: the opening tag
+  // is in the prompt, not the generated stream, so the ThinkSplitter and tool filter must start
+  // already inside the think block (else the reasoning + </think> leak into the visible reply).
+  const thinkPreopened = ((): boolean => {
+    if (!tk.hasChatTemplate) return false
+    try {
+      const r = tk.applyChatTemplate([{ role: 'user', content: 'x' }], { addGenerationPrompt: true, enableThinking: true })
+      return r.lastIndexOf('<think>') > r.lastIndexOf('</think>')
+    } catch {
+      return false
+    }
+  })()
 
   // ── conversation state ──
   // `committed` mirrors what the engine's KV cache holds, as messages; null = cache not usable.
@@ -410,7 +422,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     }
 
     const decoder: DecoderStream = tk.createDecoderStream(true)
-    const splitter = new ThinkSplitter()
+    const splitter = new ThinkSplitter('<think>', '</think>', think && thinkPreopened)
     // Stop sequences scan the VISIBLE channel; on a match the engine is aborted via an internal
     // signal (a few overrun tokens may generate before the per-step abort check lands - the text
     // is cut exactly, and the cache is dropped afterwards so the overrun can never be reused).
@@ -459,7 +471,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const jf = json ? makeJsonFilter((byteTable ??= new TokenByteTable(tk)), tk.eosTokenId, schema) : null
     // Tool turns: free text until <tool_call> opens, then the body grammar (declared names +
     // per-tool schema) until </tool_call>; a forced choice pins the whole reply to one call.
-    const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep) : null
+    const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep, think && thinkPreopened) : null
     let result: GenerateResult
     try {
       result = await engine.generate(inputTokenIds, {

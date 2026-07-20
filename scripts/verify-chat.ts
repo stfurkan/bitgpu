@@ -54,6 +54,14 @@ console.log('(A) ThinkSplitter stream logic')
   check('trailing partial open tag flushes as text', r.text === 'a<thin' && r.think === '', JSON.stringify(r))
   r = feed(['<think>a</think>mid<think>b</think>end'])
   check('two think blocks', r.text === 'midend' && r.think === 'ab', JSON.stringify(r))
+  // startInside: templates whose generation prompt PRE-OPENS <think> (Qwen3.5 thinking mode) leave
+  // the opening tag in the prompt, so the generated stream begins inside the block.
+  {
+    const sp = new ThinkSplitter('<think>', '</think>', true)
+    const a = sp.push('reasoning</think>the reply')
+    const f = sp.flush()
+    check('startInside: pre-opened reasoning routes to think, reply stays visible', a.think === 'reasoning' && a.text + f.text === 'the reply', JSON.stringify(a))
+  }
 }
 
 // ── (B) orchestration: hermetic byte-level tokenizer + ChatML template + mock engine ─────────
@@ -810,6 +818,25 @@ console.log('(D) JSON constrained decoding')
     const asst: ChatMessage = { role: 'assistant', content: t1.text, tool_calls: t1.toolCalls }
     const t2 = await chat.send([u, asst, { role: 'tool', content: '42' }], { tools: XTOOLS })
     check('xml e2e: tool result reuses the cache', t2.reusedCache && t2.text === 'Result: 42.')
+  }
+
+  // Pre-opened <think> (Qwen3.5 thinking mode): createChat must detect that the thinking-mode
+  // generation prompt leaves <think> open and start the splitter INSIDE it, so the reasoning routes
+  // to thinkText and never leaks into the visible reply.
+  {
+    const PREOPEN = [
+      "{%- for message in messages %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}",
+      "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if enable_thinking %}{{ '<think>\\n' }}{%- else %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
+    ].join('')
+    const { json: pj, config: pc } = miniTokenizer(PREOPEN)
+    const ptk = new ChatTokenizer(pj, pc)
+    const gen = ptk.applyChatTemplate([{ role: 'user', content: 'q' }], { addGenerationPrompt: true, enableThinking: true })
+    check('preopen: thinking gen prompt leaves <think> open', gen.lastIndexOf('<think>') > gen.lastIndexOf('</think>'))
+    const engine = mockEngine(ptk)
+    const chat = await createChat(engine, { tokenizer: { json: pj, config: pc } })
+    engine.script(['Let me reason step by step.</think>The answer is 42.'])
+    const r = await chat.send([{ role: 'user', content: 'q' }], { think: true })
+    check('preopen: reasoning routes to thinkText, reply stays clean', r.text === 'The answer is 42.' && r.thinkText.includes('Let me reason'), JSON.stringify({ text: r.text, think: r.thinkText }))
   }
 
   // prewarm with tools

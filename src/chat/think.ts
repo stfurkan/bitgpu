@@ -18,12 +18,17 @@ export interface SplitChunk {
 }
 
 export class ThinkSplitter {
-  private inside = false
+  private inside: boolean
   private hold = ''
   constructor(
     private readonly open = '<think>',
     private readonly close = '</think>',
-  ) {}
+    /** Start already inside a think block - for templates whose generation prompt PRE-OPENS `<think>`
+     *  (e.g. Qwen3.5 thinking mode), so the opening tag is in the prompt, not the generated stream. */
+    startInside = false,
+  ) {
+    this.inside = startInside
+  }
 
   push(chunk: string): SplitChunk {
     let s = this.hold + chunk
