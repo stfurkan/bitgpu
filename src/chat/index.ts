@@ -13,14 +13,14 @@ import type { Engine, GenerateOptions, GenerateResult, KvSnapshot, TokenLogprobs
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
 import { ThinkSplitter, StopScanner } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
-import { makeToolFilter, parseToolCall, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
+import { makeToolFilter, parseToolCall, parseToolCallXml, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
 
 export { ChatTokenizer } from './tokenizer'
 export type { ChatMessage, DecoderStream } from './tokenizer'
 export { ThinkSplitter, StopScanner } from './think'
 export { JsonMachine, validateJsonSchema } from './json'
 export type { JsonSchema } from './json'
-export { ToolBodyMachine, ToolCallSplitter, makeToolFilter, parseToolCall, validateTools } from './tools'
+export { ToolBodyMachine, ToolBodyMachineXml, ToolCallSplitter, makeToolFilter, parseToolCall, parseToolCallXml, validateTools } from './tools'
 export type { ChatTool, ToolCall, ToolChoice } from './tools'
 
 /** Options for {@link createChat}. Point it at the model directory (which already hosts
@@ -299,6 +299,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
 
   // Tool support is a property of the model (template + vocabulary); probe once, loudly.
   let templateToolsOk: boolean | null = null
+  let toolFormat: 'json' | 'xml' = 'json'
   function prepareTools(tools: ChatTool[], choice: ToolChoice): PreparedTools {
     validateTools(tools, choice)
     if (templateToolsOk === null) {
@@ -310,6 +311,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         // The template must both render the declarations and instruct the <tool_call> format
         // this module extracts and enforces.
         templateToolsOk = probe.includes('bitgpu_probe_tool') && probe.includes('<tool_call>')
+        // Which call format the template trains: the Qwen3.5 family instructs the XML
+        // `<function=…><parameter=…>` shape; everyone else the canonical JSON `{"name":…}`.
+        toolFormat = probe.includes('<function=') ? 'xml' : 'json'
       } catch {
         templateToolsOk = false
       }
@@ -322,6 +326,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     return {
       tools,
       forced: typeof choice === 'object' ? choice.name : null,
+      format: toolFormat,
       ids: { open, close, eos: tk.eosTokenId, thinkOpen: tk.tokenToId('<think>'), thinkClose: tk.tokenToId('</think>') },
     }
   }
@@ -417,7 +422,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const toolSplit = prep ? new ToolCallSplitter() : null
     const toolCalls: ToolCall[] = []
     const pushBlock = (block: string): void => {
-      const call = parseToolCall(block)
+      const call = prep?.format === 'xml' ? parseToolCallXml(block, prep.tools) : parseToolCall(block)
       toolCalls.push(call)
       if (call.name) o.onToolCall?.(call)
     }

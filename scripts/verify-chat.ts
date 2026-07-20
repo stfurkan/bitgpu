@@ -14,7 +14,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createChat, ChatTokenizer, ThinkSplitter, ToolBodyMachine, ToolCallSplitter, parseToolCall, validateTools, type ChatMessage, type ChatTool } from '../src/chat/index'
+import { createChat, ChatTokenizer, ThinkSplitter, ToolBodyMachine, ToolBodyMachineXml, ToolCallSplitter, parseToolCall, parseToolCallXml, validateTools, type ChatMessage, type ChatTool } from '../src/chat/index'
 import { JsonMachine, TokenByteTable, validateJsonSchema } from '../src/chat/json'
 import type { Engine, GenerateOptions, GenerateResult } from '../src/types'
 
@@ -108,6 +108,19 @@ const QWEN35_TEMPLATE = [
   "{%- if message.tool_calls %}{%- for tc in message.tool_calls %}{{ '\\n<tool_call>\\n{\"name\": \"' + tc.name + '\", \"arguments\": ' }}{{ tc.arguments | tojson }}{{ '}\\n</tool_call>' }}{%- endfor %}{%- endif %}{{ '<|im_end|>\\n' }}",
   "{%- else %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endif %}{%- endfor %}",
   "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if not enable_thinking %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
+].join('')
+
+// The Qwen3.5 XML tool protocol: tool declarations + a <function=…><parameter=…> call format in the
+// system block (so bitgpu detects format:'xml'), and assistant tool_calls rendered as XML. Exercises
+// ToolBodyMachineXml + parseToolCallXml end to end.
+const QWEN35_XML_TEMPLATE = [
+  "{%- if tools %}{{ '<|im_start|>system\\n<tools>' }}{%- for tool in tools %}{{ '\\n' }}{{ tool | tojson }}{%- endfor %}{{ '\\n</tools>\\nCall format: <tool_call>\\n<function=NAME>\\n<parameter=KEY>\\nVALUE\\n</parameter>\\n</function>\\n</tool_call><|im_end|>\\n' }}{%- endif %}",
+  "{%- for message in messages %}",
+  "{%- if message.role == 'tool' %}{{ '<|im_start|>user\\n<tool_response>\\n' + message.content + '\\n</tool_response><|im_end|>\\n' }}",
+  "{%- elif message.role == 'assistant' %}{{ '<|im_start|>assistant\\n' + message.content }}",
+  "{%- if message.tool_calls %}{%- for tc in message.tool_calls %}{{ '\\n<tool_call>\\n<function=' + tc.name + '>\\n' }}{%- for k, v in tc.arguments|items %}{{ '<parameter=' + k + '>\\n' }}{{ v if v is string else (v | tojson) }}{{ '\\n</parameter>\\n' }}{%- endfor %}{{ '</function>\\n</tool_call>' }}{%- endfor %}{%- endif %}{{ '<|im_end|>\\n' }}",
+  "{%- else %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endif %}{%- endfor %}",
+  "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- endif %}",
 ].join('')
 
 function miniTokenizer(template: string = CHATML_TEMPLATE): { json: unknown; config: Record<string, unknown> } {
@@ -742,6 +755,61 @@ console.log('(D) JSON constrained decoding')
     check('qwen3.5: diff-reconstructed delta == the tool_response turn + gen prompt', delta === '<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n', JSON.stringify(delta))
     const t3 = await chat.send([u, asst, { role: 'tool', content: '42' }, { role: 'assistant', content: t2.text }, { role: 'user', content: 'thanks' }], { tools: TOOLS })
     check('qwen3.5: a user turn after the tool round still reuses', t3.reusedCache)
+  }
+
+  // Qwen3.5 XML tool protocol: the model emits <function=…><parameter=…>; bitgpu detects the format,
+  // enforces its grammar (ToolBodyMachineXml), and parses it back (parseToolCallXml).
+  {
+    const encX = new TextEncoder()
+    // -- ToolBodyMachineXml grammar (byte-level enforcement) --
+    const XCANDS = ['get', 'go2'].map(ToolBodyMachine.bytesOf)
+    const XPROPS = new Map([
+      [ToolBodyMachine.bytesOf('get'), { keys: ['q'].map(ToolBodyMachine.bytesOf), required: ['q'].map(ToolBodyMachine.bytesOf) }],
+      [ToolBodyMachine.bytesOf('go2'), { keys: [], required: [] }],
+    ])
+    const feedX = (s: string): { ok: boolean; complete: boolean } => {
+      const m = new ToolBodyMachineXml(XCANDS, XPROPS)
+      const ok = m.feed(encX.encode(s))
+      return { ok, complete: ok && m.complete }
+    }
+    check('xml body: canonical call completes', feedX('\n<function=get>\n<parameter=q>\nx\n</parameter>\n</function>\n').complete)
+    check('xml body: parameter-less tool completes', feedX('<function=go2>\n</function>').complete)
+    check('xml body: raw multi-line value accepted', feedX('<function=get>\n<parameter=q>\nline1\nline2\n</parameter>\n</function>').complete)
+    check('xml body: unknown function name rejected', !feedX('<function=gz').ok)
+    check('xml body: undeclared parameter key rejected', !feedX('<function=get>\n<parameter=z').ok)
+    check('xml body: junk after the name-close rejected', !feedX('<function=get>x').ok)
+    check('xml body: content after </function> rejected', !feedX('<function=go2>\n</function>x').ok)
+    check('xml body: unterminated call does not complete', !feedX('<function=get>\n<parameter=q>\nx\n</parameter>\n').complete)
+    check('xml body: cannot close while a required parameter is missing', !feedX('<function=get>\n</').ok)
+
+    // -- parseToolCallXml (extraction + schema validation) --
+    const XTOOLS: ChatTool[] = [
+      { type: 'function', function: { name: 'get', description: 'd', parameters: { type: 'object', required: ['q'], additionalProperties: false, properties: { q: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'calc', parameters: { type: 'object', required: ['n'], additionalProperties: false, properties: { n: { type: 'number' } } } } },
+      { type: 'function', function: { name: 'go2' } },
+    ]
+    const px = (raw: string): ReturnType<typeof parseToolCallXml> => parseToolCallXml(raw, XTOOLS)
+    const g = px('\n<function=get>\n<parameter=q>\nhello world\n</parameter>\n</function>\n')
+    check('xml parse: string value kept raw', g.name === 'get' && g.arguments.q === 'hello world', JSON.stringify(g))
+    const cnum = px('<function=calc>\n<parameter=n>\n42\n</parameter>\n</function>')
+    check('xml parse: numeric value JSON-typed', cnum.name === 'calc' && cnum.arguments.n === 42, JSON.stringify(cnum.arguments))
+    check('xml parse: parameter-less call', px('<function=go2>\n</function>').name === 'go2')
+    check('xml parse: unknown tool -> name ""', px('<function=nope>\n</function>').name === '')
+    check('xml parse: missing required -> name ""', px('<function=get>\n</function>').name === '')
+    check('xml parse: non-JSON numeric value -> name ""', px('<function=calc>\n<parameter=n>\nabc\n</parameter>\n</function>').name === '')
+
+    // -- end to end: format detection + XML parse + tool round-trip against the XML template --
+    const { json: xj, config: xc } = miniTokenizer(QWEN35_XML_TEMPLATE)
+    const xtk = new ChatTokenizer(xj, xc)
+    const engine = mockEngine(xtk)
+    const chat = await createChat(engine, { tokenizer: { json: xj, config: xc } })
+    engine.script(['<tool_call>\n<function=get>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call>', 'Result: 42.', 'ok'])
+    const u: ChatMessage = { role: 'user', content: 'look up x' }
+    const t1 = await chat.send([u], { tools: XTOOLS })
+    check('xml e2e: XML call extracted + parsed to a typed call', t1.finishReason === 'tool_calls' && t1.toolCalls.length === 1 && t1.toolCalls[0].name === 'get' && t1.toolCalls[0].arguments.q === 'x', JSON.stringify(t1.toolCalls))
+    const asst: ChatMessage = { role: 'assistant', content: t1.text, tool_calls: t1.toolCalls }
+    const t2 = await chat.send([u, asst, { role: 'tool', content: '42' }], { tools: XTOOLS })
+    check('xml e2e: tool result reuses the cache', t2.reusedCache && t2.text === 'Result: 42.')
   }
 
   // prewarm with tools

@@ -186,6 +186,125 @@ export class ToolBodyMachine {
   }
 }
 
+// ── the XML call-body grammar (Qwen3.5 family) ───────────────────────────────
+// Body between <tool_call> and </tool_call> for templates that use the XML tool protocol:
+//   ws* <function=NAME> ( <parameter=KEY> RAWVALUE </parameter> )* </function> ws*
+// The scaffolding tags, the function NAME (prefix-constrained to the declared tools) and each KEY
+// (constrained to that tool's declared properties, no duplicates) are FORCED byte-by-byte, so the
+// model is held on the rails of a real call; the value bytes are free (raw text for string params,
+// JSON text for the rest) and are schema-validated at parse time (parseToolCallXml drops anything
+// that does not conform), so a surfaced call is still never malformed. Same feed/clone/complete/
+// name surface as ToolBodyMachine, so the candidate filter treats both formats identically.
+
+const X_FUNC = utf8.encode('<function=')
+const X_PARAM = utf8.encode('<parameter=')
+const X_FCLOSE = utf8.encode('</function>')
+const X_PCLOSE = utf8.encode('</parameter>')
+const litPrefix = (buf: readonly number[], lit: Uint8Array): boolean => {
+  if (buf.length > lit.length) return false
+  for (let i = 0; i < buf.length; i++) if (buf[i] !== lit[i]) return false
+  return true
+}
+const litEq = (buf: readonly number[], lit: Uint8Array): boolean => buf.length === lit.length && litPrefix(buf, lit)
+
+/** The subset of ToolBodyMachine the candidate filter relies on (both format machines implement it). */
+export interface ToolBody {
+  readonly complete: boolean
+  readonly name: string
+  feed(bytes: Uint8Array): boolean
+  clone(): ToolBody
+}
+
+const enum X { PRE, FUNC, NAME, ELEM, KEY, VAL, POST }
+
+export class ToolBodyMachineXml implements ToolBody {
+  private phase: X = X.PRE
+  private lit = 0
+  private nameBuf = ''
+  private wsRun = 0
+  private elem: number[] = []
+  private keyBuf = ''
+  private keyCands: string[] = []
+  private reqLeft: string[] = []
+  private valTail: number[] = []
+  complete = false
+  name = ''
+
+  /** byte-space tool names, and per name its byte-space property keys + required subset */
+  constructor(private readonly cands: readonly string[], private readonly props: ReadonlyMap<string, { keys: readonly string[]; required: readonly string[] }>) {}
+
+  clone(): ToolBodyMachineXml {
+    const m = new ToolBodyMachineXml(this.cands, this.props)
+    m.phase = this.phase; m.lit = this.lit; m.nameBuf = this.nameBuf; m.wsRun = this.wsRun
+    m.elem = [...this.elem]; m.keyBuf = this.keyBuf; m.keyCands = [...this.keyCands]; m.reqLeft = [...this.reqLeft]; m.valTail = [...this.valTail]
+    m.complete = this.complete; m.name = this.name
+    return m
+  }
+
+  feed(bytes: Uint8Array): boolean {
+    for (let i = 0; i < bytes.length; i++) if (!this.byte(bytes[i])) return false
+    return true
+  }
+
+  private byte(b: number): boolean {
+    switch (this.phase) {
+      case X.PRE:
+        if (WS.has(b)) return ++this.wsRun <= WS_CAP
+        if (b !== X_FUNC[0]) return false
+        this.phase = X.FUNC; this.lit = 1; return true
+      case X.FUNC:
+        if (b !== X_FUNC[this.lit]) return false
+        if (++this.lit === X_FUNC.length) { this.phase = X.NAME; this.nameBuf = '' }
+        return true
+      case X.NAME:
+        if (b === 0x3e) { // '>' commits the name and selects its property set
+          if (!this.cands.includes(this.nameBuf)) return false
+          this.name = this.nameBuf
+          const spec = this.props.get(this.nameBuf)
+          this.keyCands = [...(spec?.keys ?? [])]
+          this.reqLeft = [...(spec?.required ?? [])]
+          this.phase = X.ELEM; this.elem = []; this.wsRun = 0
+          return true
+        }
+        this.nameBuf += String.fromCharCode(b)
+        for (const c of this.cands) if (c.startsWith(this.nameBuf)) return true
+        return false
+      case X.ELEM: { // optional ws, then either another '<parameter=' or the closing '</function>'
+        if (this.elem.length === 0 && WS.has(b)) return ++this.wsRun <= WS_CAP
+        this.elem.push(b); this.wsRun = 0
+        if (litEq(this.elem, X_PARAM)) { this.phase = X.KEY; this.keyBuf = ''; return true }
+        if (litEq(this.elem, X_FCLOSE)) { // may close only once every required parameter has been given
+          if (this.reqLeft.length) return false
+          this.phase = X.POST; this.complete = true; this.wsRun = 0; return true
+        }
+        const pP = litPrefix(this.elem, X_PARAM)
+        const pF = litPrefix(this.elem, X_FCLOSE)
+        if (pF && !pP && this.reqLeft.length) return false // committing to </function> with required params left
+        return pP || pF
+      }
+      case X.KEY:
+        if (b === 0x3e) { // '>' commits the key (must be a declared, not-yet-seen property)
+          if (this.keyCands.length && !this.keyCands.includes(this.keyBuf)) return false
+          this.keyCands = this.keyCands.filter((k) => k !== this.keyBuf)
+          this.reqLeft = this.reqLeft.filter((k) => k !== this.keyBuf)
+          this.phase = X.VAL; this.valTail = []
+          return true
+        }
+        this.keyBuf += String.fromCharCode(b)
+        if (!this.keyCands.length) return true // tool declares no properties: any key name
+        for (const c of this.keyCands) if (c.startsWith(this.keyBuf)) return true
+        return false
+      case X.VAL: // raw value bytes until the '</parameter>' terminator (any byte is a valid value byte)
+        this.valTail.push(b)
+        if (this.valTail.length > X_PCLOSE.length) this.valTail.shift()
+        if (litEq(this.valTail, X_PCLOSE)) { this.phase = X.ELEM; this.elem = []; this.wsRun = 0 }
+        return true
+      case X.POST:
+        return WS.has(b) && ++this.wsRun <= WS_CAP
+    }
+  }
+}
+
 // ── the candidate filter ─────────────────────────────────────────────────────
 
 export interface ToolMarkerIds {
@@ -201,6 +320,8 @@ export interface PreparedTools {
   ids: ToolMarkerIds
   /** null = 'auto'; a name = forced single call */
   forced: string | null
+  /** the tool-call wire format the model's template uses: 'json' (Qwen3) or 'xml' (Qwen3.5) */
+  format: 'json' | 'xml'
 }
 
 /** Per-step candidate filter for tool turns. Auto mode: free text (everything permitted) until
@@ -213,9 +334,18 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
   advance: (id: number) => void
 } {
   const { ids, forced } = prep
-  const names = (forced ? prep.tools.filter((t) => t.function.name === forced) : prep.tools).map((t) => t.function.name)
+  const active = forced ? prep.tools.filter((t) => t.function.name === forced) : prep.tools
+  const names = active.map((t) => t.function.name)
   const cands = names.map(ToolBodyMachine.bytesOf)
   const schemas = new Map(prep.tools.map((t) => [ToolBodyMachine.bytesOf(t.function.name), argsSchemaOf(t)]))
+  // XML format: each tool's byte-space property keys (for the KEY constraint) + required subset
+  const props = new Map(
+    prep.tools.map((t) => {
+      const p = t.function.parameters
+      return [ToolBodyMachine.bytesOf(t.function.name), { keys: Object.keys(p?.properties ?? {}).map(ToolBodyMachine.bytesOf), required: (p?.required ?? []).map(ToolBodyMachine.bytesOf) }] as const
+    }),
+  )
+  const newBody = (): ToolBody => (prep.format === 'xml' ? new ToolBodyMachineXml(cands, props) : new ToolBodyMachine(cands, schemas))
   const enum S {
     TEXT, // auto mode outside a call: everything permitted
     OPEN, // forced mode start: only <tool_call>
@@ -223,7 +353,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
     EOS, // forced mode after the call: only eos
   }
   let state: S = forced ? S.OPEN : S.TEXT
-  let body: ToolBodyMachine | null = null
+  let body: ToolBody | null = null
   let inThink = false
   return {
     filter: (candidates: Uint32Array | number[]): number[] => {
@@ -241,7 +371,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
         }
         // BODY: the close marker only once the wrapper object is complete; otherwise bytes that
         // keep the body a valid prefix (added/special tokens have no bytes and are never body)
-        const m = body as ToolBodyMachine
+        const m = body as ToolBody
         if (n === ids.close) {
           if (m.complete) out.push(n)
           continue
@@ -267,7 +397,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
         case S.OPEN:
           if (id === ids.open) {
             state = S.BODY
-            body = new ToolBodyMachine(cands, schemas)
+            body = newBody()
           }
           return
         case S.BODY:
@@ -278,7 +408,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools): {
           }
           {
             const bytes = table.bytes(id)
-            if (bytes) (body as ToolBodyMachine).feed(bytes)
+            if (bytes) (body as ToolBody).feed(bytes)
           }
           return
         case S.EOS:
@@ -368,4 +498,39 @@ export function parseToolCall(raw: string): ToolCall {
     // fall through
   }
   return { name: '', arguments: {}, raw }
+}
+
+/** Parse one XML block's content into a ToolCall (the Qwen3.5 `<function=…><parameter=…>` protocol).
+ *  Values are coerced by the tool's schema - string params keep their raw text, everything else is
+ *  JSON.parse'd. Returns name '' if the block names an unknown tool/property, a required property is
+ *  missing, or a non-string value is not valid JSON (so a surfaced call always conforms). */
+export function parseToolCallXml(raw: string, tools: readonly ChatTool[]): ToolCall {
+  const fn = /<function=([^>]*)>/.exec(raw)
+  if (!fn) return { name: '', arguments: {}, raw }
+  const name = fn[1]
+  const tool = tools.find((t) => t.function.name === name)
+  if (!tool) return { name: '', arguments: {}, raw }
+  const schema = tool.function.parameters
+  const props = schema?.properties ?? {}
+  const args: Record<string, unknown> = {}
+  const re = /<parameter=([^>]*)>([\s\S]*?)<\/parameter>/g
+  for (let m = re.exec(raw); m !== null; m = re.exec(raw)) {
+    const key = m[1]
+    const valText = m[2].replace(/^\n/, '').replace(/\n$/, '') // strip the template's scaffolding newlines
+    const pschema = props[key] as JsonSchema | undefined
+    if (pschema?.type !== undefined && pschema.type !== 'string') {
+      try {
+        args[key] = JSON.parse(valText)
+      } catch {
+        return { name: '', arguments: {}, raw }
+      }
+    } else {
+      args[key] = valText
+    }
+  }
+  if (schema) {
+    for (const req of schema.required ?? []) if (!(req in args)) return { name: '', arguments: {}, raw }
+    if (schema.additionalProperties === false) for (const k of Object.keys(args)) if (!(k in props)) return { name: '', arguments: {}, raw }
+  }
+  return { name, arguments: args, raw }
 }
