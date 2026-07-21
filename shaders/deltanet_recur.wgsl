@@ -8,7 +8,7 @@
 // h%HK (a "tile"), NOT h/(H/HK) (a "repeat-interleave"). loadState!=0 continues from state_in
 // (persistent decode/cross-segment state); state_out always carries the final state out.
 override WGV: u32 = 128u;                 // threads per workgroup == head_v_dim (dv)
-struct Params { S: u32, H: u32, DK: u32, DV: u32, HK: u32, betaOff: u32, loadState: u32, _p2: u32 };
+struct Params { S: u32, H: u32, DK: u32, DV: u32, HK: u32, betaOff: u32, loadState: u32, tOff: u32 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> q: array<f32>;      // [S, HK, DK]
 @group(0) @binding(2) var<storage, read> k: array<f32>;      // [S, HK, DK]
@@ -33,8 +33,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   for (var dk = 0u; dk < DK; dk = dk + 1u) { s[dk] = select(0.0, state_in[sbase + dk * p.DV], p.loadState != 0u); }
 
   for (var t = 0u; t < p.S; t = t + 1u) {
-    let base = t * p.H + h;               // value-head row (v, g, beta, out)
-    let basek = t * p.HK + hk;            // key-head row (q, k)
+    let base = (t + p.tOff) * p.H + h;    // value-head row (v, g, beta, out); tOff = this chunk's
+    let basek = (t + p.tOff) * p.HK + hk; // token offset when a long segment's scan is sub-chunked
     for (var i = lid.x; i < DK; i = i + WGV) { ksh[i] = k[basek * DK + i]; qsh[i] = q[basek * DK + i]; }
     workgroupBarrier();
     var sk = 0.0;

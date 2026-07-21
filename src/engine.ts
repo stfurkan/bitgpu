@@ -84,12 +84,15 @@ const VIEW: Record<string, TypedArrayCtor> = { FLOAT: Float32Array, UINT8: Uint8
 const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rope', 'swiglu', 'copy']
 const DEFAULT_MAX_SEQ = 2048
 const PREFILL_SEG = 256 // prefill segment length; see runPrefill for why prefills are segmented
-// The hybrid DeltaNet scan accumulates its per-head state in registers across a whole prefill
-// segment; over a long segment x 64 layers the running state loses enough precision to corrupt the
-// output (coherent for short prompts, degenerate past ~50 tokens). Flushing the recurrence to the
-// f32 state buffer more often - a shorter prefill segment - keeps it stable (decode, which round-
-// trips the state every token, is unaffected). Dense models keep the full 256 segment.
-const PREFILL_SEG_HYBRID = 16
+// The hybrid DeltaNet scan accumulates its per-head state in registers across a prefill chunk;
+// over a long chunk x 64 layers the running state loses enough precision to corrupt the output
+// (coherent for short prompts, degenerate past ~50 tokens on the real 27B). Flushing the
+// recurrence to the f32 state buffer every <=16 tokens keeps it stable (decode, which round-trips
+// the state every token, is unaffected). 0.17 enforced this by shrinking the whole hybrid prefill
+// segment to 16 - which re-swept ALL weights 16x per 256 tokens (ruinous for the 4GB 27B).
+// Now only the tiny recurrence dispatch is sub-chunked (hybridLayer), same flush cadence, and the
+// hybrid keeps the full 256-token segment for every weight-reading GEMM.
+const RECUR_FLUSH = 16
 
 const PARAM_AB = new ArrayBuffer(64)
 const PARAM_DV = new DataView(PARAM_AB)
@@ -1380,8 +1383,25 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const gb = actBuf(2 * S * NV) // [g (S*NV) ; beta (S*NV)]
       run(pass, 'deltanet_gbeta', [['u', S], ['u', NV], ['u', 0], ['u', 0]], [a, b, w('linear.A_log').buf!, w('linear.dt_bias').buf!], gb, S * NV)
       const core = actBuf(S * VALDIM)
-      setup(pass, 'deltanet_recur', [['u', S], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', ls], ['u', 0]], [q, k, v, gb, gb, hyRS[li][par]], [core, hyRS[li][par ^ 1]])
-      pass.dispatchWorkgroups(NV)
+      // The scan is sub-chunked so the running state flushes through the f32 state buffers every
+      // <=RECUR_FLUSH tokens (the precision cadence the 27B needs - see RECUR_FLUSH). Chunks chain
+      // through the two ping-pong halves; the chunk count is forced ODD (an 8-token first chunk
+      // when needed) so the final state always lands in par^1, which the rest of the engine
+      // (stack's hyPar flip, snapshots) assumes. S <= RECUR_FLUSH (decode, short prefills) stays
+      // the identical single dispatch it always was.
+      {
+        const sizes: number[] = []
+        if (Math.ceil(S / RECUR_FLUSH) % 2 === 0) sizes.push(RECUR_FLUSH / 2, RECUR_FLUSH / 2) // odd count: split the first 16 into 8+8
+        for (let r = S - sizes.reduce((a, b) => a + b, 0); r > 0; r -= RECUR_FLUSH) sizes.push(Math.min(r, RECUR_FLUSH))
+        let off = 0
+        for (let c = 0; c < sizes.length; c++) {
+          const cin = hyRS[li][par ^ (c & 1)] //          c=0 reads par, then alternate
+          const cout = hyRS[li][par ^ ((c & 1) ^ 1)] //   c=0 writes par^1; odd count ends at par^1
+          setup(pass, 'deltanet_recur', [['u', sizes[c]], ['u', NV], ['u', DKV], ['u', DKV], ['u', NK], ['u', S * NV], ['u', c === 0 ? ls : 1], ['u', off]], [q, k, v, gb, gb, cin], [core, cout])
+          pass.dispatchWorkgroups(NV)
+          off += sizes[c]
+        }
+      }
       const z = actBuf(S * VALDIM)
       fusedMM(pass, w('linear.z'), n1, S, [z, dummy, dummy2], af)
       const normed = actBuf(S * VALDIM)
@@ -1572,7 +1592,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       finalnorm = new Float32Array(S * Hd),
       logits = new Float32Array(S * vocab)
     transients = []
-    const prefillSeg = A.hybrid ? PREFILL_SEG_HYBRID : PREFILL_SEG
+    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG // __SEG: test hook - verify-hybrid proves seg-256 sub-chunked == seg-16 (the known-good 0.17 cadence)
     try {
       for (let off = 0; off < S; off += prefillSeg) {
         const seg = ids.slice(off, off + prefillSeg)
@@ -1611,7 +1631,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
-    const prefillSeg = A.hybrid ? PREFILL_SEG_HYBRID : PREFILL_SEG
+    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG // __SEG: test hook - verify-hybrid proves seg-256 sub-chunked == seg-16 (the known-good 0.17 cadence)
     for (let off = 0; off < ids.length; off += prefillSeg) {
       if (off > 0 && signal?.aborted) {
         fullHistory = []

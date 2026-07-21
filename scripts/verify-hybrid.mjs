@@ -37,6 +37,7 @@ const browser = await chromium.launch({
 let fail = 0
 try {
   const page = await browser.newPage()
+  if (process.env.SEG) await page.addInitScript((s) => { globalThis.__SEG = s }, Number(process.env.SEG)) // TEMP: C1 experiment knob
   page.on('pageerror', (e) => console.log('  [pageerror]', String(e)))
   await page.goto(`http://127.0.0.1:${port}/`)
   const out = await page.evaluate(async ({ base, ids }) => {
@@ -116,7 +117,16 @@ try {
       const eR = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
       await eR.restoreCache(snap)
       const snapRestored = (await eR.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, sampGen, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
+      // seg-cadence equivalence: the full 256-token segment with the SUB-CHUNKED scan (current
+      // default) must reproduce the 0.17-known-good 16-token-segment prefill - same recurrence
+      // flush cadence by construction, so only GEMM batching rounding may differ. __SEG is the
+      // engine's test hook (read per prefill call); cleared afterwards.
+      globalThis.__SEG = 16
+      const eSeg = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
+      const rSeg = await eSeg.forward(ids)
+      const segGen = (await eSeg.generate(pad, { maxTokens: GN })).tokens
+      globalThis.__SEG = 0
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, sampGen, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength, seg16logits: [...rSeg.logits], segGen }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -176,6 +186,14 @@ try {
   const snapOk = JSON.stringify(out.snapRestored) === JSON.stringify(out.snapFull)
   console.log(`  [${snapOk ? 'PASS' : 'FAIL'}] snapshot restore+continue == cold full-prefill  restored=${JSON.stringify(out.snapRestored)} full=${JSON.stringify(out.snapFull)} (${out.snapBytes}B)`)
   if (!snapOk) fail++
+  // seg-256 sub-chunked scan vs the 0.17-known-good seg-16 cadence (direct A/B, not vs golden)
+  let sgmad = 0, sgdot = 0, sgna = 0, sgnb = 0
+  for (let i = 0; i < out.logits.length; i++) { sgmad = Math.max(sgmad, Math.abs(out.seg16logits[i] - out.logits[i])); sgdot += out.seg16logits[i] * out.logits[i]; sgna += out.seg16logits[i] ** 2; sgnb += out.logits[i] ** 2 }
+  const sgcos = sgdot / (Math.sqrt(sgna) * Math.sqrt(sgnb) + 1e-9)
+  const segGenOk = JSON.stringify(out.segGen) === JSON.stringify(out.growGen)
+  const segOk = sgmad < 5e-3 && sgcos > 0.9999 && segGenOk
+  console.log(`  [${segOk ? 'PASS' : 'FAIL'}] seg-256 sub-chunked == seg-16 cadence  logits cos=${sgcos.toFixed(6)} max|Δ|=${sgmad.toExponential(2)}, 510-tok continuation ${segGenOk ? 'identical' : `DIFFERS seg16=${JSON.stringify(out.segGen)} vs ${JSON.stringify(out.growGen)}`}`)
+  if (!segOk) fail++
 } finally {
   await browser.close(); server.close()
 }
