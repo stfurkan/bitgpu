@@ -421,7 +421,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     pipelines[name] = await device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main', constants } })
   }
   const ROWS_MR = 4 // output rows per workgroup in the multi-row GEMV
-  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked'], ['logsumexp']]
+  const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked'], ['logsumexp'], ['sampler_sigma']]
   if (useSG) {
     for (const n of ['rmsnorm_sg', 'attention_sg', 'matmul_split_sg', 'matmul_q2_sg', 'rmsnorm_rope_sg']) specs.push([n, { SG: sgMax }])
     for (const n of ['matmul_split_sm', 'matmul_resid_sm', 'matmul_q2_sm']) specs.push([n, { SG: sgMax }]) // small-batch (M=2..9) verify-pass GEMVs
@@ -494,6 +494,28 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (!transients) return
     for (const b of transients) b.destroy()
     transients = []
+    arena = null // any pooled-for-reuse scratch was just destroyed
+  }
+  // ── Prefill scratch ARENA ──────────────────────────────────────────────────
+  // Without reuse, one prefill segment keeps EVERY layer's transient activations alive at once
+  // (they are all encoded into a single submission): sum-over-layers ~= 31.5 MB/token on the 27B,
+  // which is what forced the small memory-bounded segments (HYBRID_SCRATCH_BUDGET). But a layer's
+  // temporaries are dead the moment its own dispatches are encoded - only the hidden-state buffer
+  // flows forward - and WebGPU executes dispatches in a compute pass as-if serially (each dispatch
+  // observes prior dispatches' writes, and write-after-read hazards are ordered the same way), so
+  // a later layer may safely REUSE an earlier layer's buffers within the same pass. stack() frees
+  // each layer's allocations (minus its returned hidden) into size-keyed lists as it encodes the
+  // next, cutting live prefill scratch from sum-over-layers to ~2 layers' worth. Buffers stay
+  // owned by `transients` (the arena only recycles; flushTransients still destroys). Uniform
+  // buffers never enter the arena (poolless setup() uses upload(): queue.writeBuffer ordering
+  // would corrupt earlier dispatches if a uniform buffer were rewritten for a later one).
+  let arena: Map<number, GPUBuffer[]> | null = null
+  let arenaCur: GPUBuffer[] | null = null
+  const arenaFree = (b: GPUBuffer): void => {
+    if (!arena) return
+    const list = arena.get(b.size)
+    if (list) list.push(b)
+    else arena.set(b.size, [b])
   }
   const upload = (typed: ArrayBufferView, usage: number = S_ | CD): GPUBuffer => {
     const b = device.createBuffer({ size: typed.byteLength, usage })
@@ -549,8 +571,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
   const actBuf = (n: number): GPUBuffer => {
     if (!pool) {
+      const hit = arena?.get(n * 4)?.pop()
+      if (hit) {
+        arenaCur?.push(hit)
+        return hit
+      }
       const b = device.createBuffer({ size: n * 4, usage: S_ | CS | CD })
       transients?.push(b)
+      arenaCur?.push(b)
       return b
     }
     const alloc = poolRoundFrom > 0 ? (n / poolRoundFrom) * poolRoundTo : n
@@ -1002,14 +1030,16 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Budget calibrated on the real Bonsai-27B on an 8GB M1 (segment sweep 2026-07-21): 32-seg
   // (~1.2 GB scratch) is correct and token-identical to 16-seg; 64-seg (~2.4 GB) corrupts.
   const HYBRID_SCRATCH_BUDGET = 1.25 * (1 << 30)
-  const hybridScratchPerTok = A.hybrid
-    ? A.hybrid.layer_types.reduce((sum, t) => {
-        const shared = 3 * Hd + 3 * F // n1/n2 norms, gate/up/swiglu MLP, resid out
-        const linear = 2 * CONVDIM + 2 * KEYDIM + 4 * VALDIM + 4 * NV + Hd // mixed/convd, q/k, v/core/z/normed, a/b/gbeta, h2
-        const full = 8 * H * Dh + 4 * KV * Dh + Hd // qg+query/gate/qn/qr+att/gated, kk/kn/kr/vv, h2
-        return sum + (shared + (t === 'linear' ? linear : full)) * 4
-      }, 0)
-    : 0
+  const hybridScratchPerTok = ((): number => {
+    if (!A.hybrid) return 0
+    const shared = 3 * Hd + 3 * F // n1/n2 norms, gate/up/swiglu MLP, resid out
+    const linear = 2 * CONVDIM + 2 * KEYDIM + 4 * VALDIM + 4 * NV + Hd // mixed/convd, q/k, v/core/z/normed, a/b/gbeta, h2
+    const full = 8 * H * Dh + 4 * KV * Dh + Hd // qg+query/gate/qn/qr+att/gated, kk/kn/kr/vv, h2
+    // With the prefill scratch ARENA, live scratch is ~2 layers' worth (the layer being encoded +
+    // the not-yet-released previous hidden/pinned buffers), not sum-over-layers; 3x the largest
+    // layer leaves margin for the protected buffers (embed batch, layer0, fn) and the KV appends.
+    return 3 * (shared + Math.max(linear, full)) * 4
+  })()
   const PREFILL_SEG_HY = A.hybrid ? Math.max(RECUR_FLUSH, Math.min(PREFILL_SEG, Math.floor(HYBRID_SCRATCH_BUDGET / hybridScratchPerTok / RECUR_FLUSH) * RECUR_FLUSH)) : PREFILL_SEG
   // The KV cache GROWS on demand (doubling, up to maxSeqLen) instead of pinning the full maxSeqLen
   // up front: a short conversation keeps a small cache (~KV_INITIAL positions), so idle VRAM stays
@@ -1579,16 +1609,31 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   function stack(enc: GPUCommandEncoder, h: GPUBuffer, S: number, posBase: number): { fn: GPUBuffer; layer0: GPUBuffer | null } {
     const { cos, sin } = ropeBufs(posBase, S)
     const pass = enc.beginComputePass()
-    let cur = h,
-      layer0: GPUBuffer | null = null
+    // Arena reuse (see the arena block above) is poolless-path only - the decode loop has its own
+    // slot pool. Protected from recycling: the caller's input `h` (forward() reads the embed batch
+    // back after submit) and layer 0's output (forward()'s layer0 checkpoint) - and every layer's
+    // returned hidden until the NEXT layer has consumed it.
+    const useArena = !pool && !DBG0 // DBG0 captures layer-0 buffers for post-submit readback - reuse would overwrite them
+    let layer0: GPUBuffer | null = null
+    let cur = h
+    if (useArena) arena = arena ?? new Map()
     for (let li = 0; li < A.layers; li++) {
-      cur = layer(pass, li, cur, S, posBase, cos, sin)
+      const mine: GPUBuffer[] = []
+      if (useArena) arenaCur = mine
+      const inH = cur
+      cur = layer(pass, li, inH, S, posBase, cos, sin)
       if (li === 0) layer0 = cur
+      if (useArena) {
+        arenaCur = null
+        for (const b of mine) if (b !== cur) arenaFree(b) // this layer's temporaries are consumed
+        if (inH !== h && inH !== layer0) arenaFree(inH) //   the hidden this layer just consumed
+      }
     }
     if (A.hybrid) hyPar ^= 1 // advance the recurrent/conv ping-pong for the next segment or decode token
     const fn = actBuf(S * Hd)
     rms(pass, cur, FINAL_NORM, S, Hd, fn)
     pass.end()
+    arena = null // reuse never spans stack() calls (fn/layer0 are read after this submission)
     return { fn, layer0 }
   }
 
@@ -1821,6 +1866,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // DRY (applyDry): CPU-side over the candidates, needs the live history - so it lives here in
     // the sampler chain, applied to both the sampled draw and the penalized-argmax greedy pick.
     const dryO = (genOpts.dryMultiplier ?? 0) > 0 ? { multiplier: genOpts.dryMultiplier!, base: genOpts.dryBase ?? 1.75, allowedLength: genOpts.dryAllowedLength ?? 2, range: genOpts.dryRange ?? 0, breakers: new Set(genOpts.dryBreakers ?? []) } : null
+    const topNS = genOpts.topNSigma ?? 0 // top-n-sigma: keep candidates with logit >= max - n*sigma (sigma over the FULL penalized logits, GPU-reduced)
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
     const signal = genOpts.signal
@@ -1832,9 +1878,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const candIds = device.createBuffer({ size: KT * 4, usage: S_ | CS })
     const candVals = device.createBuffer({ size: KT * 4, usage: S_ | CS })
     const lseBuf = device.createBuffer({ size: 4, usage: S_ | CS }) // log-sum-exp normalizer (logprobs)
+    const sigBuf = device.createBuffer({ size: 12, usage: S_ | CS }) // top-n-sigma moments [sum, sumsq, count] centered on max
+    const sigOff = KT * 8 + (lpN ? 4 : 0)
     const affBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD }) // upper bound = full vocab can't exceed seq len
     const banBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD })
-    const rbBuf = device.createBuffer({ size: KT * 8 + (lpN ? 4 : 0), usage: GPUBufferUsage.MAP_READ | CD })
+    const rbBuf = device.createBuffer({ size: sigOff + (topNS > 0 ? 12 : 0), usage: GPUBufferUsage.MAP_READ | CD })
     const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
 
     // upload the CPU-computed deduped id set + ngram bans for the current history; return their lengths
@@ -1855,6 +1903,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         setup(pass, 'logsumexp', [['u', vocab], ['u', 0], ['u', 0], ['u', 0]], [lg], [lseBuf])
         pass.dispatchWorkgroups(1)
       }
+      if (topNS > 0) {
+        setup(pass, 'sampler_sigma', [['u', vocab], ['u', 0], ['u', 0], ['u', 0]], [lg], [sigBuf])
+        pass.dispatchWorkgroups(1)
+      }
       for (let r = 0; r < KT; r++) {
         setup(pass, 'argmax_masked', [['u', vocab], ['u', r], ['u', 0], ['u', 0]], [lg], [candIds, candVals])
         pass.dispatchWorkgroups(1)
@@ -1864,15 +1916,30 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       enc.copyBufferToBuffer(candIds, 0, rbBuf, 0, KT * 4)
       enc.copyBufferToBuffer(candVals, 0, rbBuf, KT * 4, KT * 4)
       if (lpN) enc.copyBufferToBuffer(lseBuf, 0, rbBuf, KT * 8, 4)
+      if (topNS > 0) enc.copyBufferToBuffer(sigBuf, 0, rbBuf, sigOff, 12)
     }
+    let sigma = 0 // stddev of the current step's penalized logits (set per readback when topNS > 0)
     const readCands = async (): Promise<{ ci: Uint32Array; cv: Float32Array; lse: number }> => {
       await rbBuf.mapAsync(GPUMapMode.READ)
       const mapped = rbBuf.getMappedRange()
       const ci = new Uint32Array(mapped.slice(0, KT * 4))
       const cv = new Float32Array(mapped.slice(KT * 4, KT * 8))
       const lse = lpN ? new Float32Array(mapped.slice(KT * 8, KT * 8 + 4))[0] : 0
+      if (topNS > 0) {
+        const [sm, sq, c] = new Float32Array(mapped.slice(sigOff, sigOff + 12))
+        sigma = c > 0 ? Math.sqrt(Math.max(0, sq / c - (sm / c) ** 2)) : 0
+      }
       rbBuf.unmap()
       return { ci, cv, lse }
+    }
+    // top-n-sigma prefix cut: candidates are descending, so the kept set is the prefix with
+    // logit >= (subset max) - n*sigma; never empties (the max itself always survives)
+    const sigTrim = (ids: ArrayLike<number>, vals: ArrayLike<number>): { ids: number[]; vals: number[] } | null => {
+      if (!(topNS > 0) || vals.length === 0) return null
+      const cut = vals[0] - topNS * sigma
+      let m = 1
+      while (m < vals.length && vals[m] >= cut) m++
+      return { ids: Array.prototype.slice.call(ids, 0, m), vals: Array.prototype.slice.call(vals, 0, m) }
     }
     // logprobs bookkeeping: the chosen token's logit (set by every chooseToken path) and the
     // per-emitted-token records (aligned with the returned tokens)
@@ -1890,7 +1957,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const ci = ciAll.subarray(0, K)
       const cv = cvAll.subarray(0, K)
       let ids: ArrayLike<number> = ci, vals: ArrayLike<number> = cv
-      if (dryO) { const a = applyDry(ci, cv, history, dryO); ids = a.ids; vals = a.vals }
+      const st = sigTrim(ci, cv)
+      if (st) { ids = st.ids; vals = st.vals }
+      if (dryO) { const a = applyDry(ids as number[], vals as number[], history, dryO); ids = a.ids; vals = a.vals }
       const tk = sampled ? sampleFromCandidates(ids as number[], vals as number[], temperature, rng, topP, minP) : (ids as number[])[0]
       chosenLogit = cv[ci.indexOf(tk)] // pre-DRY logit: reported logprobs stay consistent with the GPU lse
       return tk
@@ -1916,7 +1985,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             pVals.push(cv[i])
           }
         let ids = pIds, vals = pVals
-        if (dryO) { const a = applyDry(pIds, pVals, history, dryO); ids = a.ids; vals = a.vals }
+        const st = sigTrim(pIds, pVals) // vs the permitted subset's max: the global max may be filtered out
+        if (st) { ids = st.ids; vals = st.vals }
+        if (dryO) { const a = applyDry(ids, vals, history, dryO); ids = a.ids; vals = a.vals }
         const tk = sampled ? sampleFromCandidates(ids, vals, temperature, rng, topP, minP) : ids[0]
         chosenLogit = pVals[pIds.indexOf(tk)] // pre-DRY
         return tk
@@ -1944,7 +2015,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       }
       if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
       let ids = pIds, vals = pVals
-      if (dryO) { const a = applyDry(pIds, pVals, history, dryO); ids = a.ids; vals = a.vals }
+      const st = sigTrim(pIds, pVals)
+      if (st) { ids = st.ids; vals = st.vals }
+      if (dryO) { const a = applyDry(ids, vals, history, dryO); ids = a.ids; vals = a.vals }
       const tk = sampled ? sampleFromCandidates(ids, vals, temperature, rng, topP, minP) : ids[0]
       chosenLogit = pVals[pIds.indexOf(tk)] // pre-DRY
       return tk
@@ -2035,7 +2108,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       poolUse(null)
       flushTransients()
       transients = null
-      for (const b of [tokBuf, lg, candIds, candVals, lseBuf, affBuf, banBuf, rbBuf, embG]) b.destroy()
+      for (const b of [tokBuf, lg, candIds, candVals, lseBuf, sigBuf, affBuf, banBuf, rbBuf, embG]) b.destroy()
     }
   }
 
@@ -2393,8 +2466,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const hasProcessors = (genOpts.repetitionPenalty ?? 1) !== 1 || (genOpts.noRepeatNgramSize ?? 0) > 0 || (genOpts.presencePenalty ?? 0) !== 0 || (genOpts.dryMultiplier ?? 0) > 0
     // (presencePenalty was missing from this list until 0.18: a GREEDY call with only presence set
     // silently ignored it - the plain GPU greedy loop never runs the penalty chain.)
-    if ((genOpts.dryMultiplier ?? 0) > 0 && genOpts.promptLookup && genOpts.promptLookup !== 'auto')
-      throw new Error('bitgpu: dryMultiplier is not supported with promptLookup (DRY needs per-position history; auto simply disables lookup)')
+    if (((genOpts.dryMultiplier ?? 0) > 0 || (genOpts.topNSigma ?? 0) > 0) && genOpts.promptLookup && genOpts.promptLookup !== 'auto')
+      throw new Error('bitgpu: dryMultiplier/topNSigma are not supported with promptLookup (they need per-position statistics; auto simply disables lookup)')
     const reuse = (genOpts.reuseCache ?? false) && fullHistory.length > 0
     if (genOpts.signal?.aborted) {
       // aborted before any work: don't touch fullHistory (the cache still matches it)
@@ -2447,7 +2520,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // the same per-step candidate readback, so they route identically.
     const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
     let r: RawGenResult
-    if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+    if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
       // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
       // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
       // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
@@ -2494,7 +2567,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           },
         }
       }
-    } else if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && genOpts.promptLookup) {
+    } else if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup) {
       r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else if (sampled || hasProcessors || hasFilter) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory

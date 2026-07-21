@@ -106,21 +106,39 @@ export class StopScanner {
   }
 }
 
+/** Confidence-based early stop for the think channel (training-free, DART-lineage heuristic). */
+export interface ThinkEarlyStop {
+  /** Logit gap (top1 - top2) that counts as a "confident" step. */
+  gap: number
+  /** Consecutive confident steps required before firing. */
+  window: number
+  /** Reasoning tokens that must be spent before early stop may fire (don't cut the model off
+   *  before it has actually reasoned). */
+  minTokens: number
+}
+
 /** Budget-forcing for the think channel (s1-style "budget forcing", training-free): counts the
- *  tokens generated inside a <think> block; once `budget` is spent, `force()` names `</think>` as
- *  the only permitted candidate (the engine's constrained pick guarantees it is reachable even
- *  when outside the top-K), so the model closes its reasoning and continues straight into the
- *  visible answer. `budget: 0` suppresses reasoning entirely while keeping the thinking-mode
- *  template. advance() must see every emitted token. */
+ *  tokens generated inside a <think> block; once `budget` is spent - or the EARLY-STOP heuristic
+ *  fires (the model has been decisively confident for `window` consecutive steps after
+ *  `minTokens`, a signature of rote continuation rather than active reasoning) - `force()` names
+ *  `</think>` as the only permitted candidate (the engine's constrained pick guarantees it is
+ *  reachable even when outside the top-K), so the model closes its reasoning and continues
+ *  straight into the visible answer. `budget: 0` suppresses reasoning entirely while keeping the
+ *  thinking-mode template. advance() must see every emitted token; observe() should see each
+ *  step's candidate logits (descending) BEFORE the pick - the filter callback receives exactly
+ *  that. */
 export class ThinkBudget {
   private inThink: boolean
   private spent = 0
   private closed = false
+  private run = 0 //         consecutive confident steps (early stop)
+  private earlyFired = false
   constructor(
     private readonly openId: number | undefined,
     private readonly closeId: number | undefined,
     private readonly budget: number,
     startInside: boolean,
+    private readonly early: ThinkEarlyStop | null = null,
   ) {
     this.inThink = startInside
   }
@@ -139,8 +157,17 @@ export class ThinkBudget {
     this.spent++
   }
 
-  /** The forced token id once the budget is exhausted (only `</think>` may be emitted), else null. */
+  /** Feed one step's candidate logits (descending). Only meaningful inside think. */
+  observe(vals: ArrayLike<number>): void {
+    if (!this.early || !this.inThink || this.closed || this.earlyFired || vals.length < 2) return
+    const confident = vals[0] - vals[1] >= this.early.gap
+    this.run = confident ? this.run + 1 : 0
+    if (this.spent >= this.early.minTokens && this.run >= this.early.window) this.earlyFired = true
+  }
+
+  /** The forced token id once the budget is exhausted or early stop fired, else null. */
   force(): number | null {
-    return this.inThink && !this.closed && this.spent >= this.budget && this.closeId != null ? this.closeId : null
+    if (!this.inThink || this.closed || this.closeId == null) return null
+    return this.spent >= this.budget || this.earlyFired ? this.closeId : null
   }
 }

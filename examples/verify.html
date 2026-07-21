@@ -151,6 +151,19 @@
       const detOk = s1.tokens.length === s2.tokens.length && s1.tokens.every((t, i) => t === s2.tokens[i]);
       ok = ok && detOk;
       log(`  ${detOk ? '[PASS]' : '[FAIL]'} determinism (seed 42 identical twice)`);
+
+      // (b2) top-n-sigma (GPU sigma over the full penalized logits): behavioral bounds. A huge n
+      // keeps every candidate -> the draw is BIT-identical to off; a tiny n collapses the pool to
+      // the argmax -> equals the deterministic greedy-with-processors sequence.
+      const sWide = await engine.generate(ids, { ...SOPT, maxTokens: 24, seed: 42, topNSigma: 50 });
+      const nsWideOk = sWide.tokens.length === s1.tokens.length && sWide.tokens.every((t, i) => t === s1.tokens[i]);
+      ok = ok && nsWideOk;
+      log(`  ${nsWideOk ? '[PASS]' : '[FAIL]'} topNSigma=50 bit-identical to off`);
+      const sTight = await engine.generate(ids, { ...SOPT, maxTokens: 24, seed: 42, topNSigma: 1e-4 });
+      const gProc = await engine.generate(ids, { ...SOPT, temperature: 0, maxTokens: 24 }); // penalized argmax
+      const nsTightOk = sTight.tokens.length === gProc.tokens.length && sTight.tokens.every((t, i) => t === gProc.tokens[i]);
+      ok = ok && nsTightOk;
+      log(`  ${nsTightOk ? '[PASS]' : '[FAIL]'} topNSigma~0 collapses to the penalized argmax`);
       log(`  sampled ids (seed 42): [${s1.tokens.join(', ')}]`);
       log(`  sampled decode = ${s1.tokensPerSecond.toFixed(2)} tok/s (greedy was ${g.tokensPerSecond.toFixed(2)})`);
 

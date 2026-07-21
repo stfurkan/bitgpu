@@ -57,6 +57,7 @@ export interface ChatSendOptions {
   dryAllowedLength?: number
   dryRange?: number
   dryBreakers?: number[]
+  topNSigma?: number
   noRepeatNgramSize?: number
   seed?: number
   promptLookup?: GenerateOptions['promptLookup']
@@ -86,6 +87,13 @@ export interface ChatSendOptions {
    *  slow on-device decode. `0` suppresses reasoning entirely (thinking template, no think
    *  tokens). Unset = unlimited. Ignored when `think` is off. */
   thinkBudget?: number
+  /** ADAPTIVE early stop for the reasoning phase (thinking mode only; composes with
+   *  `thinkBudget`, which stays the hard cap): when the model has been decisively confident -
+   *  top-1 vs top-2 logit gap >= `gap` - for `window` consecutive think tokens after at least
+   *  `minTokens` of reasoning, `</think>` is forced and the answer begins. Sustained certainty
+   *  inside a think block is the signature of rote continuation, not active reasoning; cutting
+   *  there buys latency at little answer-quality cost. Pass `true` for the calibrated defaults. */
+  thinkEarlyStop?: boolean | { gap?: number; window?: number; minTokens?: number }
   /** Streamed visible reply text (clean deltas: UTF-8-safe, think blocks removed). */
   onText?: (delta: string) => void
   /** Streamed think content (only meaningful with `think: true`). */
@@ -498,7 +506,16 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // thinkBudget: once the budget is spent inside <think>, the ONLY permitted candidate is
     // </think> (the engine's constrained pick walks the full vocab when it is outside the top-K),
     // then generation continues unconstrained into the visible reply.
-    const tb = think && o.thinkBudget != null && tk.tokenToId('</think>') != null ? new ThinkBudget(tk.tokenToId('<think>'), tk.tokenToId('</think>'), Math.max(0, o.thinkBudget), thinkPreopened) : null
+    // thinkEarlyStop defaults = the measured-best adaptive point on the real Bonsai-27B (Modal
+    // A100 calibration, tools/eval-thinkstop-modal.py: 75% acc @ 244 avg think tokens vs 67% @ 899
+    // unbounded). NOTE the same eval found a plain thinkBudget of 128-256 SCORED HIGHER (83%) on
+    // that uniformly-easy set - reach for the hard cap first; the adaptive stop is for mixed-
+    // difficulty workloads where one cap can't fit every question.
+    const tes = o.thinkEarlyStop ? { gap: 6, window: 16, minTokens: 64, ...(o.thinkEarlyStop === true ? {} : o.thinkEarlyStop) } : null
+    const tb =
+      think && (o.thinkBudget != null || tes) && tk.tokenToId('</think>') != null
+        ? new ThinkBudget(tk.tokenToId('<think>'), tk.tokenToId('</think>'), Math.max(0, o.thinkBudget ?? Infinity), thinkPreopened, tes)
+        : null
     let result: GenerateResult
     try {
       result = await engine.generate(inputTokenIds, {
@@ -514,6 +531,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         dryAllowedLength: o.dryAllowedLength,
         dryRange: o.dryRange,
         dryBreakers: (o.dryMultiplier ?? 0) > 0 ? (o.dryBreakers ?? defaultDryBreakers()) : undefined,
+        topNSigma: o.topNSigma,
         noRepeatNgramSize: o.noRepeatNgramSize,
         seed: o.seed,
         logprobs: o.logprobs,
@@ -523,7 +541,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         signal,
         candidateFilter:
           jf || tf || tb
-            ? (ids) => {
+            ? (ids, vals) => {
+                tb?.observe(vals)
                 const forced = tb?.force()
                 if (forced != null) return [forced]
                 return jf ? jf.filter(ids) : tf ? tf.filter(ids) : Array.from(ids)

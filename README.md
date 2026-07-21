@@ -53,7 +53,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.18.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.19.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -110,6 +110,12 @@ await engine.generate(promptTokenIds, { temperature: 0.5, topP: 0.85, topK: 20, 
 // untouched. Off by default; sequence-breaker token ids exempt structural tokens (bitgpu/chat
 // fills them from the tokenizer automatically). Not combinable with promptLookup.
 await engine.generate(promptTokenIds, { temperature: 0.5, dryMultiplier: 0.8, dryAllowedLength: 2 })
+
+// Top-n-sigma (arXiv 2411.07641): keep candidates within n standard deviations of the max logit,
+// with sigma computed ON THE GPU over the full penalized logit vector (not a top-K estimate) -
+// the cutoff adapts to how peaked the distribution actually is, which suits low-precision models.
+// Off by default (bit-identical draw when unset). Typical n: 1.0-1.5.
+await engine.generate(promptTokenIds, { temperature: 0.5, topNSigma: 1.0 })
 
 // Penalties apply under greedy decoding too (penalized argmax, deterministic, no RNG),
 // exactly like transformers.js greedy search:
@@ -238,7 +244,15 @@ conversation.
 `thinkBudget: N` caps the reasoning phase: after N generated think tokens only `</think>` may be
 emitted, so the model wraps up and answers - "budget forcing", the practical way to run thinking
 mode on-device where every token is slow. `thinkBudget: 0` keeps the thinking template but
-suppresses reasoning entirely.
+suppresses reasoning entirely. `thinkEarlyStop: true` adds an ADAPTIVE cut that composes with the
+hard cap: when the model has been decisively confident (top-1 vs top-2 logit gap) for a sustained
+run of think tokens - the signature of rote continuation rather than active reasoning - the close
+is forced early. Defaults were calibrated against the real Bonsai-27B on an A100 reference
+(tools/eval-thinkstop-modal.py): unbounded thinking scored WORST there (67% accuracy, ~900 think
+tokens, a third of the problems rambling forever), the adaptive stop reached 75% at ~244 tokens -
+and a plain `thinkBudget: 128` scored best of all (83%). So: reach for the hard cap first; use
+`thinkEarlyStop` (alone or composed with a generous cap) for mixed-difficulty workloads where a
+single cap cannot fit every question. Pass `{ gap, window, minTokens }` to tune.
 
 ### Guaranteed-valid JSON (`format: 'json'`)
 

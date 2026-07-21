@@ -1104,6 +1104,76 @@ await (async () => {
     check('e2e preopen: without a budget reasoning is untouched', rF.thinkText === 'abc' && rF.text === 'ok', JSON.stringify(rF.thinkText))
   }
 
+  // adaptive early stop: unit semantics (observe feeds each step's candidate logits pre-pick)
+  {
+    const CONF = [9, 3] // gap 6
+    const UNSURE = [9, 8] // gap 1
+    const b = new ThinkBudget(10, 11, Infinity, true, { gap: 5, window: 3, minTokens: 2 })
+    b.observe(CONF); b.advance(7) // spent 1, run 1
+    b.observe(CONF); b.advance(7) // spent 2, run 2
+    check('early stop: quiet before the window fills', b.force() === null)
+    b.observe(CONF) // run 3, spent 2 >= minTokens -> fires
+    check('early stop: fires after window consecutive confident steps', b.force() === 11)
+    const c = new ThinkBudget(10, 11, Infinity, true, { gap: 5, window: 3, minTokens: 2 })
+    c.observe(CONF); c.advance(7); c.observe(CONF); c.advance(7)
+    c.observe(UNSURE); c.advance(7) // resets the run
+    c.observe(CONF); c.observe(CONF)
+    check('early stop: an unconfident step resets the run', c.force() === null)
+    const d = new ThinkBudget(10, 11, Infinity, true, { gap: 5, window: 1, minTokens: 50 })
+    d.observe(CONF); d.advance(7)
+    d.observe(CONF)
+    check('early stop: never fires before minTokens', d.force() === null)
+  }
+
+  // e2e: a perpetually-confident "model" is cut by the early stop, then answers (vals flow
+  // through the real candidateFilter callback)
+  {
+    const PREOPEN = [
+      "{%- for message in messages %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}",
+      "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if enable_thinking %}{{ '<think>\\n' }}{%- else %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
+    ].join('')
+    const { json: pj, config: pc } = miniTokenizer(PREOPEN)
+    const ptk = new ChatTokenizer(pj, pc)
+    const cid = (ch: string): number => ptk.encode(ch, false)[0]
+    const close = ptk.tokenToId('</think>')!
+    const gapEngine = (steps: number[][]): Engine => {
+      return {
+        async generate(_ids: number[], o: GenerateOptions = {}): Promise<GenerateResult> {
+          const tokens: number[] = []
+          for (const step of steps) {
+            if (tokens.length >= (o.maxTokens ?? 256)) break
+            const vals = Float32Array.from(step, (_, i) => 20 - 10 * i) // top gap 10: always "confident"
+            const perm = o.candidateFilter ? [...o.candidateFilter(Uint32Array.from(step), vals)] : step
+            let chosen: number | null = null
+            for (const b of step) if (perm.includes(b)) { chosen = b; break }
+            if (chosen === null) throw new Error('no permitted token')
+            if (o.stopTokens?.includes(chosen)) break
+            tokens.push(chosen)
+            o.onToken?.(chosen)
+          }
+          return { tokens, prefillMs: 1, decodeMs: 1, tokensPerSecond: tokens.length, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+        },
+        async prefill() { return { prefillMs: 1 } },
+        resetCache() {},
+      } as never
+    }
+    const steps = [
+      [cid('a'), close],
+      [cid('b'), close],
+      [cid('c'), close], // window 2 + minTokens 2 satisfied here -> forced close
+      [cid('o')],
+      [cid('k')],
+      [ptk.eosTokenId],
+    ]
+    const chat = await createChat(gapEngine(steps), { tokenizer: { json: pj, config: pc } })
+    const r = await chat.send([{ role: 'user', content: 'q' }], { think: true, thinkEarlyStop: { gap: 5, window: 2, minTokens: 2 } })
+    check('e2e early stop: confident run cut, answer continues', r.thinkText === 'ab' && r.text === 'ok', JSON.stringify({ think: r.thinkText, text: r.text }))
+    // without early stop the same model reasons until its own close
+    const stepsFree = [[cid('a'), close], [cid('b'), close], [close], [cid('o')], [cid('k')], [ptk.eosTokenId]]
+    const rF = await (await createChat(gapEngine(stepsFree), { tokenizer: { json: pj, config: pc } })).send([{ role: 'user', content: 'q' }], { think: true })
+    check('e2e early stop: off by default', rF.thinkText === 'ab' && rF.text === 'ok', JSON.stringify(rF.thinkText))
+  }
+
   // e2e on the standard template (model opens <think> itself): the open tag is not counted
   {
     const { json: gj, config: gc } = miniTokenizer()

@@ -247,6 +247,13 @@ export interface GenerateOptions {
    *  repeat). Default none. `bitgpu/chat` fills this with the tokenizer's newline/punctuation
    *  tokens when DRY is enabled. */
   dryBreakers?: number[]
+  /** Top-n-sigma sampling cutoff (arXiv 2411.07641): keep candidates whose logit is within
+   *  `topNSigma` standard deviations of the max, with sigma computed on the GPU over the FULL
+   *  penalized logit vector (not a top-K estimate). Robust for low-precision models: the
+   *  threshold adapts to how peaked the distribution actually is. Typical value 1.0-1.5; default
+   *  `0` (off, bit-identical draw). Only affects sampling; not combinable with `promptLookup`
+   *  (with `'auto'`, lookup simply stays off). */
+  topNSigma?: number
   /** Block any n-gram of this size from repeating. Default `0` (off). Applied under greedy decoding
    *  too, matching transformers.js. */
   noRepeatNgramSize?: number
