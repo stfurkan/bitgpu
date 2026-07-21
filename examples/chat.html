@@ -6,70 +6,117 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
   <title>bitgpu - 1-bit LLM chat, entirely in your browser</title>
   <style>
+    /* ── tokens: warm stone ground, circuit-copper accent. Light is the default; dark is an
+       explicit choice via the toggle (persisted), never inferred from the OS. ── */
     :root {
       color-scheme: light;
-      --bg: #f7f7f8; --fg: #17171a; --muted: #6f6f78; --card: #ffffff; --line: #e3e3e8;
-      --accent: #2563eb; --accent-fg: #ffffff; --user: #e8f0fe; --danger: #dc2626; --ok: #16a34a;
-      --shadow: 0 1px 3px rgba(0,0,0,.06);
+      --bg: #faf9f7; --fg: #1c1917; --muted: #79716b; --card: #ffffff; --line: #e8e4df;
+      --accent: #b4530a; --accent-hover: #9c4708; --accent-fg: #ffffff;
+      --user: #f6ede2; --tool: #fbf7f1; --danger: #b91c1c; --ok: #15803d;
+      --ring: rgba(180, 83, 10, .28);
+      --shadow: 0 1px 2px rgba(28, 25, 23, .05), 0 2px 8px rgba(28, 25, 23, .04);
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --bg: #0e0e11; --fg: #e6e6ea; --muted: #9b9ba4; --card: #17171c; --line: #26262d;
-      --accent: #60a5fa; --accent-fg: #0b1220; --user: #1c2a44; --danger: #f87171; --ok: #4ade80;
-      --shadow: 0 1px 3px rgba(0,0,0,.4);
-    }
-    @media (prefers-color-scheme: dark) {
-      :root:not([data-theme="light"]) {
-        color-scheme: dark;
-        --bg: #0e0e11; --fg: #e6e6ea; --muted: #9b9ba4; --card: #17171c; --line: #26262d;
-        --accent: #60a5fa; --accent-fg: #0b1220; --user: #1c2a44; --danger: #f87171; --ok: #4ade80;
-        --shadow: 0 1px 3px rgba(0,0,0,.4);
-      }
+      --bg: #14110f; --fg: #ece7e2; --muted: #a29a92; --card: #1e1a17; --line: #302b26;
+      --accent: #e89a4e; --accent-hover: #f0ab66; --accent-fg: #241505;
+      --user: #33281b; --tool: #1a1613; --danger: #f87171; --ok: #4ade80;
+      --ring: rgba(232, 154, 78, .35);
+      --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 2px 10px rgba(0, 0, 0, .25);
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
-    body { font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); margin: 0; display: flex; flex-direction: column; }
-    header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
-    header .title { font-weight: 650; font-size: 15px; }
+    html, body { height: 100dvh; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--fg); margin: 0;
+      display: flex; flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── header ── */
+    header { display: flex; align-items: baseline; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--card); }
+    header .title { font: 600 15px/1 var(--mono); letter-spacing: -.02em; }
+    header .title::before { content: '▚ '; color: var(--accent); }
     header .tag { font-size: 12px; color: var(--muted); }
     header .spacer { flex: 1; }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    button, select { font: inherit; border-radius: 9px; border: 1px solid var(--line); background: var(--card); color: var(--fg); padding: 7px 12px; cursor: pointer; }
-    button:hover:not(:disabled) { border-color: var(--muted); }
+
+    /* ── controls ── */
+    button, select {
+      font: inherit; border-radius: 9px; border: 1px solid var(--line);
+      background: var(--card); color: var(--fg); padding: 8px 13px; cursor: pointer;
+      transition: border-color .12s, background .12s;
+    }
+    button:hover:not(:disabled), select:hover { border-color: var(--muted); }
     button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
-    button.icon { padding: 7px 10px; line-height: 1; }
+    button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+    button.icon { padding: 8px 10px; line-height: 1; }
     button:disabled { opacity: .45; cursor: default; }
-    .wrap { width: 100%; max-width: 820px; margin: 0 auto; padding: 0 16px; }
+    button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible, label.chk:has(input:focus-visible) {
+      outline: 2px solid var(--ring); outline-offset: 1px;
+    }
+    .wrap { width: 100%; max-width: 800px; margin: 0 auto; padding: 0 16px; }
     .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 14px 0 6px; }
     .controls .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-    label.chk { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+    label.chk {
+      display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted);
+      cursor: pointer; user-select: none; border: 1px solid var(--line); border-radius: 999px;
+      padding: 6px 12px; background: var(--card); transition: border-color .12s, color .12s;
+    }
+    label.chk:hover { border-color: var(--muted); }
+    label.chk:has(input:checked) { color: var(--accent); border-color: var(--accent); background: var(--tool); }
+    label.chk input { accent-color: var(--accent); margin: 0; }
     #status { font-size: 13px; color: var(--muted); min-height: 20px; padding: 4px 0 8px; }
+    #status b { font-family: var(--mono); font-size: 12.5px; }
     #status .err { color: var(--danger); }
     #status .ok { color: var(--ok); }
-    progress { width: 100%; height: 5px; accent-color: var(--accent); border-radius: 3px; }
-    main { flex: 1; overflow-y: auto; }
+    progress { width: 100%; height: 4px; accent-color: var(--accent); border-radius: 2px; }
+
+    /* ── chat log ── */
+    main { flex: 1; overflow-y: auto; overscroll-behavior: contain; }
     #log { display: flex; flex-direction: column; gap: 10px; padding: 10px 0 24px; }
     .msg { padding: 10px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--card); white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: var(--shadow); }
-    .msg.user { background: var(--user); align-self: flex-end; max-width: 85%; border-bottom-right-radius: 4px; }
-    .msg.assistant { align-self: flex-start; max-width: 95%; border-bottom-left-radius: 4px; }
+    .msg.user { background: var(--user); border-color: transparent; align-self: flex-end; max-width: 85%; border-bottom-right-radius: 5px; }
+    .msg.assistant { align-self: flex-start; max-width: 95%; border-bottom-left-radius: 5px; }
     .msg.assistant.pending::after { content: '▍'; color: var(--accent); animation: blink 1s steps(1) infinite; }
-    .msg.toolcall { align-self: flex-start; max-width: 95%; font: 12.5px/1.6 ui-monospace, monospace; color: var(--muted); background: transparent; box-shadow: none; border-style: dashed; }
-    .msg.toolcall b { color: var(--fg); font-weight: 600; }
+    .msg.toolcall { align-self: flex-start; max-width: 95%; font: 12.5px/1.6 var(--mono); color: var(--muted); background: var(--tool); box-shadow: none; border-style: dashed; }
+    .msg.toolcall b { color: var(--accent); font-weight: 600; }
     @keyframes blink { 50% { opacity: 0; } }
-    .msg .meta { display: block; font-size: 11px; color: var(--muted); margin-top: 6px; }
-    .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 48px 24px; }
+    .msg .meta { display: block; font: 11px/1.5 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); margin-top: 7px; }
+    .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 44px 24px; max-width: 62ch; margin: 0 auto; }
     .empty b { color: var(--fg); }
+
+    /* ── composer ── */
     footer { border-top: 1px solid var(--line); background: var(--card); padding: 10px 0 calc(10px + env(safe-area-inset-bottom)); }
     .inputrow { display: flex; gap: 8px; }
-    input[type="text"] { flex: 1; padding: 11px 14px; border-radius: 11px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); font: inherit; min-width: 0; }
-    input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
-    .storage { font-size: 12px; color: var(--muted); display: flex; gap: 10px; align-items: center; padding-top: 6px; }
-    .storage button { font-size: 12px; padding: 3px 8px; }
+    input[type="text"] {
+      flex: 1; padding: 11px 14px; border-radius: 11px; border: 1px solid var(--line);
+      background: var(--bg); color: var(--fg); font: inherit; font-size: 16px; min-width: 0;
+    }
+    input[type="text"]:focus { outline: 2px solid var(--ring); outline-offset: -1px; border-color: transparent; }
+    .storage { font: 12px/1.5 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 6px; }
+    .storage button { font: inherit; font-size: 12px; padding: 3px 9px; }
+
+    /* ── schema editor ── */
     #schemaBox { display: none; padding: 8px 0 2px; }
     #schemaBox.show { display: block; }
     #schemaBox .hint { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-    #schema { width: 100%; min-height: 96px; font: 12.5px/1.5 ui-monospace, monospace; border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--fg); padding: 8px 10px; resize: vertical; }
+    #schema { width: 100%; min-height: 96px; font: 12.5px/1.5 var(--mono); border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--fg); padding: 8px 10px; resize: vertical; }
+
+    /* ── small screens ── */
+    @media (max-width: 640px) {
+      header { padding: 10px 14px; }
+      header .tag { display: none; }
+      .controls select { flex: 1 1 100%; }
+      .msg.user, .msg.assistant, .msg.toolcall { max-width: 100%; }
+      .empty { padding: 28px 8px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; transition: none !important; }
+      .msg.assistant.pending::after { opacity: 1; }
+    }
   </style>
 </head>
 <body>
@@ -87,7 +134,7 @@
         <option value="bonsai-1.7b-gguf">Bonsai 1.7B · ~240 MB</option>
         <option value="bonsai-4b-gguf">Bonsai 4B · ~570 MB</option>
         <option value="bonsai-8b-gguf">Bonsai 8B · ~1.2 GB</option>
-        <option value="bonsai-27b-gguf">Bonsai 27B · hybrid · ~3.8 GB · 16 GB+ · experimental</option>
+        <option value="bonsai-27b-gguf">Bonsai 27B · hybrid · ~3.8 GB · 16 GB+</option>
         <option value="bonsai-1.7b">Bonsai 1.7B · ONNX · ~290 MB</option>
         <option value="bonsai-4b">Bonsai 4B · ONNX · ~660 MB</option>
         <option value="bonsai-8b">Bonsai 8B · ONNX · ~1.3 GB</option>
@@ -145,7 +192,7 @@
   <script type="module">
     // Pinned published package from a CDN: this single file runs on GitHub Pages, any static
     // host, or saved locally. For development against a checkout use examples/verify.html.
-    const BITGPU = 'https://esm.sh/bitgpu@0.16.0';
+    const BITGPU = 'https://esm.sh/bitgpu@0.17.0';
     const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@main/models';
     const HF = (r) => `https://huggingface.co/onnx-community/${r}/resolve/main`;
     const PRISM = (r) => `https://huggingface.co/prism-ml/${r}/resolve/main`;
@@ -157,8 +204,9 @@
       'bonsai-4b-gguf': { data: `${PRISM('Bonsai-4B-gguf')}/Bonsai-4B-Q1_0.gguf`, tok: HF('Bonsai-4B-ONNX'), aux: 'Bonsai-4B-Q1_0.aux.bin' },
       'bonsai-8b-gguf': { data: `${PRISM('Bonsai-8B-gguf')}/Bonsai-8B-Q1_0.gguf`, tok: HF('Bonsai-8B-ONNX'), aux: 'Bonsai-8B-Q1_0.aux.bin' },
       // Qwen3.5 hybrid 27B: committed manifest + aux like the others; weights stream from HF, tokenizer
-      // from the -unpacked repo (the GGUF repo ships none). ~3.8 GB - wants 16 GB+.
-      'bonsai-27b-gguf': { data: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-Q1_0.gguf`, tok: PRISM('Bonsai-27B-unpacked'), aux: 'Bonsai-27B-Q1_0.aux.bin' },
+      // from the -unpacked repo (the GGUF repo ships none). ~3.8 GB - wants 16 GB+. `gen` overrides the
+      // sampling with PrismML's recommended settings for this model (temp 0.5 / top_p 0.85 / top_k 20).
+      'bonsai-27b-gguf': { data: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-Q1_0.gguf`, tok: PRISM('Bonsai-27B-unpacked'), aux: 'Bonsai-27B-Q1_0.aux.bin', gen: { temperature: 0.5, topP: 0.85, topK: 20 } },
       'bonsai-1.7b': { data: `${HF('Bonsai-1.7B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'bonsai.aux.bin' },
       'bonsai-4b': { data: `${HF('Bonsai-4B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-4B-ONNX'), aux: 'model_q1.aux.bin' },
       'bonsai-8b': { data: `${HF('Bonsai-8B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-8B-ONNX'), aux: 'model_q1.aux.bin' },
@@ -166,13 +214,12 @@
     const $ = (id) => document.getElementById(id);
     const status = (html) => { $('status').innerHTML = html; };
 
-    // ── theme: system default, manual override persisted ──
-    const applyTheme = (t) => { t ? document.documentElement.setAttribute('data-theme', t) : document.documentElement.removeAttribute('data-theme'); };
+    // ── theme: LIGHT by default (deliberate, not OS-inferred); the toggle flips to dark and the
+    // choice is persisted across visits ──
+    const applyTheme = (t) => { t === 'dark' ? document.documentElement.setAttribute('data-theme', 'dark') : document.documentElement.removeAttribute('data-theme'); };
     applyTheme(localStorage.getItem('bitgpu-theme'));
     $('theme').onclick = () => {
-      const dark = matchMedia('(prefers-color-scheme: dark)').matches;
-      const cur = localStorage.getItem('bitgpu-theme') || (dark ? 'dark' : 'light');
-      const next = cur === 'dark' ? 'light' : 'dark';
+      const next = (localStorage.getItem('bitgpu-theme') || 'light') === 'dark' ? 'light' : 'dark';
       localStorage.setItem('bitgpu-theme', next);
       applyTheme(next);
     };
@@ -194,9 +241,12 @@
     async function refreshStorage() {
       try {
         const est = await navigator.storage.estimate();
-        const mb = (est.usage ?? 0) / 1048576;
+        const fmt = (b) => { const mb = b / 1048576; return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb.toFixed(0) + ' MB'; };
         const has = (await (await caches.open(CACHE)).keys()).length > 0;
-        $('usage').textContent = has ? `~${mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb.toFixed(0) + ' MB'} of models cached in this browser` : 'no models downloaded yet';
+        const persisted = (await navigator.storage.persisted?.()) ?? false;
+        $('usage').textContent = has
+          ? `~${fmt(est.usage ?? 0)} of models cached${est.quota ? ` (of ~${fmt(est.quota)} available)` : ''}${persisted ? ' · persistent' : ''}`
+          : 'no models downloaded yet';
         $('wipe').hidden = !has;
       } catch { $('usage').textContent = ''; }
     }
@@ -247,6 +297,9 @@
     $('load').onclick = async () => {
       const key = $('model').value, m = MODELS[key];
       $('load').disabled = true; $('model').disabled = true;
+      // Ask for durable storage so the browser will not silently evict multi-GB model weights
+      // under storage pressure (best-effort; browsers may grant automatically or prompt).
+      navigator.storage?.persist?.().catch(() => {});
       try {
         status('loading bitgpu...');
         const [{ createEngine, WebGPUUnavailableError }, { createChat }] = await Promise.all([import(BITGPU), import(`${BITGPU}/chat`)]);
@@ -404,8 +457,13 @@
             catch { throw new Error('the schema box does not contain valid JSON'); }
           } else format = 'json';
         }
+        // per-model sampling: models with a `gen` override (the 27B) use it; the rest keep the default.
+        // minP prunes candidates below 5% of the top token's probability - without it, a bare "hello"
+        // (no language anchor) can sample a Spanish/Russian opening from the top-K tail, and the first
+        // token locks the reply's language.
+        const gen = MODELS[$('model').value]?.gen ?? { temperature: 0.5, topK: 20, minP: 0.05, repetitionPenalty: 1.1 };
         const sendOnce = () => chat.send(messages, {
-          temperature: 0.5, topK: 20, repetitionPenalty: 1.1,
+          ...gen,
           maxTokens: json ? 320 : 512,
           format,
           tools: toolsOn ? DEMO_TOOLS : undefined,

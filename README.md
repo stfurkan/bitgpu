@@ -53,7 +53,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.16.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.17.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -99,6 +99,11 @@ console.log(result.tokens, result.tokensPerSecond)
 
 // Sampling (matches transformers.js v4.2.0 exactly): set a temperature other than 0/1.
 await engine.generate(promptTokenIds, { temperature: 0.5, topK: 20, repetitionPenalty: 1.15 })
+
+// Extra warpers, all off by default (the draw is bit-identical to the plain sampler when unset):
+// topP (nucleus over the top-K), minP (>= minP * top prob - robust for low-precision models),
+// presencePenalty (flat subtraction on seen tokens - the Qwen3.5 family's anti-repetition knob).
+await engine.generate(promptTokenIds, { temperature: 0.5, topP: 0.85, topK: 20, minP: 0.05, presencePenalty: 1.5 })
 
 // Penalties apply under greedy decoding too (penalized argmax, deterministic, no RNG),
 // exactly like transformers.js greedy search:
@@ -287,11 +292,13 @@ with or without it; `promptLookup` is disabled for the turn.
 
 ### Tool calling (`tools`)
 
-The model's own protocol (Qwen3-family templates render a `tools` list and emit
-`<tool_call>` blocks), with the same enforcement guarantee as schema mode: a bitgpu tool call
+The model's own protocol, with the same enforcement guarantee as schema mode: a bitgpu tool call
 **cannot be malformed** - once the model opens a call, the name is forced to one of your
 declared tools and the arguments are forced through that tool's `parameters` schema,
-token-by-token.
+token-by-token. Both Qwen wire formats are supported and auto-detected from the chat template:
+the Qwen3 JSON shape (`<tool_call>{"name": …, "arguments": …}</tool_call>` - the dense Bonsai
+models) and the Qwen3.5 XML shape (`<tool_call><function=…><parameter=…>` - the hybrid
+Bonsai-27B), so the same `tools` array works across all of them.
 
 ```ts
 const tools = [{
@@ -373,14 +380,16 @@ const engine = await createEngine({
 })
 ```
 
-The Qwen3.5 hybrid **Bonsai-27B** loads exactly the same way - `fromGguf` is its only path (there is
-no offline converter for the hybrid yet), so point at
+The Qwen3.5 hybrid **Bonsai-27B** loads exactly the same way - `fromGguf` on
 `prism-ml/Bonsai-27B-gguf/resolve/main/Bonsai-27B-Q1_0.gguf` with `kvCache: 'q8'` and, say,
-`maxSeqLen: 4096`. bitgpu runs its **text trunk** (the model is multimodal; the vision path is out of
-scope). Text chat works through `bitgpu/chat` unchanged - its Jinja template and tool-call rendering
-go through the same path as the dense models (verified end-to-end) - but the GGUF repo ships no
-tokenizer, so point `createChat` at [prism-ml/Bonsai-27B-unpacked](https://huggingface.co/prism-ml/Bonsai-27B-unpacked)
-for `tokenizer.json` + `tokenizer_config.json`. It is a ~3.8 GB download and comfortably wants a 16 GB
+`maxSeqLen: 4096` - or via its [committed manifest](models/) like the dense models. bitgpu runs its
+**text trunk** (the model is multimodal; the vision path is out of scope). Text chat AND tool calling
+work through `bitgpu/chat` unchanged - the Qwen3.5 template's XML tool protocol is auto-detected and
+enforced like the dense models' JSON protocol (verified end-to-end on the real 27B) - but the GGUF
+repo ships no tokenizer, so point `createChat` at
+[prism-ml/Bonsai-27B-unpacked](https://huggingface.co/prism-ml/Bonsai-27B-unpacked)
+for `tokenizer.json` + `tokenizer_config.json`. Recommended sampling (per the model card):
+`temperature: 0.5, topP: 0.85, topK: 20`. It is a ~3.8 GB download and comfortably wants a 16 GB
 (or larger) GPU budget - on an 8 GB laptop it runs but the weights spill to swap, so decode is slow.
 A hybrid upside: its 48 gated-DeltaNet layers cost O(1) per token, so decode throughput stays nearly
 flat as context grows (only the 16 full-attention layers scale with length) - a long-context
