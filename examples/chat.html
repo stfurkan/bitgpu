@@ -85,6 +85,24 @@
     .msg.toolcall b { color: var(--accent); font-weight: 600; }
     @keyframes blink { 50% { opacity: 0; } }
     .msg .meta { display: block; font: 11px/1.5 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); margin-top: 7px; }
+    /* markdown-rendered assistant bubbles (plain bubbles keep pre-wrap) */
+    .msg.md { white-space: normal; }
+    .msg.md > :first-child { margin-top: 0; }
+    .msg.md > :last-child:not(.meta) { margin-bottom: 0; }
+    .msg.md p, .msg.md ul, .msg.md ol, .msg.md pre, .msg.md blockquote, .msg.md table { margin: 8px 0; }
+    .msg.md h3, .msg.md h4, .msg.md h5 { margin: 12px 0 6px; line-height: 1.3; }
+    .msg.md h3 { font-size: 16px; } .msg.md h4 { font-size: 14.5px; } .msg.md h5 { font-size: 13.5px; }
+    .msg.md ul, .msg.md ol { padding-left: 22px; }
+    .msg.md li { margin: 3px 0; }
+    .msg.md code { font: 12.5px/1.6 var(--mono); background: var(--tool); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+    .msg.md pre { background: var(--tool); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+    .msg.md pre code { background: none; border: 0; padding: 0; white-space: pre; }
+    .msg.md blockquote { border-left: 3px solid var(--accent); padding: 2px 12px; color: var(--muted); }
+    .msg.md table { border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%; font-variant-numeric: tabular-nums; }
+    .msg.md th, .msg.md td { border: 1px solid var(--line); padding: 4px 10px; text-align: left; }
+    .msg.md th { background: var(--tool); }
+    .msg.md a { color: var(--accent); }
+    .msg.md hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
     .empty { text-align: center; color: var(--muted); font-size: 13.5px; padding: 44px 24px; max-width: 62ch; margin: 0 auto; }
     .empty b { color: var(--fg); }
 
@@ -346,7 +364,7 @@
             let pendingCalls = [];
             for (const m of sess.msgs) {
               if (m.role === 'user') bubble('user', m.content);
-              else if (m.role === 'assistant') { pendingCalls = [...(m.tool_calls ?? [])]; if (m.content) bubble('assistant', m.content); }
+              else if (m.role === 'assistant') { pendingCalls = [...(m.tool_calls ?? [])]; if (m.content) { const b = bubble('assistant', ''); b.classList.add('md'); setMd(b, m.content); } }
               else if (m.role === 'tool') {
                 const call = pendingCalls.shift();
                 const tb = bubble('toolcall', '');
@@ -409,6 +427,79 @@
     $('jsonMode').onchange = () => { if ($('jsonMode').checked) $('toolMode').checked = false; setPlaceholder(); };
     $('toolMode').onchange = () => { if ($('toolMode').checked) $('jsonMode').checked = false; setPlaceholder(); };
 
+    // ── minimal streaming markdown renderer ──
+    // Everything is HTML-escaped FIRST, then markdown structure is layered on top - the model can
+    // never inject markup. Re-rendered from the full accumulated text on every streamed delta
+    // (bubbles are small, so a full rebuild per token is cheap and keeps the parser stateless);
+    // an unclosed ``` fence mid-stream just renders as an open code block until its close arrives.
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const inlineMd = (s) => {
+      const codes = [];
+      s = s.replace(/`([^`\n]+)`/g, (_, c) => `\x00${codes.push(c) - 1}\x00`); // shield code spans
+      s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+        .replace(/(^|[\s(])\*(\S(?:[^*\n]*\S)?)\*/g, '$1<i>$2</i>')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[+i]}</code>`);
+    };
+    const md = (src) => {
+      const lines = esc(src).split('\n');
+      let html = '', i = 0, para = [];
+      const flush = () => { if (para.length) { html += `<p>${para.map(inlineMd).join('<br>')}</p>`; para = []; } };
+      while (i < lines.length) {
+        const l = lines[i];
+        if (/^\s*```/.test(l)) {
+          flush();
+          const buf = [];
+          for (i++; i < lines.length && !/^\s*```/.test(lines[i]);) buf.push(lines[i++]);
+          i++;
+          html += `<pre><code>${buf.join('\n')}</code></pre>`;
+          continue;
+        }
+        const h = l.match(/^(#{1,3})\s+(.*)/);
+        if (h) { flush(); const n = h[1].length + 2; html += `<h${n}>${inlineMd(h[2])}</h${n}>`; i++; continue; }
+        if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) { flush(); html += '<hr>'; i++; continue; }
+        if (/^\s*&gt;\s?/.test(l)) {
+          flush();
+          const buf = [];
+          while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*&gt;\s?/, ''));
+          html += `<blockquote>${buf.map(inlineMd).join('<br>')}</blockquote>`;
+          continue;
+        }
+        if (/^\s*\|.*\|\s*$/.test(l) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] ?? '')) {
+          flush();
+          const cells = (s) => s.trim().replace(/^\||\|$/g, '').split('|').map((c) => inlineMd(c.trim()));
+          html += `<table><thead><tr>${cells(l).map((c) => `<th>${c}</th>`).join('')}</tr></thead><tbody>`;
+          for (i += 2; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]);) html += `<tr>${cells(lines[i++]).map((c) => `<td>${c}</td>`).join('')}</tr>`;
+          html += '</tbody></table>';
+          continue;
+        }
+        if (/^(\s*)([-*+]|\d+[.)])\s+/.test(l)) {
+          flush();
+          const items = [];
+          let m;
+          while (i < lines.length && (m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)/))) {
+            items.push({ ind: Math.floor(m[1].replace(/\t/g, '  ').length / 2), ord: /\d/.test(m[2]), text: m[3] });
+            i++;
+          }
+          const stack = [];
+          for (const it of items) {
+            const depth = Math.min(it.ind, stack.length) + 1; // clamp: a child can only nest one level at a time
+            while (stack.length > depth) html += `</li></${stack.pop()}>`;
+            if (stack.length === depth) html += '</li>';
+            while (stack.length < depth) { const tag = it.ord ? 'ol' : 'ul'; html += `<${tag}>`; stack.push(tag); }
+            html += `<li>${inlineMd(it.text)}`;
+          }
+          while (stack.length) html += `</li></${stack.pop()}>`;
+          continue;
+        }
+        if (!l.trim()) { flush(); i++; continue; }
+        para.push(l); i++;
+      }
+      flush();
+      return html;
+    };
+    const setMd = (el, raw) => { el.innerHTML = md(raw); };
+
     const bubble = (cls, text) => {
       $('empty')?.remove();
       const d = document.createElement('div');
@@ -446,9 +537,11 @@
       messages.push({ role: 'user', content: q });
       let out = bubble('assistant', '');
       out.classList.add('pending');
+      let rawOut = ''; // the bubble's accumulated source text (markdown renders from this)
       try {
         const json = $('jsonMode').checked;
         const toolsOn = $('toolMode').checked;
+        if (!json) out.classList.add('md'); // JSON replies stay verbatim (pre-wrap), prose renders as markdown
         let format;
         if (json) {
           const st = $('schema').value.trim();
@@ -464,13 +557,19 @@
         const gen = MODELS[$('model').value]?.gen ?? { temperature: 0.5, topK: 20, minP: 0.05, repetitionPenalty: 1.1 };
         const sendOnce = () => chat.send(messages, {
           ...gen,
-          maxTokens: json ? 320 : 512,
+          // generous cap - the engine clamps to the remaining KV window and stops cleanly there,
+          // so long answers aren't cut short (512 was truncating the 27B's fuller replies)
+          maxTokens: json ? 512 : 2048,
           format,
           tools: toolsOn ? DEMO_TOOLS : undefined,
           logprobs: 5, // powers the confidence readout; the demo always samples, so this is ~free
           promptLookup: json || toolsOn ? undefined : 'auto',
           signal: abort.signal,
-          onText: (d) => { out.textContent += d; out.scrollIntoView({ block: 'end' }); },
+          onText: (d) => {
+            rawOut += d;
+            if (json) out.textContent = rawOut; else setMd(out, rawOut);
+            out.scrollIntoView({ block: 'end' });
+          },
           onOverflow: () => {
             // conversation outgrew the KV window: keep the latest turns that fit
             let msgs = messages.slice();
@@ -484,7 +583,7 @@
         // conversation is this page's code. Cap the rounds so a chatty model cannot loop.
         let calls = 0;
         while (toolsOn && r.finishReason === 'tool_calls' && calls < 3 && !abort.signal.aborted) {
-          if (!out.textContent) out.remove(); // a pure call turn has no visible reply
+          if (!rawOut) out.remove(); // a pure call turn has no visible reply
           else out.classList.remove('pending');
           messages.push({ role: 'assistant', content: r.text, tool_calls: r.toolCalls });
           for (const call of r.toolCalls) {
@@ -497,12 +596,14 @@
           }
           calls++;
           out = bubble('assistant', '');
-          out.classList.add('pending');
+          out.classList.add('pending', 'md');
+          rawOut = '';
           r = await sendOnce(); // extends the KV cache: no re-prefill of the conversation
         }
         if (r.finishReason === 'abort') {
           if (calls === 0) messages.length = base; // nothing committed yet: forget the question too
-          out.textContent += ' [stopped]';
+          rawOut += ' *[stopped]*';
+          if (json) out.textContent = rawOut; else setMd(out, rawOut);
         } else {
           messages.push({ role: 'assistant', content: r.text, ...(r.toolCalls.length ? { tool_calls: r.toolCalls } : {}) });
           const conf = confidenceOf(r);
@@ -512,11 +613,13 @@
             + (r.reusedCache ? ' · cache reused' : '')
             + (conf !== null ? ` · confidence ${(conf * 100).toFixed(0)}%` : '')
             + (calls ? ` · ${calls} tool round${calls > 1 ? 's' : ''}` : '')
-            + (json ? ` · ${r.finishReason === 'stop' ? 'valid JSON' : 'cut by maxTokens'}` : '');
+            + (json ? ` · ${r.finishReason === 'stop' ? 'valid JSON' : 'cut by maxTokens'}` : '')
+            + (!json && r.finishReason === 'length' ? ' · length-capped' : '');
           out.appendChild(meta);
           saveSession(); // persist the conversation + KV cache; a reload continues from here
         }
       } catch (e) {
+        out.classList.remove('md');
         out.textContent = `error: ${e.message}`;
         messages.length = base; // unwind the whole turn, including any tool round-trip messages
       }
