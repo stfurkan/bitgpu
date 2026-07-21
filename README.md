@@ -536,6 +536,10 @@ ln -s /path/to/bonsai-model examples/model-1.7b   # or copy the files in
 npm run build
 npm run verify:headless                      # serves the repo itself + drives system Chrome headlessly
 FAST=1 npm run verify:headless               # dev iteration: baseline model, core sections only (~3 min; NOT a release gate)
+npm run test:27b                             # LIVE Bonsai-27B gate: streams the real 3.8 GB weights (nothing persisted),
+                                             #   proves long-prompt segment parity + typed tool calling at real scale -
+                                             #   the classes the tiny synth hybrid cannot catch (silent scratch-VRAM OOM
+                                             #   only exists at ~31.5 MB/token). Run before releases touching the hybrid.
 ```
 
 Or serve the repo root (`python3 -m http.server 8000`) and open

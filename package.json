@@ -58,6 +58,7 @@
     "test:gguf": "tsx scripts/verify-gguf.ts",
     "test:kernels": "python3 tools/gen-kernel-cases.py && node scripts/verify-kernels.mjs",
     "test:hybrid": "python3 tools/gen-synth-qwen35.py && npm run build && node scripts/verify-hybrid.mjs",
+    "test:27b": "npm run build && node scripts/verify-27b-live.mjs",
     "profile": "node scripts/profile.mjs",
     "bench": "node scripts/benchmark.mjs"
   },

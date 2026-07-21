@@ -1657,10 +1657,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         return null
       }
       const seg = ids.slice(off, off + prefillSeg)
+      // Fail LOUDLY if this segment's transient scratch cannot really be allocated: a failed
+      // createBuffer does not throw - WebGPU returns an invalid buffer whose writes are discarded,
+      // and the model degenerates silently (the 0.15/0.18 27B corruption class). The scope wraps
+      // every transient allocation and the submission. Backends that over-commit without reporting
+      // (some Metal configurations) slip past this, which is why the segment size is ALSO
+      // memory-budgeted (PREFILL_SEG_HY) - this guard is the backstop for backends that do report.
+      device.pushErrorScope('out-of-memory')
       const enc = device.createCommandEncoder()
       fn = stack(enc, embedBatch(enc, seg), seg.length, posBase + off).fn
       lastRow = seg.length - 1
       device.queue.submit([enc.finish()])
+      const oom = await device.popErrorScope()
+      if (oom) throw new Error(`bitgpu: GPU out of memory during prefill (segment of ${seg.length} tokens at position ${posBase + off}) - the output would have been silently corrupted. Lower maxSeqLen, use kvCache: 'q8', or free GPU memory.`)
       if (off + prefillSeg < ids.length) {
         await device.queue.onSubmittedWorkDone()
         flushTransients() // this segment's scratch is dead; the peak stays at one segment
