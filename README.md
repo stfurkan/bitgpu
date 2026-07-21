@@ -53,7 +53,7 @@ weights stream straight from the Hugging Face Hub. This runs as-is:
 import { createEngine } from 'bitgpu'
 import { createChat } from 'bitgpu/chat'
 
-const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.17.0/models/bonsai-1.7b-gguf'
+const REPO = 'https://cdn.jsdelivr.net/gh/stfurkan/bitgpu@v0.18.0/models/bonsai-1.7b-gguf'
 const TOK = 'https://huggingface.co/onnx-community/Bonsai-1.7B-ONNX/resolve/main'
 const engine = await createEngine({
   manifestUrl: `${REPO}/manifest.json`,
@@ -104,6 +104,12 @@ await engine.generate(promptTokenIds, { temperature: 0.5, topK: 20, repetitionPe
 // topP (nucleus over the top-K), minP (>= minP * top prob - robust for low-precision models),
 // presencePenalty (flat subtraction on seen tokens - the Qwen3.5 family's anti-repetition knob).
 await engine.generate(promptTokenIds, { temperature: 0.5, topP: 0.85, topK: 20, minP: 0.05, presencePenalty: 1.5 })
+
+// DRY ("don't repeat yourself"): penalizes only tokens that would EXTEND a repeated sequence
+// (exponentially in the repeat length), so verbatim loops break while ordinary word reuse is
+// untouched. Off by default; sequence-breaker token ids exempt structural tokens (bitgpu/chat
+// fills them from the tokenizer automatically). Not combinable with promptLookup.
+await engine.generate(promptTokenIds, { temperature: 0.5, dryMultiplier: 0.8, dryAllowedLength: 2 })
 
 // Penalties apply under greedy decoding too (penalized argmax, deterministic, no RNG),
 // exactly like transformers.js greedy search:
@@ -229,6 +235,11 @@ reuse with exact token bookkeeping (a clean follow-up turn prefills only the del
 `chat.prewarm(messages)` warms a static system prompt at load). `chat.reset()` forgets the
 conversation.
 
+`thinkBudget: N` caps the reasoning phase: after N generated think tokens only `</think>` may be
+emitted, so the model wraps up and answers - "budget forcing", the practical way to run thinking
+mode on-device where every token is slow. `thinkBudget: 0` keeps the thinking template but
+suppresses reasoning entirely.
+
 ### Guaranteed-valid JSON (`format: 'json'`)
 
 ```ts
@@ -298,7 +309,11 @@ declared tools and the arguments are forced through that tool's `parameters` sch
 token-by-token. Both Qwen wire formats are supported and auto-detected from the chat template:
 the Qwen3 JSON shape (`<tool_call>{"name": …, "arguments": …}</tool_call>` - the dense Bonsai
 models) and the Qwen3.5 XML shape (`<tool_call><function=…><parameter=…>` - the hybrid
-Bonsai-27B), so the same `tools` array works across all of them.
+Bonsai-27B), so the same `tools` array works across all of them. In the XML format each
+parameter's VALUE is constrained by its own schema: a `number`/`integer`/`boolean`/`array`/
+`object` parameter is forced to be exactly that (JSON grammar, including integer bounds and
+array item schemas), a string `enum` is forced onto one of its literals, and plain strings stay
+free text - the model cannot hand your tool `abc` where a number belongs.
 
 ```ts
 const tools = [{

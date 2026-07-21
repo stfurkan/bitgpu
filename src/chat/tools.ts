@@ -191,10 +191,12 @@ export class ToolBodyMachine {
 //   ws* <function=NAME> ( <parameter=KEY> RAWVALUE </parameter> )* </function> ws*
 // The scaffolding tags, the function NAME (prefix-constrained to the declared tools) and each KEY
 // (constrained to that tool's declared properties, no duplicates) are FORCED byte-by-byte, so the
-// model is held on the rails of a real call; the value bytes are free (raw text for string params,
-// JSON text for the rest) and are schema-validated at parse time (parseToolCallXml drops anything
-// that does not conform), so a surfaced call is still never malformed. Same feed/clone/complete/
-// name surface as ToolBodyMachine, so the candidate filter treats both formats identically.
+// model is held on the rails of a real call. VALUES are constrained by the parameter's schema
+// (0.18): non-string params run a JsonMachine over the value text (numbers, booleans, integer
+// bounds, arrays/objects - exactly what parseToolCallXml will JSON.parse), string enums are
+// prefix-forced over the literals, and plain strings stay free raw text. parseToolCallXml still
+// validates at parse time, so a surfaced call is never malformed even without enforcement. Same
+// feed/clone/complete/name surface as ToolBodyMachine, so the filter treats both formats alike.
 
 const X_FUNC = utf8.encode('<function=')
 const X_PARAM = utf8.encode('<parameter=')
@@ -221,7 +223,16 @@ export interface ToolBody {
   forcedNext?(): number
 }
 
-const enum X { PRE, FUNC, NAME, ELEM, KEY, VAL, POST }
+const enum X { PRE, FUNC, NAME, ELEM, KEY, VAL, VCLOSE, POST }
+type ValMode = 'raw' | 'enum' | 'json'
+
+/** Per-tool spec the XML machine constrains against (all string keys/literals in BYTE space). */
+export interface XmlToolProps {
+  keys: readonly string[]
+  required: readonly string[]
+  /** byte-space property key -> that parameter's schema (used to pick the value grammar). */
+  schemas?: ReadonlyMap<string, JsonSchema>
+}
 
 export class ToolBodyMachineXml implements ToolBody {
   private phase: X = X.PRE
@@ -234,17 +245,23 @@ export class ToolBodyMachineXml implements ToolBody {
   private reqLeft: string[] = []
   private valTail: number[] = []
   private valStarted = false
+  private valMode: ValMode = 'raw'
+  private valBuf = '' //           enum mode: the literal so far (byte space)
+  private valEnum: string[] = [] //  enum mode: byte-space literals
+  private valJson: JsonMachine | null = null // json mode
+  private closeLit = 0 //          VCLOSE: position inside </parameter>
   complete = false
   name = ''
 
-  /** byte-space tool names, and per name its byte-space property keys + required subset */
-  constructor(private readonly cands: readonly string[], private readonly props: ReadonlyMap<string, { keys: readonly string[]; required: readonly string[] }>) {}
+  /** byte-space tool names, and per name its property keys / required subset / param schemas */
+  constructor(private readonly cands: readonly string[], private readonly props: ReadonlyMap<string, XmlToolProps>) {}
 
   clone(): ToolBodyMachineXml {
     const m = new ToolBodyMachineXml(this.cands, this.props)
     m.phase = this.phase; m.lit = this.lit; m.nameBuf = this.nameBuf; m.wsRun = this.wsRun
     m.elem = [...this.elem]; m.keyBuf = this.keyBuf; m.keyCands = [...this.keyCands]; m.reqLeft = [...this.reqLeft]; m.valTail = [...this.valTail]
     m.valStarted = this.valStarted; m.complete = this.complete; m.name = this.name
+    m.valMode = this.valMode; m.valBuf = this.valBuf; m.valEnum = [...this.valEnum]; m.valJson = this.valJson ? this.valJson.clone() : null; m.closeLit = this.closeLit
     return m
   }
 
@@ -262,7 +279,11 @@ export class ToolBodyMachineXml implements ToolBody {
       case X.ELEM: // the canonical scaffold '\n' after '>' / '</parameter>'
         return this.elem.length === 0 && this.wsRun === 0 ? 0x0a : -1
       case X.VAL: // the canonical scaffold '\n' after '<parameter=KEY>'
-        return this.wsRun === 0 ? 0x0a : -1
+        if (this.wsRun === 0) return 0x0a
+        // enum value fully matched and no other literal extends it: the post-literal '\n' is
+        // deterministic scaffold (the closer follows), so pin it like the others
+        if (this.valMode === 'enum' && this.valEnum.includes(this.valBuf) && !this.valEnum.some((c) => c !== this.valBuf && c.startsWith(this.valBuf))) return 0x0a
+        return -1
       default:
         return -1
     }
@@ -317,14 +338,26 @@ export class ToolBodyMachineXml implements ToolBody {
           this.keyCands = this.keyCands.filter((k) => k !== this.keyBuf)
           this.reqLeft = this.reqLeft.filter((k) => k !== this.keyBuf)
           this.phase = X.VAL; this.valTail = []; this.wsRun = 0; this.valStarted = false // canonical leading '\n' still owed
+          // the parameter's schema picks the value grammar, mirroring parseToolCallXml's coercion:
+          // non-string type -> the value text is JSON (JsonMachine over the param schema);
+          // string enum -> the raw literal set; anything else -> free raw text
+          const sch = this.props.get(this.name)?.schemas?.get(this.keyBuf)
+          const t = sch?.type
+          if (sch && t !== undefined && t !== 'string') {
+            this.valMode = 'json'; this.valJson = new JsonMachine(sch)
+          } else if (sch?.enum?.length) {
+            this.valMode = 'enum'; this.valBuf = ''; this.valEnum = sch.enum.map(ToolBodyMachine.bytesOf)
+          } else {
+            this.valMode = 'raw'
+          }
           return true
         }
         this.keyBuf += String.fromCharCode(b)
         if (!this.keyCands.length) return true // tool declares no properties: any key name
         for (const c of this.keyCands) if (c.startsWith(this.keyBuf)) return true
         return false
-      case X.VAL: // the canonical leading '\n' (forced, same reason as ELEM), then raw value bytes
-        if (this.wsRun === 0) { //   until the '</parameter>' terminator
+      case X.VAL: { // the canonical leading '\n' (forced, same reason as ELEM), then the value
+        if (this.wsRun === 0) {
           if (b !== 0x0a) return false
           this.wsRun = 1
           return true // the scaffolding newline is not part of the value (parse strips it anyway)
@@ -336,9 +369,34 @@ export class ToolBodyMachineXml implements ToolBody {
           if (b === 0x0a) return false
           this.valStarted = true
         }
+        if (this.valMode === 'json') {
+          // JSON value per the param schema. Once the machine says the root is complete, its DONE
+          // state keeps accepting trailing whitespace (the canonical '\n' before the closer lands
+          // there); the first byte it REJECTS after completion must start '</parameter>'.
+          const j = this.valJson as JsonMachine
+          if (j.feed(Uint8Array.of(b))) return true
+          if (!j.complete || b !== X_PCLOSE[0]) return false
+          this.phase = X.VCLOSE; this.closeLit = 1
+          return true
+        }
+        if (this.valMode === 'enum') {
+          // raw literal from the enum set: every byte must keep the buffer a prefix of a literal;
+          // once a full literal is matched, the canonical '\n' hands over to the closer. (If one
+          // literal is a prefix of another, extension wins - a byte machine cannot fork - so avoid
+          // enum sets where a literal + '\n' is a prefix of a sibling literal.)
+          const next = this.valBuf + String.fromCharCode(b)
+          if (this.valEnum.some((c) => c.startsWith(next))) { this.valBuf = next; return true }
+          if (b === 0x0a && this.valEnum.includes(this.valBuf)) { this.phase = X.VCLOSE; this.closeLit = 0; return true }
+          return false
+        }
         this.valTail.push(b)
         if (this.valTail.length > X_PCLOSE.length) this.valTail.shift()
         if (litEq(this.valTail, X_PCLOSE)) { this.phase = X.ELEM; this.elem = []; this.wsRun = 0 }
+        return true
+      }
+      case X.VCLOSE: // the '</parameter>' literal after a grammar-terminated (json/enum) value
+        if (b !== X_PCLOSE[this.closeLit]) return false
+        if (++this.closeLit === X_PCLOSE.length) { this.phase = X.ELEM; this.elem = []; this.wsRun = 0 }
         return true
       case X.POST:
         return WS.has(b) && ++this.wsRun <= WS_CAP
@@ -383,7 +441,8 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
   const props = new Map(
     prep.tools.map((t) => {
       const p = t.function.parameters
-      return [ToolBodyMachine.bytesOf(t.function.name), { keys: Object.keys(p?.properties ?? {}).map(ToolBodyMachine.bytesOf), required: (p?.required ?? []).map(ToolBodyMachine.bytesOf) }] as const
+      const schemas = new Map(Object.entries(p?.properties ?? {}).map(([k, v]) => [ToolBodyMachine.bytesOf(k), v as JsonSchema] as const))
+      return [ToolBodyMachine.bytesOf(t.function.name), { keys: [...schemas.keys()], required: (p?.required ?? []).map(ToolBodyMachine.bytesOf), schemas }] as const
     }),
   )
   const newBody = (): ToolBody => (prep.format === 'xml' ? new ToolBodyMachineXml(cands, props) : new ToolBodyMachine(cands, schemas))

@@ -105,3 +105,42 @@ export class StopScanner {
     return r
   }
 }
+
+/** Budget-forcing for the think channel (s1-style "budget forcing", training-free): counts the
+ *  tokens generated inside a <think> block; once `budget` is spent, `force()` names `</think>` as
+ *  the only permitted candidate (the engine's constrained pick guarantees it is reachable even
+ *  when outside the top-K), so the model closes its reasoning and continues straight into the
+ *  visible answer. `budget: 0` suppresses reasoning entirely while keeping the thinking-mode
+ *  template. advance() must see every emitted token. */
+export class ThinkBudget {
+  private inThink: boolean
+  private spent = 0
+  private closed = false
+  constructor(
+    private readonly openId: number | undefined,
+    private readonly closeId: number | undefined,
+    private readonly budget: number,
+    startInside: boolean,
+  ) {
+    this.inThink = startInside
+  }
+
+  advance(id: number): void {
+    if (this.closed) return
+    if (!this.inThink) {
+      if (this.openId != null && id === this.openId) this.inThink = true
+      return
+    }
+    if (this.closeId != null && id === this.closeId) {
+      this.inThink = false
+      this.closed = true
+      return
+    }
+    this.spent++
+  }
+
+  /** The forced token id once the budget is exhausted (only `</think>` may be emitted), else null. */
+  force(): number | null {
+    return this.inThink && !this.closed && this.spent >= this.budget && this.closeId != null ? this.closeId : null
+  }
+}

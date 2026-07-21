@@ -94,6 +94,48 @@ export function ngramBans(history: number[], n: number): number[] {
   return generated.get(JSON.stringify(idx)) ?? []
 }
 
+/** Options for the DRY ("don't repeat yourself") repetition penalty. */
+export interface DryOpts {
+  multiplier: number //   penalty strength; 0 disables
+  base: number //         exponential growth per repeated token beyond allowedLength
+  allowedLength: number // repeats up to this length are free
+  range: number //        only the last `range` history tokens are searched (0 = all)
+  breakers: Set<number> // token ids that reset matching (sequence walls); never penalized themselves
+}
+
+/** DRY repetition penalty (Kingbri/llama.cpp lineage), applied over the top-K candidates on the
+ *  CPU. For each candidate c: find the longest L such that the last L history tokens followed by c
+ *  reproduce an earlier stretch of the history (i.e. picking c would EXTEND an L-token repeat).
+ *  If L >= allowedLength the candidate's logit drops by multiplier * base^(L - allowedLength).
+ *  Matching never crosses a breaker token on either side, and breaker candidates are never
+ *  penalized (structural tokens - newlines, quotes - legitimately repeat). Operating on the
+ *  candidates (not the full vocab) mirrors how topP/minP are scoped in this engine. Returns the
+ *  adjusted pairs re-sorted descending (stable), leaving the inputs untouched. */
+export function applyDry(candIds: Uint32Array | number[], candVals: Float32Array | number[], history: number[], o: DryOpts): { ids: number[]; vals: number[] } {
+  const n = history.length
+  const lo = o.range > 0 ? Math.max(0, n - o.range) : 0
+  const MAXL = o.allowedLength + 32 // bound the exponent; base^32 already dwarfs any logit
+  const vals = Array.from(candVals) as number[]
+  const ids = Array.from(candIds) as number[]
+  if (n > lo && o.multiplier > 0) {
+    for (let ci = 0; ci < ids.length; ci++) {
+      const c = ids[ci]
+      if (o.breakers.has(c)) continue
+      let maxL = 0
+      for (let i = lo; i < n; i++) {
+        if (history[i] !== c) continue
+        let l = 0 // hist[i-1-j] must equal hist[n-1-j], no breakers on either side
+        while (l < MAXL && i - 1 - l >= lo && !o.breakers.has(history[i - 1 - l]) && !o.breakers.has(history[n - 1 - l]) && history[i - 1 - l] === history[n - 1 - l]) l++
+        if (l > maxL) maxL = l
+        if (maxL >= MAXL) break
+      }
+      if (maxL >= o.allowedLength) vals[ci] -= o.multiplier * Math.pow(o.base, maxL - o.allowedLength)
+    }
+  }
+  const order = Array.from(ids.keys()).sort((a, b) => vals[b] - vals[a] || a - b)
+  return { ids: order.map((i) => ids[i]), vals: order.map((i) => vals[i]) }
+}
+
 /** Stable softmax (max-subtract), matching transformers.js utils/maths.js softmax. */
 function softmax(arr: Float32Array | number[]): number[] {
   let maxVal = arr[0]

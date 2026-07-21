@@ -228,6 +228,25 @@ export interface GenerateOptions {
    *  additive anti-repetition knob the Qwen3.5 family recommends, applied after `repetitionPenalty`).
    *  Default `0` (off). Applied on the full vocab before top-k, under greedy decoding too. */
   presencePenalty?: number
+  /** DRY ("don't repeat yourself") repetition penalty strength. Default `0` (off). When a candidate
+   *  token would EXTEND a repeat - the last L history tokens followed by it reproduce an earlier
+   *  stretch - and L >= `dryAllowedLength`, its logit drops by
+   *  `dryMultiplier * dryBase^(L - dryAllowedLength)`. Targets loops that per-token penalties miss
+   *  while leaving legitimately repeated single tokens alone. Applied on the CPU over the top-K
+   *  candidates (like `topP`/`minP`), under greedy decoding too; reported logprobs are pre-DRY.
+   *  Not supported together with `promptLookup` (with `'auto'`, lookup simply stays off). */
+  dryMultiplier?: number
+  /** DRY exponential base (default `1.75`). */
+  dryBase?: number
+  /** Repeat length that DRY tolerates before penalizing (default `2`). */
+  dryAllowedLength?: number
+  /** DRY only searches the last `dryRange` history tokens (default `0` = the whole history). */
+  dryRange?: number
+  /** Token ids that act as DRY sequence breakers: matching never crosses them and they are never
+   *  penalized themselves (structural tokens - newlines, quotes, list markers - legitimately
+   *  repeat). Default none. `bitgpu/chat` fills this with the tokenizer's newline/punctuation
+   *  tokens when DRY is enabled. */
+  dryBreakers?: number[]
   /** Block any n-gram of this size from repeating. Default `0` (off). Applied under greedy decoding
    *  too, matching transformers.js. */
   noRepeatNgramSize?: number

@@ -14,7 +14,7 @@ import {
   RepetitionPenaltyLogitsProcessor,
   NoRepeatNGramLogitsProcessor,
 } from '@huggingface/transformers'
-import { MT19937, affectedIds, ngramBans, sampleFromCandidates } from '../src/sampler'
+import { MT19937, affectedIds, applyDry, ngramBans, sampleFromCandidates } from '../src/sampler'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const T = 0.5
@@ -165,6 +165,45 @@ console.log('\n(E) top-p / min-p warpers')
   let inMin = 0
   for (const seed of many) if (kept.has(sampleFromCandidates(candIds, candVals, T, new MT19937(seed), 1, MP))) inMin++
   check('minP=0.3 never draws below the threshold', inMin === many.length, `${inMin}/${many.length} (kept ${mMin})`)
+}
+
+// (F) DRY penalty: pure-function checks on applyDry
+{
+  const o = (over: Partial<Parameters<typeof applyDry>[3]> = {}) => ({ multiplier: 2, base: 1.75, allowedLength: 2, range: 0, breakers: new Set<number>(), ...over })
+
+  // no repeat context: untouched, order preserved
+  let r = applyDry([5, 6, 7], [3, 2, 1], [1, 2, 3, 4], o())
+  check('DRY no-repeat leaves logits untouched', JSON.stringify(r) === JSON.stringify({ ids: [5, 6, 7], vals: [3, 2, 1] }))
+
+  // history [.. 11 12 20 .. 11 12], candidate 20 extends the 2-repeat "11 12": penalty = 2*1.75^0
+  r = applyDry([20, 99], [5, 4.9], [10, 11, 12, 20, 30, 40, 11, 12], o())
+  check('DRY penalizes the repeat-extending candidate', Math.abs((r.vals[r.ids.indexOf(20)] ?? 0) - 3) < 1e-9, `got ${r.vals[r.ids.indexOf(20)]}`)
+  check('DRY leaves the non-extending candidate alone', r.vals[r.ids.indexOf(99)] === 4.9)
+  check('DRY re-sorts descending after the penalty', r.ids[0] === 99)
+
+  // repeats below allowedLength are free
+  r = applyDry([20], [5], [10, 11, 12, 20, 30, 40, 99, 12], o()) // only L=1 (".. 12" matches)
+  check('DRY tolerates repeats below allowedLength', r.vals[0] === 5)
+
+  // longer repeat -> exponential: L=3 -> 2*1.75^1
+  r = applyDry([30], [5], [9, 11, 12, 13, 30, 40, 11, 12, 13], o()) // "11 12 13"+30 reproduces "11 12 13 30"
+  check('DRY penalty grows with repeat length', Math.abs(r.vals[0] - (5 - 2 * 1.75)) < 1e-9, `got ${r.vals[0]}`)
+
+  // a breaker inside the match window cuts the repeat below allowedLength
+  r = applyDry([20], [5], [10, 11, 12, 20, 30, 40, 11, 12], o({ breakers: new Set([11]) }))
+  check('DRY breaker resets matching', r.vals[0] === 5)
+
+  // a breaker candidate is never penalized even if it extends a repeat
+  r = applyDry([20], [5], [10, 11, 12, 20, 30, 40, 11, 12], o({ breakers: new Set([20]) }))
+  check('DRY never penalizes a breaker candidate', r.vals[0] === 5)
+
+  // range excludes the earlier occurrence -> no penalty
+  r = applyDry([20], [5], [10, 11, 12, 20, 30, 40, 11, 12], o({ range: 3 }))
+  check('DRY range limits the searched history', r.vals[0] === 5)
+
+  // multiplier 0 (the off state the engine gates on): identity
+  r = applyDry([30, 99], [5, 4.9], [10, 11, 12, 20, 30, 40, 11, 12], o({ multiplier: 0 }))
+  check('DRY multiplier=0 is the identity', JSON.stringify(r) === JSON.stringify({ ids: [30, 99], vals: [5, 4.9] }))
 }
 
 console.log(`\n${failures === 0 ? 'ALL SAMPLER CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`)

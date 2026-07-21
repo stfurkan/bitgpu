@@ -11,13 +11,13 @@
 // `bitgpu` stays a zero-dependency package, and importing plain `bitgpu` never loads chat code.
 import type { Engine, GenerateOptions, GenerateResult, KvSnapshot, TokenLogprobs } from '../types'
 import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
-import { ThinkSplitter, StopScanner } from './think'
+import { ThinkSplitter, StopScanner, ThinkBudget } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
 import { makeToolFilter, parseToolCall, parseToolCallXml, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
 
 export { ChatTokenizer } from './tokenizer'
 export type { ChatMessage, DecoderStream } from './tokenizer'
-export { ThinkSplitter, StopScanner } from './think'
+export { ThinkSplitter, StopScanner, ThinkBudget } from './think'
 export { JsonMachine, validateJsonSchema } from './json'
 export type { JsonSchema } from './json'
 export { ToolBodyMachine, ToolBodyMachineXml, ToolCallSplitter, makeToolFilter, parseToolCall, parseToolCallXml, validateTools } from './tools'
@@ -49,6 +49,14 @@ export interface ChatSendOptions {
   minP?: number
   repetitionPenalty?: number
   presencePenalty?: number
+  /** DRY anti-loop penalty strength (see GenerateOptions.dryMultiplier). When set, the chat layer
+   *  supplies sequence-breaker token ids from the tokenizer (newline/punctuation/list markers) so
+   *  structural repetition is never penalized; pass `dryBreakers` to override. */
+  dryMultiplier?: number
+  dryBase?: number
+  dryAllowedLength?: number
+  dryRange?: number
+  dryBreakers?: number[]
   noRepeatNgramSize?: number
   seed?: number
   promptLookup?: GenerateOptions['promptLookup']
@@ -73,6 +81,11 @@ export interface ChatSendOptions {
    *  turn drops the KV cache afterwards (the stripped reply cannot reproduce the cached tokens).
    *  Default false. */
   think?: boolean
+  /** Cap on reasoning length (thinking mode only): after this many generated think tokens the
+   *  engine may only emit `</think>`, so the model wraps up and answers - "budget forcing" for
+   *  slow on-device decode. `0` suppresses reasoning entirely (thinking template, no think
+   *  tokens). Unset = unlimited. Ignored when `think` is off. */
+  thinkBudget?: number
   /** Streamed visible reply text (clean deltas: UTF-8-safe, think blocks removed). */
   onText?: (delta: string) => void
   /** Streamed think content (only meaningful with `think: true`). */
@@ -360,6 +373,16 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
   }
 
   let byteTable: TokenByteTable | null = null // per-token byte lookup, built once, shared by json turns
+  // DRY sequence breakers: the ids the tokenizer produces for common structural strings (newlines,
+  // punctuation, list markers) - matching across them would penalize legitimate structure (lists,
+  // code, JSON). Built once on first DRY-enabled turn.
+  let dryBreakerIds: number[] | null = null
+  const defaultDryBreakers = (): number[] => {
+    if (dryBreakerIds) return dryBreakerIds
+    const ids = new Set<number>()
+    for (const t of ['\n', '\n\n', ':', ';', ',', '"', "'", '*', '-', '|', '#', '.', '.\n']) for (const id of tk.encode(t)) ids.add(id)
+    return (dryBreakerIds = [...ids])
+  }
 
   async function sendImpl(messages: ChatMessage[], o: ChatSendOptions = {}): Promise<ChatResult> {
     if (messages.length === 0) throw new Error('bitgpu/chat: no messages')
@@ -472,6 +495,10 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // Tool turns: free text until <tool_call> opens, then the body grammar (declared names +
     // per-tool schema) until </tool_call>; a forced choice pins the whole reply to one call.
     const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep, think && thinkPreopened) : null
+    // thinkBudget: once the budget is spent inside <think>, the ONLY permitted candidate is
+    // </think> (the engine's constrained pick walks the full vocab when it is outside the top-K),
+    // then generation continues unconstrained into the visible reply.
+    const tb = think && o.thinkBudget != null && tk.tokenToId('</think>') != null ? new ThinkBudget(tk.tokenToId('<think>'), tk.tokenToId('</think>'), Math.max(0, o.thinkBudget), thinkPreopened) : null
     let result: GenerateResult
     try {
       result = await engine.generate(inputTokenIds, {
@@ -482,6 +509,11 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         minP: o.minP,
         repetitionPenalty: o.repetitionPenalty,
         presencePenalty: o.presencePenalty,
+        dryMultiplier: o.dryMultiplier,
+        dryBase: o.dryBase,
+        dryAllowedLength: o.dryAllowedLength,
+        dryRange: o.dryRange,
+        dryBreakers: (o.dryMultiplier ?? 0) > 0 ? (o.dryBreakers ?? defaultDryBreakers()) : undefined,
         noRepeatNgramSize: o.noRepeatNgramSize,
         seed: o.seed,
         logprobs: o.logprobs,
@@ -489,8 +521,16 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         stopTokens: [tk.eosTokenId, ...(o.stopTokens ?? [])],
         reuseCache: canReuse,
         signal,
-        candidateFilter: jf ? (ids) => jf.filter(ids) : tf ? (ids) => tf.filter(ids) : undefined,
+        candidateFilter:
+          jf || tf || tb
+            ? (ids) => {
+                const forced = tb?.force()
+                if (forced != null) return [forced]
+                return jf ? jf.filter(ids) : tf ? tf.filter(ids) : Array.from(ids)
+              }
+            : undefined,
         onToken: (id) => {
+          tb?.advance(id)
           jf?.advance(id)
           tf?.advance(id)
           emit(splitter.push(decoder.push(id)))

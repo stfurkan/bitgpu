@@ -11,7 +11,7 @@
 import { SHADERS } from './shaders.generated'
 import { GpuOutOfMemoryError, WebGPUUnavailableError } from './errors'
 import { draftNgram, pldWorthIt, PLD_PROBATION } from './pld'
-import { MT19937, affectedIds, ngramBans, sampleFromCandidates } from './sampler'
+import { MT19937, affectedIds, applyDry, ngramBans, sampleFromCandidates } from './sampler'
 import type {
   DeviceLostInfo,
   Engine,
@@ -84,14 +84,14 @@ const VIEW: Record<string, TypedArrayCtor> = { FLOAT: Float32Array, UINT8: Uint8
 const WGSLS = ['matmul_split', 'matmul_resid', 'matmul_q2', 'rope', 'swiglu', 'copy']
 const DEFAULT_MAX_SEQ = 2048
 const PREFILL_SEG = 256 // prefill segment length; see runPrefill for why prefills are segmented
-// The hybrid DeltaNet scan accumulates its per-head state in registers across a prefill chunk;
-// over a long chunk x 64 layers the running state loses enough precision to corrupt the output
-// (coherent for short prompts, degenerate past ~50 tokens on the real 27B). Flushing the
-// recurrence to the f32 state buffer every <=16 tokens keeps it stable (decode, which round-trips
-// the state every token, is unaffected). 0.17 enforced this by shrinking the whole hybrid prefill
-// segment to 16 - which re-swept ALL weights 16x per 256 tokens (ruinous for the 4GB 27B).
-// Now only the tiny recurrence dispatch is sub-chunked (hybridLayer), same flush cadence, and the
-// hybrid keeps the full 256-token segment for every weight-reading GEMM.
+// The hybrid recurrence scan is sub-chunked so its running state flushes through the f32 state
+// buffers every <=RECUR_FLUSH tokens regardless of the prefill segment size. History: 0.17
+// attributed the 27B's ">50-token gibberish" to scan precision and shrank the WHOLE hybrid
+// segment to 16 tokens; the real-27B segment sweep (2026-07-21) showed the actual culprit was
+// transient-scratch VRAM (see HYBRID_SCRATCH_BUDGET) - but the flush cadence is kept: it is
+// proven equivalent (verify-hybrid gates sub-chunked == 16-token cadence, logits cos 1.000000)
+// and it removes any long-segment scan-precision concern on devices where the memory budget
+// allows large segments.
 const RECUR_FLUSH = 16
 
 const PARAM_AB = new ArrayBuffer(64)
@@ -993,6 +993,24 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     KEYDIM = NK * DKV,
     VALDIM = NV * DKV,
     CONVDIM = KEYDIM * 2 + VALDIM // conv operates on the q|k|v stream
+  // Hybrid prefill segment: MEMORY-bounded, not fixed. One segment encodes ALL layers' transient
+  // scratch into a single submission, so live scratch = seg x (every hybridLayer actBuf per token,
+  // summed over the 64 layers) - for the 27B that is ~38 MB/token, and exceeding what the device
+  // can really allocate does NOT error: WebGPU hands back invalid buffers, writes are discarded,
+  // and the model degenerates SILENTLY (this - not scan precision - was the real cause of the 0.15
+  // ">50-token gibberish" bug; the 0.17 16-token segment "fix" worked by shrinking scratch).
+  // Budget calibrated on the real Bonsai-27B on an 8GB M1 (segment sweep 2026-07-21): 32-seg
+  // (~1.2 GB scratch) is correct and token-identical to 16-seg; 64-seg (~2.4 GB) corrupts.
+  const HYBRID_SCRATCH_BUDGET = 1.25 * (1 << 30)
+  const hybridScratchPerTok = A.hybrid
+    ? A.hybrid.layer_types.reduce((sum, t) => {
+        const shared = 3 * Hd + 3 * F // n1/n2 norms, gate/up/swiglu MLP, resid out
+        const linear = 2 * CONVDIM + 2 * KEYDIM + 4 * VALDIM + 4 * NV + Hd // mixed/convd, q/k, v/core/z/normed, a/b/gbeta, h2
+        const full = 8 * H * Dh + 4 * KV * Dh + Hd // qg+query/gate/qn/qr+att/gated, kk/kn/kr/vv, h2
+        return sum + (shared + (t === 'linear' ? linear : full)) * 4
+      }, 0)
+    : 0
+  const PREFILL_SEG_HY = A.hybrid ? Math.max(RECUR_FLUSH, Math.min(PREFILL_SEG, Math.floor(HYBRID_SCRATCH_BUDGET / hybridScratchPerTok / RECUR_FLUSH) * RECUR_FLUSH)) : PREFILL_SEG
   // The KV cache GROWS on demand (doubling, up to maxSeqLen) instead of pinning the full maxSeqLen
   // up front: a short conversation keeps a small cache (~KV_INITIAL positions), so idle VRAM stays
   // low on memory-constrained devices (a full 2048-position f32 cache is ~448 MB at 28 layers,
@@ -1592,7 +1610,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       finalnorm = new Float32Array(S * Hd),
       logits = new Float32Array(S * vocab)
     transients = []
-    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG // __SEG: test hook - verify-hybrid proves seg-256 sub-chunked == seg-16 (the known-good 0.17 cadence)
+    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
     try {
       for (let off = 0; off < S; off += prefillSeg) {
         const seg = ids.slice(off, off + prefillSeg)
@@ -1631,7 +1649,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
-    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG // __SEG: test hook - verify-hybrid proves seg-256 sub-chunked == seg-16 (the known-good 0.17 cadence)
+    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
     for (let off = 0; off < ids.length; off += prefillSeg) {
       if (off > 0 && signal?.aborted) {
         fullHistory = []
@@ -1791,6 +1809,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const topP = genOpts.topP ?? 1
     const minP = genOpts.minP ?? 0
     const ngramN = genOpts.noRepeatNgramSize ?? 0
+    // DRY (applyDry): CPU-side over the candidates, needs the live history - so it lives here in
+    // the sampler chain, applied to both the sampled draw and the penalized-argmax greedy pick.
+    const dryO = (genOpts.dryMultiplier ?? 0) > 0 ? { multiplier: genOpts.dryMultiplier!, base: genOpts.dryBase ?? 1.75, allowedLength: genOpts.dryAllowedLength ?? 2, range: genOpts.dryRange ?? 0, breakers: new Set(genOpts.dryBreakers ?? []) } : null
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
     const signal = genOpts.signal
@@ -1859,8 +1880,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const pick = (ciAll: Uint32Array, cvAll: Float32Array): number => {
       const ci = ciAll.subarray(0, K)
       const cv = cvAll.subarray(0, K)
-      const tk = sampled ? sampleFromCandidates(ci, cv, temperature, rng, topP, minP) : ci[0]
-      chosenLogit = cv[ci.indexOf(tk)]
+      let ids: ArrayLike<number> = ci, vals: ArrayLike<number> = cv
+      if (dryO) { const a = applyDry(ci, cv, history, dryO); ids = a.ids; vals = a.vals }
+      const tk = sampled ? sampleFromCandidates(ids as number[], vals as number[], temperature, rng, topP, minP) : (ids as number[])[0]
+      chosenLogit = cv[ci.indexOf(tk)] // pre-DRY logit: reported logprobs stay consistent with the GPU lse
       return tk
     }
     const filter = genOpts.candidateFilter
@@ -1883,8 +1906,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             pIds.push(ci[i])
             pVals.push(cv[i])
           }
-        const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng, topP, minP) : pIds[0]
-        chosenLogit = pVals[pIds.indexOf(tk)]
+        let ids = pIds, vals = pVals
+        if (dryO) { const a = applyDry(pIds, pVals, history, dryO); ids = a.ids; vals = a.vals }
+        const tk = sampled ? sampleFromCandidates(ids, vals, temperature, rng, topP, minP) : ids[0]
+        chosenLogit = pVals[pIds.indexOf(tk)] // pre-DRY
         return tk
       }
       const all = await readback(lg, vocab) // penalized logits; every argmax round masked its winner in place
@@ -1909,8 +1934,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         }
       }
       if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
-      const tk = sampled ? sampleFromCandidates(pIds, pVals, temperature, rng, topP, minP) : pIds[0]
-      chosenLogit = pVals[pIds.indexOf(tk)]
+      let ids = pIds, vals = pVals
+      if (dryO) { const a = applyDry(pIds, pVals, history, dryO); ids = a.ids; vals = a.vals }
+      const tk = sampled ? sampleFromCandidates(ids, vals, temperature, rng, topP, minP) : ids[0]
+      chosenLogit = pVals[pIds.indexOf(tk)] // pre-DRY
       return tk
     }
 
@@ -2354,7 +2381,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // transformers.js applies repetition_penalty / no_repeat_ngram under greedy search too, so a
     // greedy turn that requests them routes through the sampler-chain path (which picks the
     // penalized argmax instead of drawing); the plain GPU-resident greedy loop can't see history.
-    const hasProcessors = (genOpts.repetitionPenalty ?? 1) !== 1 || (genOpts.noRepeatNgramSize ?? 0) > 0
+    const hasProcessors = (genOpts.repetitionPenalty ?? 1) !== 1 || (genOpts.noRepeatNgramSize ?? 0) > 0 || (genOpts.presencePenalty ?? 0) !== 0 || (genOpts.dryMultiplier ?? 0) > 0
+    // (presencePenalty was missing from this list until 0.18: a GREEDY call with only presence set
+    // silently ignored it - the plain GPU greedy loop never runs the penalty chain.)
+    if ((genOpts.dryMultiplier ?? 0) > 0 && genOpts.promptLookup && genOpts.promptLookup !== 'auto')
+      throw new Error('bitgpu: dryMultiplier is not supported with promptLookup (DRY needs per-position history; auto simply disables lookup)')
     const reuse = (genOpts.reuseCache ?? false) && fullHistory.length > 0
     if (genOpts.signal?.aborted) {
       // aborted before any work: don't touch fullHistory (the cache still matches it)
@@ -2407,7 +2438,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // the same per-step candidate readback, so they route identically.
     const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
     let r: RawGenResult
-    if (!hasFilter && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+    if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
       // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
       // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
       // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
@@ -2454,7 +2485,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           },
         }
       }
-    } else if (!hasFilter && genOpts.promptLookup) {
+    } else if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && genOpts.promptLookup) {
       r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
     } else if (sampled || hasProcessors || hasFilter) {
       r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory

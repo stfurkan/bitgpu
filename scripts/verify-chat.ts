@@ -14,8 +14,8 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createChat, ChatTokenizer, ThinkSplitter, ToolBodyMachine, ToolBodyMachineXml, ToolCallSplitter, parseToolCall, parseToolCallXml, validateTools, type ChatMessage, type ChatTool } from '../src/chat/index'
-import { JsonMachine, TokenByteTable, validateJsonSchema } from '../src/chat/json'
+import { createChat, ChatTokenizer, ThinkSplitter, ThinkBudget, ToolBodyMachine, ToolBodyMachineXml, ToolCallSplitter, parseToolCall, parseToolCallXml, validateTools, type ChatMessage, type ChatTool } from '../src/chat/index'
+import { JsonMachine, TokenByteTable, validateJsonSchema, type JsonSchema } from '../src/chat/json'
 import type { Engine, GenerateOptions, GenerateResult } from '../src/types'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -790,6 +790,41 @@ console.log('(D) JSON constrained decoding')
     check('xml body: unterminated call does not complete', !feedX('<function=get>\n<parameter=q>\nx\n</parameter>\n').complete)
     check('xml body: cannot close while a required parameter is missing', !feedX('<function=get>\n</').ok)
 
+    // -- typed VALUES (0.18): the parameter's schema constrains the value bytes --
+    const bo = ToolBodyMachine.bytesOf
+    const mkProps = (entries: Array<[string, JsonSchema]>, required: string[] = []): Map<string, { keys: string[]; required: string[]; schemas: Map<string, JsonSchema> }> =>
+      new Map([[bo('f'), { keys: entries.map(([k]) => bo(k)), required: required.map(bo), schemas: new Map(entries.map(([k, v]) => [bo(k), v])) }]])
+    const feedT = (props: ReturnType<typeof mkProps>, str: string): { ok: boolean; complete: boolean } => {
+      const m = new ToolBodyMachineXml([bo('f')], props)
+      const ok = m.feed(encX.encode(str))
+      return { ok, complete: ok && m.complete }
+    }
+    const NUM = mkProps([['n', { type: 'number' }]])
+    check('typed value: number param accepts a number', feedT(NUM, '<function=f>\n<parameter=n>\n12.5\n</parameter>\n</function>').complete)
+    check('typed value: number param rejects prose', !feedT(NUM, '<function=f>\n<parameter=n>\nabc').ok)
+    check('typed value: number param rejects trailing junk', !feedT(NUM, '<function=f>\n<parameter=n>\n12x').ok)
+    const INT = mkProps([['n', { type: 'integer', minimum: 0, maximum: 10 }]])
+    check('typed value: integer maximum rejects 42', !feedT(INT, '<function=f>\n<parameter=n>\n42').ok)
+    check('typed value: integer in range completes', feedT(INT, '<function=f>\n<parameter=n>\n7\n</parameter>\n</function>').complete)
+    check('typed value: integer rejects a fraction', !feedT(INT, '<function=f>\n<parameter=n>\n1.').ok)
+    const BOOL = mkProps([['b', { type: 'boolean' }]])
+    check('typed value: boolean accepts true', feedT(BOOL, '<function=f>\n<parameter=b>\ntrue\n</parameter>\n</function>').complete)
+    check('typed value: boolean rejects "yes"', !feedT(BOOL, '<function=f>\n<parameter=b>\nyes').ok)
+    const ARR = mkProps([['a', { type: 'array', items: { type: 'number' } }]])
+    check('typed value: number-array accepted', feedT(ARR, '<function=f>\n<parameter=a>\n[1, 2.5]\n</parameter>\n</function>').complete)
+    check('typed value: array rejects a string item', !feedT(ARR, '<function=f>\n<parameter=a>\n["x"').ok)
+    const ENUM = mkProps([['u', { type: 'string', enum: ['celsius', 'fahrenheit'] }]])
+    check('typed value: enum accepts a literal', feedT(ENUM, '<function=f>\n<parameter=u>\ncelsius\n</parameter>\n</function>').complete)
+    check('typed value: enum rejects off-list bytes', !feedT(ENUM, '<function=f>\n<parameter=u>\nkelvin').ok)
+    check('typed value: enum rejects ending on a bare prefix', !feedT(ENUM, '<function=f>\n<parameter=u>\ncels\n').ok)
+    {
+      const m = new ToolBodyMachineXml([bo('f')], ENUM)
+      m.feed(encX.encode('<function=f>\n<parameter=u>\ncelsius'))
+      check('typed value: completed unambiguous enum pins the closing newline', m.forcedNext?.() === 0x0a)
+    }
+    const RAWP = mkProps([['s', { type: 'string' }]])
+    check('typed value: plain string stays free raw text', feedT(RAWP, '<function=f>\n<parameter=s>\nany bytes <ok> here\n</parameter>\n</function>').complete)
+
     // -- parseToolCallXml (extraction + schema validation) --
     const XTOOLS: ChatTool[] = [
       { type: 'function', function: { name: 'get', description: 'd', parameters: { type: 'object', required: ['q'], additionalProperties: false, properties: { q: { type: 'string' } } } } },
@@ -818,6 +853,37 @@ console.log('(D) JSON constrained decoding')
     const asst: ChatMessage = { role: 'assistant', content: t1.text, tool_calls: t1.toolCalls }
     const t2 = await chat.send([u, asst, { role: 'tool', content: '42' }], { tools: XTOOLS })
     check('xml e2e: tool result reuses the cache', t2.reusedCache && t2.text === 'Result: 42.')
+
+    // -- e2e through the REAL candidate filter: a number param forces digits over the model's
+    //    preferred prose (every step offers a decoy 'z' first; only grammar-legal bytes survive) --
+    {
+      const cid = (ch: string): number => xtk.encode(ch, false)[0]
+      const body = '\n<function=calc>\n<parameter=n>\n42\n</parameter>\n</function>\n'
+      const steps: number[][] = [[xtk.tokenToId('<tool_call>')!], ...[...body].map((ch) => [cid('z'), cid(ch)]), [xtk.tokenToId('</tool_call>')!], [xtk.eosTokenId]]
+      const candEngine = (st: number[][]): Engine => {
+        return {
+          async generate(_ids: number[], o: GenerateOptions = {}): Promise<GenerateResult> {
+            const tokens: number[] = []
+            for (const step of st) {
+              if (tokens.length >= (o.maxTokens ?? 256)) break
+              let chosen: number | null = null
+              const perm = o.candidateFilter ? [...o.candidateFilter(Uint32Array.from(step), new Float32Array(step.length))] : step
+              for (const b of step) if (perm.includes(b)) { chosen = b; break }
+              if (chosen === null) throw new Error('no permitted token')
+              if (o.stopTokens?.includes(chosen)) break
+              tokens.push(chosen)
+              o.onToken?.(chosen)
+            }
+            return { tokens, prefillMs: 1, decodeMs: 1, tokensPerSecond: tokens.length, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+          },
+          async prefill() { return { prefillMs: 1 } },
+          resetCache() {},
+        } as never
+      }
+      const fchat = await createChat(candEngine(steps), { tokenizer: { json: xj, config: xc } })
+      const fr = await fchat.send([{ role: 'user', content: 'add' }], { tools: XTOOLS })
+      check('xml filter e2e: number value forced through the grammar', fr.finishReason === 'tool_calls' && fr.toolCalls[0]?.name === 'calc' && fr.toolCalls[0]?.arguments.n === 42, JSON.stringify(fr.toolCalls))
+    }
   }
 
   // Pre-opened <think> (Qwen3.5 thinking mode): createChat must detect that the thinking-mode
@@ -955,6 +1021,108 @@ if (!staged) {
   }
   check('machine accepts a real-tokenized JSON doc token-by-token', jmOk && jm.complete)
 }
+
+// ── (G) thinkBudget: budget-forcing for the think channel ────────────────────────────────────
+console.log('\n(G) thinkBudget (budget-forced </think>)')
+await (async () => {
+  // unit: the counter/forcing state machine
+  {
+    const b = new ThinkBudget(10, 11, 2, false)
+    check('budget: inactive outside think', b.force() === null)
+    b.advance(10) // <think> opens (not counted)
+    check('budget: open tag does not spend budget', b.force() === null)
+    b.advance(7) // 1st think token
+    check('budget: under budget stays free', b.force() === null)
+    b.advance(8) // 2nd think token -> budget spent
+    check('budget: exhausted forces the close id', b.force() === 11)
+    b.advance(11) // </think>
+    check('budget: after close it never re-arms', b.force() === null)
+    const z = new ThinkBudget(10, 11, 0, true)
+    check('budget 0 (preopened): forces close immediately', z.force() === 11)
+    const n = new ThinkBudget(10, undefined, 0, true)
+    check('budget without a close id never forces', n.force() === null)
+  }
+
+  // candidate-driven mock (like section D): rank-ordered candidates per step, the filter picks
+  const candEngine = (steps: number[][]): Engine => {
+    return {
+      async generate(_ids: number[], o: GenerateOptions = {}): Promise<GenerateResult> {
+        const tokens: number[] = []
+        for (const step of steps) {
+          if (tokens.length >= (o.maxTokens ?? 256)) break
+          let chosen: number | null = null
+          for (let i = 0; i < step.length && chosen === null; i += 4) {
+            const batch = step.slice(i, i + 4)
+            const perm = o.candidateFilter ? o.candidateFilter(Uint32Array.from(batch), new Float32Array(batch.length)) : batch
+            for (const b of batch) if ([...perm].includes(b)) { chosen = b; break }
+          }
+          if (chosen === null) throw new Error('no permitted token')
+          if (o.stopTokens?.includes(chosen)) break
+          tokens.push(chosen)
+          o.onToken?.(chosen)
+        }
+        return { tokens, prefillMs: 1, decodeMs: 1, tokensPerSecond: tokens.length, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+      },
+      async prefill() { return { prefillMs: 1 } },
+      resetCache() {},
+    } as never
+  }
+
+  // e2e on the PRE-OPENED template (Qwen3.5 style): budget 2 cuts a would-be-endless reasoning
+  {
+    const PREOPEN = [
+      "{%- for message in messages %}{{ '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}{%- endfor %}",
+      "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{%- if enable_thinking %}{{ '<think>\\n' }}{%- else %}{{ '<think>\\n\\n</think>\\n\\n' }}{%- endif %}{%- endif %}",
+    ].join('')
+    const { json: pj, config: pc } = miniTokenizer(PREOPEN)
+    const ptk = new ChatTokenizer(pj, pc)
+    const cid = (ch: string): number => ptk.encode(ch, false)[0]
+    const close = ptk.tokenToId('</think>')!
+    // the "model" would reason forever; every step lists </think> as a lower-ranked candidate
+    // (standing in for the real engine's full-vocab fallback when it is outside the top-K)
+    const steps = [
+      [cid('a'), close],
+      [cid('b'), close],
+      [cid('c'), close], // budget 2 -> the filter forces </think> here
+      [cid('o')],
+      [cid('k')],
+      [ptk.eosTokenId],
+    ]
+    const chat = await createChat(candEngine(steps), { tokenizer: { json: pj, config: pc } })
+    const r = await chat.send([{ role: 'user', content: 'q' }], { think: true, thinkBudget: 2 })
+    check('e2e preopen: budget cuts reasoning at 2 tokens', r.thinkText === 'ab', JSON.stringify(r.thinkText))
+    check('e2e preopen: the answer continues after the forced close', r.text === 'ok', JSON.stringify(r.text))
+    // budget 0: no reasoning at all
+    const steps0 = [[cid('a'), close], [cid('y')], [ptk.eosTokenId]]
+    const chat0 = await createChat(candEngine(steps0), { tokenizer: { json: pj, config: pc } })
+    const r0 = await chat0.send([{ role: 'user', content: 'q' }], { think: true, thinkBudget: 0 })
+    check('e2e preopen: budget 0 suppresses reasoning', r0.thinkText === '' && r0.text === 'y', JSON.stringify({ think: r0.thinkText, text: r0.text }))
+    // no budget: same scripted model reasons freely until its own close
+    const stepsFree = [[cid('a'), close], [cid('b'), close], [cid('c'), close], [close], [cid('o')], [cid('k')], [ptk.eosTokenId]]
+    const chatF = await createChat(candEngine(stepsFree), { tokenizer: { json: pj, config: pc } })
+    const rF = await chatF.send([{ role: 'user', content: 'q' }], { think: true })
+    check('e2e preopen: without a budget reasoning is untouched', rF.thinkText === 'abc' && rF.text === 'ok', JSON.stringify(rF.thinkText))
+  }
+
+  // e2e on the standard template (model opens <think> itself): the open tag is not counted
+  {
+    const { json: gj, config: gc } = miniTokenizer()
+    const gtk = new ChatTokenizer(gj, gc)
+    const cid = (ch: string): number => gtk.encode(ch, false)[0]
+    const open = gtk.tokenToId('<think>')!
+    const close = gtk.tokenToId('</think>')!
+    const steps = [
+      [open],
+      [cid('a'), close],
+      [cid('b'), close], // budget 1 -> forced close here
+      [cid('z')],
+      [gtk.eosTokenId],
+    ]
+    const chat = await createChat(candEngine(steps), { tokenizer: { json: gj, config: gc } })
+    const r = await chat.send([{ role: 'user', content: 'q' }], { think: true, thinkBudget: 1 })
+    check('e2e self-opened: open tag uncounted, budget 1 leaves 1 think token', r.thinkText === 'a' && r.text === 'z', JSON.stringify({ think: r.thinkText, text: r.text }))
+  }
+})()
 
 console.log(failures === 0 ? '\nALL CHAT CHECKS PASSED' : `\n${failures} CHAT CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

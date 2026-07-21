@@ -429,10 +429,17 @@ export class JsonMachine {
   private byte(b: number): boolean {
     if (!WS.has(b)) this.wsRun = 0 // any non-whitespace byte ends the run
     switch (this.phase) {
-      case P.ROOT:
+      case P.ROOT: {
         if (WS.has(b)) return this.ws()
         if (b === 0x7b || b === 0x5b) return this.openValue(b)
-        return false // JSON mode requires an object or array root
+        // Schema-less roots stay object/array-only (an unambiguous reply for format:'json').
+        // A root SCHEMA that names a scalar type (number/boolean/...) legalizes that scalar -
+        // openValue enforces it - which the XML tool-value grammar relies on (a '<parameter=>'
+        // value with a number schema is a bare JSON number).
+        const rt = this.root?.type
+        if (rt !== undefined && rt !== 'object' && rt !== 'array') return this.openValue(b)
+        return false
+      }
       case P.VALUE:
         if (WS.has(b)) return this.ws()
         return this.openValue(b)
