@@ -213,6 +213,12 @@ export interface ToolBody {
   readonly name: string
   feed(bytes: Uint8Array): boolean
   clone(): ToolBody
+  /** When the machine sits at a DETERMINISTIC single-byte scaffold position (the '>' that commits a
+   *  name/key, the canonical scaffold '\n'), the byte that must come next - the filter then permits
+   *  ONLY the exact single-byte token, pinning the token boundaries to the model's canonical
+   *  tokenization (merged tokens like '>\n' produce identical text but off-distribution token ids,
+   *  which a 1-bit model cannot recover from). -1 = free position. */
+  forcedNext?(): number
 }
 
 const enum X { PRE, FUNC, NAME, ELEM, KEY, VAL, POST }
@@ -227,6 +233,7 @@ export class ToolBodyMachineXml implements ToolBody {
   private keyCands: string[] = []
   private reqLeft: string[] = []
   private valTail: number[] = []
+  private valStarted = false
   complete = false
   name = ''
 
@@ -237,13 +244,28 @@ export class ToolBodyMachineXml implements ToolBody {
     const m = new ToolBodyMachineXml(this.cands, this.props)
     m.phase = this.phase; m.lit = this.lit; m.nameBuf = this.nameBuf; m.wsRun = this.wsRun
     m.elem = [...this.elem]; m.keyBuf = this.keyBuf; m.keyCands = [...this.keyCands]; m.reqLeft = [...this.reqLeft]; m.valTail = [...this.valTail]
-    m.complete = this.complete; m.name = this.name
+    m.valStarted = this.valStarted; m.complete = this.complete; m.name = this.name
     return m
   }
 
   feed(bytes: Uint8Array): boolean {
     for (let i = 0; i < bytes.length; i++) if (!this.byte(bytes[i])) return false
     return true
+  }
+
+  forcedNext(): number {
+    switch (this.phase) {
+      case X.NAME: // the '>' that commits a COMPLETE, unambiguous name
+        return this.cands.includes(this.nameBuf) && !this.cands.some((c) => c !== this.nameBuf && c.startsWith(this.nameBuf)) ? 0x3e : -1
+      case X.KEY: // the '>' that commits a COMPLETE, unambiguous key
+        return this.keyCands.length > 0 && this.keyCands.includes(this.keyBuf) && !this.keyCands.some((c) => c !== this.keyBuf && c.startsWith(this.keyBuf)) ? 0x3e : -1
+      case X.ELEM: // the canonical scaffold '\n' after '>' / '</parameter>'
+        return this.elem.length === 0 && this.wsRun === 0 ? 0x0a : -1
+      case X.VAL: // the canonical scaffold '\n' after '<parameter=KEY>'
+        return this.wsRun === 0 ? 0x0a : -1
+      default:
+        return -1
+    }
   }
 
   private byte(b: number): boolean {
@@ -269,9 +291,16 @@ export class ToolBodyMachineXml implements ToolBody {
         this.nameBuf += String.fromCharCode(b)
         for (const c of this.cands) if (c.startsWith(this.nameBuf)) return true
         return false
-      case X.ELEM: { // optional ws, then either another '<parameter=' or the closing '</function>'
-        if (this.elem.length === 0 && WS.has(b)) return ++this.wsRun <= WS_CAP
-        this.elem.push(b); this.wsRun = 0
+      case X.ELEM: { // the template's single '\n', then either another '<parameter=' or '</function>'.
+        // The scaffolding is FORCED to the canonical single newline: near-tied scaffolding logits
+        // (e.g. '\n' vs a 4-space indent token) otherwise let f32-vs-bf16 rounding flip a 1-bit
+        // model onto legal-but-off-distribution whitespace, after which the value degenerates.
+        if (this.elem.length === 0 && this.wsRun === 0) {
+          if (b !== 0x0a) return false
+          this.wsRun = 1
+          return true
+        }
+        this.elem.push(b)
         if (litEq(this.elem, X_PARAM)) { this.phase = X.KEY; this.keyBuf = ''; return true }
         if (litEq(this.elem, X_FCLOSE)) { // may close only once every required parameter has been given
           if (this.reqLeft.length) return false
@@ -287,14 +316,26 @@ export class ToolBodyMachineXml implements ToolBody {
           if (this.keyCands.length && !this.keyCands.includes(this.keyBuf)) return false
           this.keyCands = this.keyCands.filter((k) => k !== this.keyBuf)
           this.reqLeft = this.reqLeft.filter((k) => k !== this.keyBuf)
-          this.phase = X.VAL; this.valTail = []
+          this.phase = X.VAL; this.valTail = []; this.wsRun = 0; this.valStarted = false // canonical leading '\n' still owed
           return true
         }
         this.keyBuf += String.fromCharCode(b)
         if (!this.keyCands.length) return true // tool declares no properties: any key name
         for (const c of this.keyCands) if (c.startsWith(this.keyBuf)) return true
         return false
-      case X.VAL: // raw value bytes until the '</parameter>' terminator (any byte is a valid value byte)
+      case X.VAL: // the canonical leading '\n' (forced, same reason as ELEM), then raw value bytes
+        if (this.wsRun === 0) { //   until the '</parameter>' terminator
+          if (b !== 0x0a) return false
+          this.wsRun = 1
+          return true // the scaffolding newline is not part of the value (parse strips it anyway)
+        }
+        // The value must not BEGIN with another newline: '\n' vs '\n\n' are byte-prefix-equal, so
+        // the near-tie logit flip would otherwise land on '\n\n' - legal text, but off-canonical
+        // token-wise, and the model degenerates from there. Values may contain newlines later.
+        if (!this.valStarted) {
+          if (b === 0x0a) return false
+          this.valStarted = true
+        }
         this.valTail.push(b)
         if (this.valTail.length > X_PCLOSE.length) this.valTail.shift()
         if (litEq(this.valTail, X_PCLOSE)) { this.phase = X.ELEM; this.elem = []; this.wsRun = 0 }
@@ -378,6 +419,13 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
         }
         const bytes = table.bytes(n)
         if (!bytes || bytes.length === 0) continue
+        // deterministic scaffold position: only the exact single-byte token (pins token boundaries
+        // to the canonical tokenization - see ToolBody.forcedNext)
+        const fb = m.forcedNext?.() ?? -1
+        if (fb >= 0) {
+          if (bytes.length === 1 && bytes[0] === fb) out.push(n)
+          continue
+        }
         if (m.clone().feed(bytes)) out.push(n)
       }
       return out

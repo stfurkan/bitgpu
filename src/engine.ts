@@ -506,6 +506,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     uni: GPUBuffer
     bg: GPUBindGroup | null
     last: Uint8Array | null
+    /** The buffers the cached bind group was built against. Most buffers are stable within a call,
+     *  but the hybrid's recurrent/conv state PING-PONGS between two halves every stack() call - a
+     *  bind group cached at one parity would silently freeze the recurrence (state_in re-read from
+     *  the same half forever), so the cache must key on buffer identity, not just the slot. */
+    bufs: GPUBuffer[] | null
   }
   // NAMED pools: each distinct dispatch sequence gets its own slot array ('decode' = the fused
   // token loop, 'pld1' / 'pldm' = speculative single-token and verify steps). Selecting a pool
@@ -1210,7 +1215,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (pool) {
       let slot = pool.disp[dispIdx]
       if (!slot) {
-        slot = { uni: device.createBuffer({ size: 64, usage: U | CD }), bg: null, last: null }
+        slot = { uni: device.createBuffer({ size: 64, usage: U | CD }), bg: null, last: null, bufs: null }
         pool.disp[dispIdx] = slot
       }
       const data2 = makeParams(fields) // reused view; only writeBuffer when the params changed
@@ -1218,11 +1223,21 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         device.queue.writeBuffer(slot.uni, 0, data2 as BufferSource)
         slot.last = data2.slice()
       }
+      // rebuild when any bound buffer changed (see DispSlot.bufs - the hybrid state ping-pong)
+      if (slot.bg && slot.bufs) {
+        const nb = ins.length + outs.length
+        if (slot.bufs.length !== nb) slot.bg = null
+        else {
+          for (let i = 0; i < ins.length; i++) if (slot.bufs[i] !== ins[i]) { slot.bg = null; break }
+          if (slot.bg) for (let i = 0; i < outs.length; i++) if (slot.bufs[ins.length + i] !== outs[i]) { slot.bg = null; break }
+        }
+      }
       if (!slot.bg) {
         const entries: GPUBindGroupEntry[] = [{ binding: 0, resource: { buffer: slot.uni } }]
         ins.forEach((b, i) => entries.push({ binding: i + 1, resource: { buffer: b } }))
         outs.forEach((b, i) => entries.push({ binding: 1 + ins.length + i, resource: { buffer: b } }))
         slot.bg = device.createBindGroup({ layout: pipelines[name].getBindGroupLayout(0), entries })
+        slot.bufs = [...ins, ...outs]
       }
       pass.setBindGroup(0, slot.bg)
       dispIdx++

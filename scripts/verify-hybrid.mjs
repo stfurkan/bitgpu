@@ -54,6 +54,12 @@ try {
         for (let j = 1; j < V; j++) if (last[j] > last[am]) am = j
         ref.push(am); seq.push(am)
       }
+      // SAMPLED-PATH decode gate: the sampled/constrained loop (generateSampledImpl) runs ONE stack()
+      // per step, flipping the hybrid state ping-pong every step - the pooled bind groups must follow
+      // the alternating state buffers or the recurrence silently freezes (each step re-reads the same
+      // state_in; caught live on the 27B as decode stuck at the prompt-end distribution). topK:1 with a
+      // tiny temperature is deterministic, so it must match the plain-greedy tokens exactly.
+      const sampGen = (await engine.generate(ids.slice(0, K), { maxTokens: N, temperature: 0.01, topK: 1, seed: 1 })).tokens
       // KV-grow gate: force ensureKvCapacity past the 512-position initial cap. generate() reserves
       // capacity for the whole run upfront, so a >512-token generation grows the cache - which for the
       // hybrid grows KV ONLY for the full-attention layers (kvLayers in engine.ts). Re-check that
@@ -110,7 +116,7 @@ try {
       const eR = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
       await eR.restoreCache(snap)
       const snapRestored = (await eR.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
+      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, sampGen, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -134,6 +140,8 @@ try {
   const decOk = JSON.stringify(out.gen) === JSON.stringify(out.ref)
   console.log(`  [${decOk ? 'PASS' : 'FAIL'}] decode==prefill  gen=${JSON.stringify(out.gen)} ref=${JSON.stringify(out.ref)}`)
   if (!decOk) fail++
+  const sampOk = JSON.stringify(out.sampGen) === JSON.stringify(out.gen)
+  console.log(`  [${sampOk ? 'PASS' : 'FAIL'}] sampled-path decode == plain greedy (state ping-pong under pooled bind groups)  samp=${JSON.stringify(out.sampGen)}`)
   const growOk = JSON.stringify(out.growGen) === JSON.stringify(out.growRef)
   console.log(`  [${growOk ? 'PASS' : 'FAIL'}] decode==prefill across KV grow (>512)  gen=${JSON.stringify(out.growGen)} ref=${JSON.stringify(out.growRef)}`)
   if (!growOk) fail++
