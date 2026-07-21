@@ -242,6 +242,8 @@ export class ToolBodyMachineXml implements ToolBody {
   private elem: number[] = []
   private keyBuf = ''
   private keyCands: string[] = []
+  private declared = false // the committed tool declares at least one property
+  private valWs = 0 // whitespace accepted after a completed json-mode value (canonical: one)
   private reqLeft: string[] = []
   private valTail: number[] = []
   private valStarted = false
@@ -259,7 +261,7 @@ export class ToolBodyMachineXml implements ToolBody {
   clone(): ToolBodyMachineXml {
     const m = new ToolBodyMachineXml(this.cands, this.props)
     m.phase = this.phase; m.lit = this.lit; m.nameBuf = this.nameBuf; m.wsRun = this.wsRun
-    m.elem = [...this.elem]; m.keyBuf = this.keyBuf; m.keyCands = [...this.keyCands]; m.reqLeft = [...this.reqLeft]; m.valTail = [...this.valTail]
+    m.elem = [...this.elem]; m.keyBuf = this.keyBuf; m.keyCands = [...this.keyCands]; m.reqLeft = [...this.reqLeft]; m.valTail = [...this.valTail]; m.declared = this.declared; m.valWs = this.valWs
     m.valStarted = this.valStarted; m.complete = this.complete; m.name = this.name
     m.valMode = this.valMode; m.valBuf = this.valBuf; m.valEnum = [...this.valEnum]; m.valJson = this.valJson ? this.valJson.clone() : null; m.closeLit = this.closeLit
     return m
@@ -305,6 +307,7 @@ export class ToolBodyMachineXml implements ToolBody {
           this.name = this.nameBuf
           const spec = this.props.get(this.nameBuf)
           this.keyCands = [...(spec?.keys ?? [])]
+          this.declared = this.keyCands.length > 0
           this.reqLeft = [...(spec?.required ?? [])]
           this.phase = X.ELEM; this.elem = []; this.wsRun = 0
           return true
@@ -322,12 +325,20 @@ export class ToolBodyMachineXml implements ToolBody {
           return true
         }
         this.elem.push(b)
-        if (litEq(this.elem, X_PARAM)) { this.phase = X.KEY; this.keyBuf = ''; return true }
+        // A tool WITH declared properties may only open as many <parameter= elements as it has
+        // unused keys: an exhausted candidate list must not degrade into "any key accepted"
+        // (duplicates silently overwrite on parse; undeclared keys make the call a dud). A tool
+        // with NO declared properties keeps the permissive behavior on purpose.
+        const canParam = this.keyCands.length > 0 || !this.declared
+        if (litEq(this.elem, X_PARAM)) {
+          if (!canParam) return false
+          this.phase = X.KEY; this.keyBuf = ''; return true
+        }
         if (litEq(this.elem, X_FCLOSE)) { // may close only once every required parameter has been given
           if (this.reqLeft.length) return false
           this.phase = X.POST; this.complete = true; this.wsRun = 0; return true
         }
-        const pP = litPrefix(this.elem, X_PARAM)
+        const pP = litPrefix(this.elem, X_PARAM) && canParam
         const pF = litPrefix(this.elem, X_FCLOSE)
         if (pF && !pP && this.reqLeft.length) return false // committing to </function> with required params left
         return pP || pF
@@ -343,7 +354,7 @@ export class ToolBodyMachineXml implements ToolBody {
           // string enum -> the raw literal set; anything else -> free raw text
           const sch = this.props.get(this.name)?.schemas?.get(this.keyBuf)
           const t = sch?.type
-          if (sch && t !== undefined && t !== 'string') {
+          if (sch && (sch.oneOf !== undefined || (t !== undefined && t !== 'string'))) {
             this.valMode = 'json'; this.valJson = new JsonMachine(sch)
           } else if (sch?.enum?.length) {
             this.valMode = 'enum'; this.valBuf = ''; this.valEnum = sch.enum.map(ToolBodyMachine.bytesOf)
@@ -374,7 +385,16 @@ export class ToolBodyMachineXml implements ToolBody {
           // state keeps accepting trailing whitespace (the canonical '\n' before the closer lands
           // there); the first byte it REJECTS after completion must start '</parameter>'.
           const j = this.valJson as JsonMachine
-          if (j.feed(Uint8Array.of(b))) return true
+          if (j.feed(Uint8Array.of(b))) {
+            // Once the root is complete, the machine's DONE state accepts whitespace forever;
+            // canonically exactly ONE '\n' precedes '</parameter>'. Cap it so a whitespace-happy
+            // model cannot burn the whole token budget inside the value. (Mid-value completeness,
+            // e.g. a number that could gain digits, resets the cap on any non-ws byte.)
+            if (j.complete && (b === 0x0a || b === 0x20 || b === 0x09 || b === 0x0d)) {
+              if (++this.valWs > 1) return false
+            } else this.valWs = 0
+            return true
+          }
           if (!j.complete || b !== X_PCLOSE[0]) return false
           this.phase = X.VCLOSE; this.closeLit = 1
           return true
@@ -445,7 +465,23 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
       return [ToolBodyMachine.bytesOf(t.function.name), { keys: [...schemas.keys()], required: (p?.required ?? []).map(ToolBodyMachine.bytesOf), schemas }] as const
     }),
   )
+  if (prep.format === 'xml')
+    for (const t of prep.tools)
+      for (const [k, s] of Object.entries(t.function.parameters?.properties ?? {})) {
+        const sch = s as JsonSchema
+        const isRawText = sch.oneOf === undefined && (sch.type === undefined || sch.type === 'string') && !sch.enum?.length
+        if (isRawText && (sch.minLength !== undefined || sch.maxLength !== undefined))
+          throw new Error(`bitgpu/chat: minLength/maxLength on string parameter '${t.function.name}.${k}' cannot be enforced with the XML tool protocol (values are raw text); use an enum or drop the constraint`)
+        if (sch.enum?.some((v) => v === ''))
+          throw new Error(`bitgpu/chat: enum on parameter '${t.function.name}.${k}' contains an empty string, which the XML tool protocol cannot represent (the value scaffold newline would be ambiguous)`)
+      }
   const newBody = (): ToolBody => (prep.format === 'xml' ? new ToolBodyMachineXml(cands, props) : new ToolBodyMachine(cands, schemas))
+  // The token-level grammar gates the close-marker TOKEN, but ToolCallSplitter closes blocks on
+  // the decoded TEXT - so a value spelling out '</tool_call>' byte-by-byte would truncate the
+  // block early and leak its remainder into the visible reply. Reject any token that would make
+  // the body text contain the marker (values always have alternative spellings, no dead ends).
+  const CLOSE_TEXT = ToolBodyMachine.bytesOf('</tool_call>')
+  let bodyTail = ''
   const enum S {
     TEXT, // auto mode outside a call: everything permitted
     OPEN, // forced mode start: only <tool_call>
@@ -478,6 +514,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
         }
         const bytes = table.bytes(n)
         if (!bytes || bytes.length === 0) continue
+        if ((bodyTail + String.fromCharCode(...bytes)).includes(CLOSE_TEXT)) continue // would embed '</tool_call>' as text
         // deterministic scaffold position: only the exact single-byte token (pins token boundaries
         // to the canonical tokenization - see ToolBody.forcedNext)
         const fb = m.forcedNext?.() ?? -1
@@ -505,6 +542,7 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
           if (id === ids.open) {
             state = S.BODY
             body = newBody()
+            bodyTail = ''
           }
           return
         case S.BODY:
@@ -515,7 +553,10 @@ export function makeToolFilter(table: TokenByteTable, prep: PreparedTools, start
           }
           {
             const bytes = table.bytes(id)
-            if (bytes) (body as ToolBody).feed(bytes)
+            if (bytes) {
+              ;(body as ToolBody).feed(bytes)
+              bodyTail = (bodyTail + String.fromCharCode(...bytes)).slice(1 - CLOSE_TEXT.length)
+            }
           }
           return
         case S.EOS:
@@ -625,7 +666,7 @@ export function parseToolCallXml(raw: string, tools: readonly ChatTool[]): ToolC
     const key = m[1]
     const valText = m[2].replace(/^\n/, '').replace(/\n$/, '') // strip the template's scaffolding newlines
     const pschema = props[key] as JsonSchema | undefined
-    if (pschema?.type !== undefined && pschema.type !== 'string') {
+    if (pschema?.oneOf !== undefined || (pschema?.type !== undefined && pschema.type !== 'string')) {
       try {
         args[key] = JSON.parse(valText)
       } catch {

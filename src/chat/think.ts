@@ -133,6 +133,7 @@ export class ThinkBudget {
   private closed = false
   private run = 0 //         consecutive confident steps (early stop)
   private earlyFired = false
+  private seen = false //    observe() already ran for the current step (see below)
   constructor(
     private readonly openId: number | undefined,
     private readonly closeId: number | undefined,
@@ -155,11 +156,16 @@ export class ThinkBudget {
       return
     }
     this.spent++
+    this.seen = false // next step's first observe() counts again
   }
 
-  /** Feed one step's candidate logits (descending). Only meaningful inside think. */
+  /** Feed one step's candidate logits (descending). Only meaningful inside think. Counted at most
+   *  once per emitted step: the engine re-invokes the candidate filter (and thus observe) once per
+   *  512-token batch when it has to walk the full vocabulary for a forced token, and those
+   *  batch-local gaps must not eat the early-stop window. */
   observe(vals: ArrayLike<number>): void {
-    if (!this.early || !this.inThink || this.closed || this.earlyFired || vals.length < 2) return
+    if (!this.early || !this.inThink || this.closed || this.earlyFired || this.seen || vals.length < 2) return
+    this.seen = true
     const confident = vals[0] - vals[1] >= this.early.gap
     this.run = confident ? this.run + 1 : 0
     if (this.spent >= this.early.minTokens && this.run >= this.early.window) this.earlyFired = true

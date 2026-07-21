@@ -1118,6 +1118,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // threshold); the copy is GPU-side and bounded geometrically. Invalidates cached decode bind groups
   // since they referenced the old buffers.
   async function ensureKvCapacity(needed: number): Promise<void> {
+    // The cache never holds more than maxSeqLen positions, so clamp before the early-return. In
+    // sink mode callers pass posBase + prompt + maxTokens, which legitimately exceeds maxSeqLen
+    // (the window rolls mid-turn); unclamped, that made every steady-state turn (kvCapacity
+    // already at maxSeqLen) fall through to a full same-size reallocate-and-copy of every layer's
+    // K/V - a pointless per-turn 2x-cache VRAM spike that could even throw GpuOutOfMemoryError.
+    needed = Math.min(needed, maxSeqLen)
     if (needed <= kvCapacity) return
     const newCap = Math.min(maxSeqLen, Math.max(needed, kvCapacity * 2))
     const copyBytes = kvCapacity * KV * Dh * KVB // preserve all currently-allocated K/V
@@ -1649,13 +1655,18 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const vocab = W.lm_head.N!
     // Segmented like runPrefill (bit-exact by the same composition the reuse gates prove), so a
     // long forward() neither dispatches >65535 workgroups in one dimension (S*heads at full
-    // maxSeqLen) nor binds an S x vocab logits buffer beyond the negotiated binding limit.
+    // maxSeqLen) nor binds an S x vocab logits buffer beyond the negotiated binding limit. The
+    // segment is capped at 32 rows because that is exactly what needBind reserves for logits
+    // (32 * vocab * 4): a 256-row segment binds 8x the reserve and only fits today because the
+    // lm_head weight binding happens to be >= 1024*vocab bytes when hidden >= 2048 - zero margin
+    // at hidden 2048, silently over the limit below it. forward() is a verification path, so the
+    // extra segmentation cost is irrelevant.
     const embed = new Float32Array(S * Hd),
       layer0 = new Float32Array(S * Hd),
       finalnorm = new Float32Array(S * Hd),
       logits = new Float32Array(S * vocab)
     transients = []
-    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
+    const prefillSeg = Math.min(((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY, 32) // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
     try {
       for (let off = 0; off < S; off += prefillSeg) {
         const seg = ids.slice(off, off + prefillSeg)
@@ -1880,17 +1891,26 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const lseBuf = device.createBuffer({ size: 4, usage: S_ | CS }) // log-sum-exp normalizer (logprobs)
     const sigBuf = device.createBuffer({ size: 12, usage: S_ | CS }) // top-n-sigma moments [sum, sumsq, count] centered on max
     const sigOff = KT * 8 + (lpN ? 4 : 0)
-    const affBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD }) // upper bound = full vocab can't exceed seq len
-    const banBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD })
+    // Sized for the common case, grown on demand: under overflow 'sinks' the penalty history is
+    // the WHOLE conversation (unbounded by maxSeqLen), so distinct-token/ngram-ban counts can
+    // exceed any fixed bound; an oversized writeBuffer would be silently DROPPED (validation
+    // error) and the sampler would keep penalizing the previous step's ids.
+    let affBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD })
+    let banBuf = device.createBuffer({ size: maxSeqLen * 4, usage: S_ | CD })
+    const grow = (b: GPUBuffer, bytes: number): GPUBuffer => {
+      if (bytes <= b.size) return b
+      b.destroy() // safe: destruction defers until submitted work using it completes
+      return device.createBuffer({ size: 1 << (32 - Math.clz32(bytes - 1)), usage: S_ | CD })
+    }
     const rbBuf = device.createBuffer({ size: sigOff + (topNS > 0 ? 12 : 0), usage: GPUBufferUsage.MAP_READ | CD })
     const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
 
     // upload the CPU-computed deduped id set + ngram bans for the current history; return their lengths
     const writeAffBan = (history: number[]): { affLen: number; banLen: number } => {
       const aff = penalty !== 1 || presence !== 0 ? affectedIds(history) : new Uint32Array(0)
-      if (aff.length) device.queue.writeBuffer(affBuf, 0, aff)
+      if (aff.length) device.queue.writeBuffer((affBuf = grow(affBuf, aff.byteLength)), 0, aff)
       const ban = ngramN > 0 ? ngramBans(history, ngramN) : []
-      if (ban.length) device.queue.writeBuffer(banBuf, 0, Uint32Array.from(ban))
+      if (ban.length) device.queue.writeBuffer((banBuf = grow(banBuf, ban.length * 4)), 0, Uint32Array.from(ban))
       return { affLen: aff.length, banLen: ban.length }
     }
     // penalty pre-filter (+ logprobs normalizer) + KT masked-argmax, all in the given pass (after
@@ -1976,7 +1996,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const ci = ciAll.subarray(0, K)
       const cv = cvAll.subarray(0, K)
       const perm = new Set(filter(ci, cv))
-      if (perm.size > 0) {
+      {
         const pIds: number[] = []
         const pVals: number[] = []
         for (let i = 0; i < ci.length; i++)
@@ -1984,6 +2004,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             pIds.push(ci[i])
             pVals.push(cv[i])
           }
+        // A filter may return ids OUTSIDE the candidates it was shown (e.g. chat's thinkBudget
+        // forcing </think> when it is not in the top-K). An empty intersection must fall through
+        // to the full-vocabulary walk below - which re-invokes the filter batch by batch until
+        // the forced id is actually in view - never pick from an empty list.
+        if (pIds.length === 0) return chooseTokenSlow(ciAll, cvAll)
         let ids = pIds, vals = pVals
         const st = sigTrim(pIds, pVals) // vs the permitted subset's max: the global max may be filtered out
         if (st) { ids = st.ids; vals = st.vals }
@@ -1992,6 +2017,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         chosenLogit = pVals[pIds.indexOf(tk)] // pre-DRY
         return tk
       }
+    }
+    const chooseTokenSlow = async (ciAll: Uint32Array, cvAll: Float32Array): Promise<number> => {
       const all = await readback(lg, vocab) // penalized logits; every argmax round masked its winner in place
       // Restore the masked entries from the candidates already read back: the filter-rejected
       // top-K re-check and fail again (filters are deterministic), and the extra logprobs-only
@@ -2002,9 +2029,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const pVals: number[] = []
       const B = 512
       for (let i = 0; i < order.length && pIds.length < K; i += B) {
-        if (all[order[i]] === -Infinity) break // sorted: only masked/banned entries remain
-        const batch = order.slice(i, i + B).filter((id) => all[id] !== -Infinity)
-        const ok = new Set(filter(Uint32Array.from(batch), Float32Array.from(batch.map((id) => all[id]))))
+        // Once at least one finite permitted token exists, the -inf tail (ngram-banned entries;
+        // masked argmax winners were restored above) cannot outrank it - stop. With NOTHING
+        // permitted yet, keep walking INTO the -inf tail: a grammar/filter-required token that an
+        // n-gram ban soft-banned must stay reachable (constraint outranks repetition heuristic) -
+        // otherwise a schema needing e.g. one more ',' in a repetitive array throws mid-turn.
+        if (all[order[i]] === -Infinity && pIds.length > 0) break
+        const batch = order.slice(i, i + B)
+        const ok = new Set(filter!(Uint32Array.from(batch), Float32Array.from(batch.map((id) => all[id]))))
         for (const id of batch) {
           if (ok.has(id)) {
             pIds.push(id)
@@ -2012,6 +2044,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             if (pIds.length >= K) break
           }
         }
+        // Only reachable when nothing finite was permitted: keep exactly one banned token so the
+        // pick is deterministic (a softmax over several -inf logits is NaN).
+        if (pVals[0] === -Infinity) { pIds.length = 1; pVals.length = 1; break }
       }
       if (pIds.length === 0) throw new Error('bitgpu: candidateFilter permitted no token in the entire vocabulary')
       let ids = pIds, vals = pVals
@@ -2136,7 +2171,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const ngramN = genOpts.noRepeatNgramSize ?? 0
     const pl = typeof genOpts.promptLookup === 'object' && genOpts.promptLookup !== null ? genOpts.promptLookup : {}
     const ngramSize = Math.max(2, pl.ngramSize ?? 3)
-    const maxDraft = Math.max(1, pl.maxDraft ?? 8)
+    // Clamped to 31: lgAll binds (maxDraft + 1) rows of logits, and needBind reserves exactly 32
+    // rows (32 * vocab * 4). An unclamped user value would exceed the negotiated binding limit and
+    // fail as a DEFERRED validation error - silent garbage. >9 already falls back to slow kernels.
+    const maxDraft = Math.max(1, Math.min(pl.maxDraft ?? 8, 31))
     const stopSet = genOpts.stopTokens ? new Set(genOpts.stopTokens) : null
     const onToken = genOpts.onToken
     const signal = genOpts.signal
@@ -2150,8 +2188,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const idsOut = device.createBuffer({ size: (maxDraft + 1) * 4, usage: S_ | CS }) // greedy: argmax per row
     const candIds = device.createBuffer({ size: K * 4, usage: S_ | CS })
     const candVals = device.createBuffer({ size: K * 4, usage: S_ | CS })
-    const affBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
-    const banBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
+    let affBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
+    let banBuf = device.createBuffer({ size: (maxSeqLen + maxDraft + 1) * 4, usage: S_ | CD })
+    const grow = (b: GPUBuffer, bytes: number): GPUBuffer => {
+      if (bytes <= b.size) return b
+      b.destroy()
+      return device.createBuffer({ size: 1 << (32 - Math.clz32(bytes - 1)), usage: S_ | CD })
+    }
     const rbAll = device.createBuffer({ size: (maxDraft + 1) * K * 8, usage: GPUBufferUsage.MAP_READ | CD })
     // Step input token ids + their gathered embeddings, written per step (never re-created: the
     // pooled bind groups cache buffer identities, so a per-step upload would go stale the moment
@@ -2162,9 +2205,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
     const writeAffBan = (h: number[]): { affLen: number; banLen: number } => {
       const aff = penalty !== 1 || presence !== 0 ? affectedIds(h) : new Uint32Array(0)
-      if (aff.length) device.queue.writeBuffer(affBuf, 0, aff)
+      if (aff.length) device.queue.writeBuffer((affBuf = grow(affBuf, aff.byteLength)), 0, aff)
       const ban = ngramN > 0 ? ngramBans(h, ngramN) : []
-      if (ban.length) device.queue.writeBuffer(banBuf, 0, Uint32Array.from(ban))
+      if (ban.length) device.queue.writeBuffer((banBuf = grow(banBuf, ban.length * 4)), 0, Uint32Array.from(ban))
       return { affLen: aff.length, banLen: ban.length }
     }
     const samplerChain = (pass: GPUComputePassEncoder, affLen: number, banLen: number): void => {
@@ -2356,7 +2399,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // and return layer-0 checkpoints + final norm + logits for each, so a divergence pinpoints the
   // first fused kernel that differs.
   async function debugDecode(prefillIds: number[]): Promise<{ fast: Record<string, Float32Array>; slow: Record<string, Float32Array> }> {
+    // Overwrites K/V from position 0: whatever conversation the cache held is unusable after this
+    // (same rule as forward()); invalidate FIRST so no later reuse/save touches the clobbered rows.
+    fullHistory = []
+    cacheLen = 0
     await ensureKvCapacity(prefillIds.length + 1)
+    transients = []
     const encP = device.createCommandEncoder()
     stack(encP, embedBatch(encP, prefillIds), prefillIds.length, 0)
     device.queue.submit([encP.finish()])
@@ -2369,6 +2417,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const enc = device.createCommandEncoder()
       const r = stack(enc, embedBatch(enc, [tok]), 1, pos)
       const lg = device.createBuffer({ size: W.lm_head.N! * 4, usage: S_ | CS })
+      transients?.push(lg)
       const pass = enc.beginComputePass()
       lmHead(pass, r.fn, 1, lg)
       pass.end()
@@ -2390,9 +2439,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       DBG0 = null
       return ck
     }
-    const fast = await runStep(false),
-      slow = await runStep(true)
-    return { fast, slow }
+    try {
+      const fast = await runStep(false),
+        slow = await runStep(true)
+      return { fast, slow }
+    } finally {
+      // a throw inside runStep must not leave the arena disabled / layer-0 capture on for good
+      FORCE_SLOW = false
+      DBG0 = null
+      flushTransients()
+      transients = null
+    }
   }
 
   // Debug hook for the browser harness: run a prefill for `ids` (history = ids), then return the GPU
@@ -2400,6 +2457,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // `base` on the CPU and diffs vs `penalized` (exact, same input), and compares its top-K vs candIds,
   // validating sampler_penalty.wgsl and argmax_masked.wgsl in isolation against the headless-checked math.
   async function debugSampler(ids: number[], genOpts: GenerateOptions): Promise<{ base: Float32Array; penalized: Float32Array; candIds: Uint32Array; candVals: Float32Array }> {
+    fullHistory = [] // clobbers K/V from position 0, like debugDecode
+    cacheLen = 0
+    transients = []
     const vocab = W.lm_head.N!
     const K = Math.max(1, Math.min(genOpts.topK ?? 20, vocab))
     const penalty = genOpts.repetitionPenalty ?? 1
@@ -2408,6 +2468,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS })
     const candIds = device.createBuffer({ size: K * 4, usage: S_ | CS })
     const candVals = device.createBuffer({ size: K * 4, usage: S_ | CS })
+    transients?.push(lg, candIds, candVals)
     const aff = penalty !== 1 || presence !== 0 ? affectedIds(ids) : new Uint32Array(0)
     const ban = ngramN > 0 ? ngramBans(ids, ngramN) : []
     const affBuf = upload(aff.length ? aff : new Uint32Array(1), S_ | CD)
@@ -2416,6 +2477,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const enc1 = device.createCommandEncoder()
     const { fn } = stack(enc1, embedBatch(enc1, ids), ids.length, 0)
     const lastP = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
+    transients?.push(lastP)
     enc1.copyBufferToBuffer(fn, (ids.length - 1) * Hd * 4, lastP, 0, Hd * 4)
     let pass = enc1.beginComputePass()
     lmHead(pass, lastP, 1, lg)
@@ -2435,7 +2497,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     pass.end()
     device.queue.submit([enc2.finish()])
     await device.queue.onSubmittedWorkDone()
-    return { base, penalized: await readback(lg, vocab), candIds: await readbackU32(candIds, K), candVals: await readback(candVals, K) }
+    try {
+      return { base, penalized: await readback(lg, vocab), candIds: await readbackU32(candIds, K), candVals: await readback(candVals, K) }
+    } finally {
+      flushTransients()
+      transients = null
+    }
   }
 
   const capabilities: EngineCapabilities = {
@@ -2468,6 +2535,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // silently ignored it - the plain GPU greedy loop never runs the penalty chain.)
     if (((genOpts.dryMultiplier ?? 0) > 0 || (genOpts.topNSigma ?? 0) > 0) && genOpts.promptLookup && genOpts.promptLookup !== 'auto')
       throw new Error('bitgpu: dryMultiplier/topNSigma are not supported with promptLookup (they need per-position statistics; auto simply disables lookup)')
+    // Speculation is unsound on the hybrid backbone: draft verification runs the whole batch
+    // through the DeltaNet recurrence, and a rejected draft's contribution to the cumulative
+    // recurrent/conv state cannot be rewound (unlike K/V rows, which later steps overwrite).
+    // Every token after the first rejection would decode from state polluted by tokens that were
+    // never emitted. 'auto' quietly skips speculation; an explicit request fails loudly.
+    if (A.hybrid && genOpts.promptLookup && genOpts.promptLookup !== 'auto')
+      throw new Error("bitgpu: promptLookup is not supported on the qwen3_5 hybrid backbone (rejected drafts would corrupt the linear-attention recurrent state); use promptLookup: 'auto' or omit it")
     const reuse = (genOpts.reuseCache ?? false) && fullHistory.length > 0
     if (genOpts.signal?.aborted) {
       // aborted before any work: don't touch fullHistory (the cache still matches it)
@@ -2481,6 +2555,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // itself must still fit the window - prompt-side trimming stays the caller's job).
     let posBase = reuse ? (roll ? cacheLen : fullHistory.length - 1) : 0 // reuse: the prior last token (uncached) is re-fed, then the delta
     const prefillTokens = reuse ? [fullHistory[fullHistory.length - 1], ...promptTokenIds] : promptTokenIds
+    // Captured BEFORE any await: a resetCache() landing inside the roll-eviction await below swaps
+    // the module-level fullHistory, and a reuse turn must then complete against the ORPHANED array
+    // (discarded with it) - never splice its delta onto the freshly reset history. A non-reuse turn
+    // legitimately starts a new conversation either way.
+    const hist = reuse ? fullHistory : [...promptTokenIds]
     if (prefillTokens.length === 0) throw new Error('generate: no tokens to process')
     if (roll && posBase + prefillTokens.length + 1 > maxSeqLen) {
       if (SINKS + prefillTokens.length + 1 > maxSeqLen)
@@ -2493,120 +2572,143 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (room < 1) throw new Error(`generate: prompt length ${posBase + prefillTokens.length} exceeds maxSeqLen ${maxSeqLen}; trim history or raise maxSeqLen`)
     // In sink mode the window rolls mid-turn, so maxTokens is honored as-is (no window clamp).
     const maxTokens = roll ? (genOpts.maxTokens ?? 256) : Math.min(genOpts.maxTokens ?? 256, room) // clamp instead of throwing: fill the window, stop there
-    if (reuse) fullHistory.push(...promptTokenIds) // the delta is now part of the conversation (last token already present)
-    else fullHistory = [...promptTokenIds]
+    if (reuse) hist.push(...promptTokenIds) // the delta is now part of the conversation (last token already present)
+    else fullHistory = hist
+    // From here on the conversation state is mutated: any THROW below (scratch/KV OOM mid-
+    // prefill, a GPU validation failure) may leave hist ahead of the K/V actually written.
+    // Invalidate the cache so a caller that catches cannot silently reuse poisoned state
+    // (the abort path already does this inside runPrefill). Conservative by design: an
+    // options-validation throw from an impl also clears - safe, merely un-cached.
+    try {
 
-    if (maxTokens < 1) {
-      // maxTokens: 0 - behave like prefill(): write K/V for the prompt (so a later reuseCache
-      // turn continues correctly), record the history above, emit nothing. Previously this
-      // emitted one token anyway.
-      await ensureKvCapacity(posBase + prefillTokens.length)
-      transients = []
-      try {
-        const t0 = performance.now()
-        await runPrefill(prefillTokens, posBase, genOpts.signal)
-        await device.queue.onSubmittedWorkDone()
-        cacheLen = posBase + prefillTokens.length - 1 // sink-mode bookkeeping (last token re-feeds)
-        return { tokens: [], prefillMs: performance.now() - t0, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
-      } finally {
-        flushTransients()
-        transients = null
+      if (maxTokens < 1) {
+        // maxTokens: 0 - behave like prefill(): write K/V for the prompt (so a later reuseCache
+        // turn continues correctly), record the history above, emit nothing. Previously this
+        // emitted one token anyway.
+        await ensureKvCapacity(posBase + prefillTokens.length)
+        transients = []
+        try {
+          const t0 = performance.now()
+          // Feed all but the LAST token: the next reuse turn re-feeds it (writing its K/V then).
+          // Feeding it here too would double-apply it to the hybrid backbone's cumulative DeltaNet
+          // recurrence (harmless-idempotent for dense K/V, silently divergent for the hybrid).
+          if (prefillTokens.length > 1) {
+            await runPrefill(prefillTokens.slice(0, -1), posBase, genOpts.signal)
+            await device.queue.onSubmittedWorkDone()
+          }
+          cacheLen = posBase + prefillTokens.length - 1 // positions fed/written (last token re-feeds)
+          return { tokens: [], prefillMs: performance.now() - t0, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+        } finally {
+          flushTransients()
+          transients = null
+        }
       }
-    }
 
-    // A candidateFilter needs the per-step sampler-chain path (candidates on the CPU every
-    // token) and cannot speculate (draft verification has no per-row filter state) - so it
-    // forces that path and disables promptLookup, as documented on the option. logprobs need
-    // the same per-step candidate readback, so they route identically.
-    const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
-    let r: RawGenResult
-    if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
-      // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
-      // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
-      // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
-      // the continuation re-feeds the last emitted token at its position (the composition the
-      // reuse gates prove bit-exact), and a sampled continuation takes over the probation's
-      // RNG mid-stream, so the draw sequence is exactly a single run's.
-      const r1 = await generatePldImpl(prefillTokens, posBase, PLD_PROBATION, genOpts, fullHistory)
-      const E = r1.tokens.length
-      if (E < PLD_PROBATION) {
-        r = r1 // stopped or aborted inside the window: nothing left to decide
-      } else {
-        const keep = pldWorthIt(E, r1.spec?.steps ?? 0, sampled || hasProcessors)
-        const ids2 = [r1.tokens[E - 1]] // re-feed the last emitted token (its K/V is unwritten)
-        const pos2 = posBase + prefillTokens.length + E - 1
-        const n2 = maxTokens - E
-        let r2: RawGenResult
-        if (keep) {
-          r2 = await generatePldImpl(ids2, pos2, n2, genOpts, fullHistory, r1.rng)
-        } else if (sampled || hasProcessors) {
-          r2 = await generateSampledImpl(ids2, pos2, n2, genOpts, fullHistory, r1.rng)
+      // A candidateFilter needs the per-step sampler-chain path (candidates on the CPU every
+      // token) and cannot speculate (draft verification has no per-row filter state) - so it
+      // forces that path and disables promptLookup, as documented on the option. logprobs need
+      // the same per-step candidate readback, so they route identically.
+      const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
+      let r: RawGenResult
+      if (!hasFilter && !A.hybrid && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup === 'auto' && maxTokens > PLD_PROBATION) {
+        // Probation: speculate for the first PLD_PROBATION tokens, then keep PLD only if the
+        // measured tokens-per-verify-step clears the plain-decode break-even for this mode;
+        // otherwise the rest of the turn runs the plain path. Output is IDENTICAL either way:
+        // the continuation re-feeds the last emitted token at its position (the composition the
+        // reuse gates prove bit-exact), and a sampled continuation takes over the probation's
+        // RNG mid-stream, so the draw sequence is exactly a single run's.
+        const r1 = await generatePldImpl(prefillTokens, posBase, PLD_PROBATION, genOpts, hist)
+        const E = r1.tokens.length
+        if (E < PLD_PROBATION) {
+          r = r1 // stopped or aborted inside the window: nothing left to decide
         } else {
-          const hist = fullHistory
-          r2 = await generateImpl(ids2, pos2, n2, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
-          hist.push(...r2.tokens) // plain greedy does not touch history; the PLD/sampled impls push their own
+          const keep = pldWorthIt(E, r1.spec?.steps ?? 0, sampled || hasProcessors)
+          const ids2 = [r1.tokens[E - 1]] // re-feed the last emitted token (its K/V is unwritten)
+          const pos2 = posBase + prefillTokens.length + E - 1
+          const n2 = maxTokens - E
+          let r2: RawGenResult
+          if (keep) {
+            r2 = await generatePldImpl(ids2, pos2, n2, genOpts, hist, r1.rng)
+          } else if (sampled || hasProcessors) {
+            r2 = await generateSampledImpl(ids2, pos2, n2, genOpts, hist, r1.rng)
+          } else {
+            r2 = await generateImpl(ids2, pos2, n2, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
+            hist.push(...r2.tokens) // plain greedy does not touch history; the PLD/sampled impls push their own
+          }
+          const total = E + r2.tokens.length
+          const decodeMs = r1.decodeMs + r2.prefillMs + r2.decodeMs // the 1-token re-feed is decode work
+          const w1 = Math.max(1, E - 1)
+          const w2 = Math.max(0, r2.tokens.length)
+          r = {
+            prefillMs: r1.prefillMs,
+            decodeMs,
+            tokPerSec: Math.max(1, total - 1) / (decodeMs / 1000),
+            tokens: [...r1.tokens, ...r2.tokens],
+            firstArgmax: r1.firstArgmax,
+            recMs: (r1.recMs * w1 + r2.recMs * w2) / (w1 + w2),
+            gpuMs: (r1.gpuMs * w1 + r2.gpuMs * w2) / (w1 + w2),
+            rbMs: (r1.rbMs * w1 + r2.rbMs * w2) / (w1 + w2),
+            spec: {
+              steps: (r1.spec?.steps ?? 0) + (r2.spec?.steps ?? 0),
+              drafted: (r1.spec?.drafted ?? 0) + (r2.spec?.drafted ?? 0),
+              accepted: (r1.spec?.accepted ?? 0) + (r2.spec?.accepted ?? 0),
+              bailed: !keep,
+            },
+          }
         }
-        const total = E + r2.tokens.length
-        const decodeMs = r1.decodeMs + r2.prefillMs + r2.decodeMs // the 1-token re-feed is decode work
-        const w1 = Math.max(1, E - 1)
-        const w2 = Math.max(0, r2.tokens.length)
-        r = {
-          prefillMs: r1.prefillMs,
-          decodeMs,
-          tokPerSec: Math.max(1, total - 1) / (decodeMs / 1000),
-          tokens: [...r1.tokens, ...r2.tokens],
-          firstArgmax: r1.firstArgmax,
-          recMs: (r1.recMs * w1 + r2.recMs * w2) / (w1 + w2),
-          gpuMs: (r1.gpuMs * w1 + r2.gpuMs * w2) / (w1 + w2),
-          rbMs: (r1.rbMs * w1 + r2.rbMs * w2) / (w1 + w2),
-          spec: {
-            steps: (r1.spec?.steps ?? 0) + (r2.spec?.steps ?? 0),
-            drafted: (r1.spec?.drafted ?? 0) + (r2.spec?.drafted ?? 0),
-            accepted: (r1.spec?.accepted ?? 0) + (r2.spec?.accepted ?? 0),
-            bailed: !keep,
-          },
-        }
+      } else if (!hasFilter && !A.hybrid && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup) {
+        r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, hist) // pushes generated tokens onto hist
+      } else if (sampled || hasProcessors || hasFilter) {
+        r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, hist) // pushes generated tokens onto hist
+      } else {
+        // Capture the history array like the sampled/PLD paths do: a resetCache() racing this turn
+        // installs a fresh array, and these tokens must land on the OLD one (then next turn falls
+        // back to a clean full prefill) instead of populating the reset history against stale K/V.
+        r = await generateImpl(prefillTokens, posBase, maxTokens, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
+        hist.push(...r.tokens) // greedy doesn't touch history; record the generated tokens for the next turn
       }
-    } else if (!hasFilter && (genOpts.dryMultiplier ?? 0) === 0 && (genOpts.topNSigma ?? 0) === 0 && genOpts.promptLookup) {
-      r = await generatePldImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
-    } else if (sampled || hasProcessors || hasFilter) {
-      r = await generateSampledImpl(prefillTokens, posBase, maxTokens, genOpts, fullHistory) // pushes generated tokens onto fullHistory
-    } else {
-      // Capture the history array like the sampled/PLD paths do: a resetCache() racing this turn
-      // installs a fresh array, and these tokens must land on the OLD one (then next turn falls
-      // back to a clean full prefill) instead of populating the reset history against stale K/V.
-      const hist = fullHistory
-      r = await generateImpl(prefillTokens, posBase, maxTokens, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
-      hist.push(...r.tokens) // greedy doesn't touch history; record the generated tokens for the next turn
-    }
-    return {
-      tokens: r.tokens,
-      prefillMs: r.prefillMs,
-      decodeMs: r.decodeMs,
-      tokensPerSecond: r.tokPerSec,
-      timing: { recordMs: r.recMs, gpuMs: r.gpuMs, readbackMs: r.rbMs },
-      ...(r.spec ? { speculation: r.spec } : {}),
-      ...(r.lp ? { logprobs: r.lp } : {}),
+      return {
+        tokens: r.tokens,
+        prefillMs: r.prefillMs,
+        decodeMs: r.decodeMs,
+        tokensPerSecond: r.tokPerSec,
+        timing: { recordMs: r.recMs, gpuMs: r.gpuMs, readbackMs: r.rbMs },
+        ...(r.spec ? { speculation: r.spec } : {}),
+        ...(r.lp ? { logprobs: r.lp } : {}),
+      }
+    } catch (e) {
+      fullHistory = []
+      cacheLen = 0
+      throw e
     }
   }
 
   // Prefill a prompt PREFIX into the KV cache without decoding, then stop. A later
   // generate(delta, {reuseCache:true}) continues from it, so a static system prompt can be warmed at
   // load and the user's first turn becomes a cheap cache-append instead of a full prefill. Like a
-  // non-reuse generate's prefill it resets the cache (this prefix becomes the whole history); it
-  // writes K/V for EVERY prefilled position, so the reuse path's re-fed last token just overwrites
-  // position len-1 idempotently and the result is identical to a cold full prefill.
+  // non-reuse generate's prefill it resets the cache (this prefix becomes the whole history). It
+  // feeds ids[0 .. len-1): the reuse path re-feeds the LAST history token, which writes position
+  // len-1's K/V then - feeding it here too would be merely redundant for dense K/V (idempotent
+  // overwrite) but WRONG for the hybrid backbone, whose cumulative DeltaNet recurrence would
+  // apply that token twice (once here, once on the re-feed) and silently diverge from a cold
+  // full prefill for the rest of the conversation.
   async function prefill(ids: number[]): Promise<{ prefillMs: number }> {
     if (ids.length === 0) throw new Error('prefill: no tokens to process')
     if (ids.length > maxSeqLen) throw new Error(`prefill: sequence length ${ids.length} exceeds maxSeqLen ${maxSeqLen}`)
+    // Invalidate BEFORE touching the cache: a mid-prefill throw (e.g. scratch OOM) must not leave
+    // the old history pointing at partially overwritten K/V rows. Same guard as forward().
+    fullHistory = []
+    cacheLen = 0
     await ensureKvCapacity(ids.length)
     transients = []
     try {
       const t0 = performance.now()
-      await runPrefill(ids, 0) // posBase 0: fresh prefix; writes K/V for every position (segmented)
-      await device.queue.onSubmittedWorkDone()
+      if (ids.length > 1) {
+        await runPrefill(ids.slice(0, -1), 0) // posBase 0: fresh prefix (segmented)
+        await device.queue.onSubmittedWorkDone()
+      }
       fullHistory = [...ids]
-      cacheLen = ids.length - 1 // sink-mode bookkeeping (last token re-feeds)
+      cacheLen = ids.length - 1 // positions actually fed/written; the last token re-feeds on reuse
       return { prefillMs: performance.now() - t0 }
     } finally {
       flushTransients()
@@ -2645,34 +2747,51 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const bytes = snapshotBytes(count)
     const data = new ArrayBuffer(bytes)
     if (bytes > 0) {
-      const rb = device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | CD })
-      const enc = device.createCommandEncoder()
-      let off = 0
+      // The total snapshot (all layers) can exceed the device's maxBufferSize (256 MiB unless the
+      // weights needed more) - a 4B q8 cache passes it at ~3.2k tokens. Read back through a bounded
+      // staging buffer instead of one snapshot-sized MAP_READ allocation: peak extra VRAM stays
+      // constant and no limit above WebGPU's guaranteed minimum is ever required. __RBCAP = test
+      // hook to force multi-chunk on small snapshots.
+      const cap = Math.max(4, Math.min(((globalThis as { __RBCAP?: number }).__RBCAP ?? 0) || 128 << 20, device.limits.maxBufferSize) & ~3)
+      const pieces: { src: GPUBuffer; off: number; size: number }[] = []
       if (count > 0)
         for (const li of kvLayers) {
-          enc.copyBufferToBuffer(Kc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
-          off += count * kvRowBytes
-          enc.copyBufferToBuffer(Vc[li], base * kvRowBytes, rb, off, count * kvRowBytes)
-          off += count * kvRowBytes
+          pieces.push({ src: Kc[li], off: base * kvRowBytes, size: count * kvRowBytes })
+          pieces.push({ src: Vc[li], off: base * kvRowBytes, size: count * kvRowBytes })
           if (kv8) {
-            enc.copyBufferToBuffer(Ksc[li], base * scRowBytes, rb, off, count * scRowBytes)
-            off += count * scRowBytes
-            enc.copyBufferToBuffer(Vsc[li], base * scRowBytes, rb, off, count * scRowBytes)
-            off += count * scRowBytes
+            pieces.push({ src: Ksc[li], off: base * scRowBytes, size: count * scRowBytes })
+            pieces.push({ src: Vsc[li], off: base * scRowBytes, size: count * scRowBytes })
           }
         }
       // hybrid: each linear layer's DeltaNet recurrent + conv state (the current ping-pong half),
       // which already reflects tokens [0, len) - the re-fed last token continues it exactly like KV.
       for (const li of linearLayers) {
-        enc.copyBufferToBuffer(hyRS[li][hyPar], 0, rb, off, rsSz)
-        off += rsSz
-        enc.copyBufferToBuffer(hyCS[li][hyPar], 0, rb, off, csSz)
-        off += csSz
+        pieces.push({ src: hyRS[li][hyPar], off: 0, size: rsSz })
+        pieces.push({ src: hyCS[li][hyPar], off: 0, size: csSz })
       }
-      device.queue.submit([enc.finish()])
-      await rb.mapAsync(GPUMapMode.READ)
-      new Uint8Array(data).set(new Uint8Array(rb.getMappedRange()))
-      rb.unmap()
+      const rb = device.createBuffer({ size: Math.min(bytes, cap), usage: GPUBufferUsage.MAP_READ | CD })
+      let pi = 0
+      let pOff = 0 // progress inside pieces[pi] (a piece larger than cap spans chunks)
+      for (let dst = 0; dst < bytes; ) {
+        const sz = Math.min(cap, bytes - dst)
+        const enc = device.createCommandEncoder()
+        for (let fill = 0; fill < sz; ) {
+          const p = pieces[pi]
+          const take = Math.min(p.size - pOff, sz - fill)
+          enc.copyBufferToBuffer(p.src, p.off + pOff, rb, fill, take)
+          fill += take
+          pOff += take
+          if (pOff === p.size) {
+            pi++
+            pOff = 0
+          }
+        }
+        device.queue.submit([enc.finish()])
+        await rb.mapAsync(GPUMapMode.READ, 0, sz)
+        new Uint8Array(data, dst, sz).set(new Uint8Array(rb.getMappedRange(0, sz)))
+        rb.unmap()
+        dst += sz
+      }
       rb.destroy()
     }
     return {
@@ -2708,8 +2827,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const base = Math.max(0, Math.floor(snap.base ?? 0))
     if (base > 0 && A.hybrid) throw new Error('restoreCache: delta snapshots are not supported for the qwen3_5 hybrid backbone')
     const count = len - base
-    if (len + 1 > maxSeqLen)
-      throw new Error(`restoreCache: snapshot needs ${len + 1} cache slots but maxSeqLen is ${maxSeqLen}`)
+    // v1 needs one spare slot for the reuse turn's re-fed last token; v2 (sink mode) does not -
+    // a reuse turn there evicts to make its own room first, and a rolled cache legitimately ends
+    // a turn exactly full (cacheLen == maxSeqLen), which must stay restorable.
+    if (len + (snap.version === 2 ? 0 : 1) > maxSeqLen)
+      throw new Error(`restoreCache: snapshot needs ${len + (snap.version === 2 ? 0 : 1)} cache slots but maxSeqLen is ${maxSeqLen}`)
     if (snap.data.byteLength !== snapshotBytes(count))
       throw new Error(`restoreCache: snapshot data is ${snap.data.byteLength} bytes, expected ${snapshotBytes(count)}`)
     if (base > 0) {
@@ -2781,12 +2903,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     dispose: () => device.destroy(),
     device,
     adapter,
-    profileDecode: async (ids, nTokens, full = null, syncN = SYNC_N) => {
+    // The debug/profile trio overwrites K/V from position 0 and shares every flag and buffer the
+    // main ops use - serialized like them so a queued generate can never interleave, and each one
+    // invalidates fullHistory so a later reuse/save cannot touch the clobbered cache.
+    profileDecode: serialize(async (ids: number[], nTokens: number, full: Set<string> | null = null, syncN: number = SYNC_N) => {
+      fullHistory = []
+      cacheLen = 0
       TS_PROFILE = hasTS // collect true GPU time this run (no-op without the feature)
       try { return await generateImpl(ids, 0, nTokens, full, syncN) } finally { TS_PROFILE = false }
-    },
-    debugDecode,
-    debugSampler,
+    }),
+    debugDecode: serialize(debugDecode),
+    debugSampler: serialize(debugSampler),
   }
   return api
 }

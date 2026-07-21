@@ -727,6 +727,17 @@
         const rejOk = rej === 4;
         ok = ok && rejOk;
         log(`  ${rejOk ? '[PASS]' : '[FAIL]'} tampered snapshots rejected (${rej}/4 threw)`);
+        // chunked readback: force a tiny staging cap so this snapshot spans many chunks (the path a
+        // >maxBufferSize snapshot takes in production, e.g. 4B q8 past ~3.2k tokens). Bytes must be
+        // identical to the single-chunk snapshot above.
+        await engine.restoreCache(sn); // put the cache back to exactly sn's content
+        globalThis.__RBCAP = 4096;
+        const snC = await engine.saveCache();
+        globalThis.__RBCAP = 0;
+        const a = new Uint8Array(sn.data), b = new Uint8Array(snC.data);
+        const chOk = a.length === b.length && a.every((v, i) => v === b[i]);
+        ok = ok && chOk;
+        log(`  ${chOk ? '[PASS]' : '[FAIL]'} chunked readback (4 KiB staging cap): snapshot byte-identical`);
         engine.resetCache();
       }
 
