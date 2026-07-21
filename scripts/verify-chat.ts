@@ -1194,5 +1194,87 @@ await (async () => {
   }
 })()
 
+
+// ── (K) audit regressions (0.19.1) ───────────────────────────────────────────
+console.log('\n(K) 0.19.1 audit regressions')
+await (async () => {
+  const enc = new TextEncoder()
+  const bo = ToolBodyMachine.bytesOf
+
+  // observe() counts at most once per emitted step: the engine's full-vocab walk re-invokes the
+  // candidate filter once per 512-token batch, and those calls must not eat the early-stop window.
+  {
+    const b = new ThinkBudget(10, 11, 99, true, { gap: 5, window: 2, minTokens: 0 })
+    b.observe([9, 1])
+    b.observe([9, 1])
+    b.observe([9, 1]) // same step re-invocations: window 2 must NOT be satisfied
+    check('observe: batch re-invocations count once', b.force() === null)
+    b.advance(7) // a think token emits -> next step
+    b.observe([9, 1]) // second confident STEP -> window 2 met
+    check('observe: two confident STEPS fire the early stop', b.force() === 11)
+  }
+
+  // Exhausted declared keys close the door: duplicates and post-exhaustion params rejected.
+  {
+    const props = new Map([[bo('get'), { keys: [bo('q')], required: [bo('q')], schemas: new Map<string, JsonSchema>() }]])
+    const feed = (s: string): boolean => new ToolBodyMachineXml([bo('get')], props).feed(enc.encode(s))
+    check('xml keys: duplicate parameter rejected', !feed('<function=get>\n<parameter=q>\nx\n</parameter>\n<parameter='))
+    check('xml keys: close after exhausting keys still fine', (() => { const m = new ToolBodyMachineXml([bo('get')], props); return m.feed(enc.encode('<function=get>\n<parameter=q>\nx\n</parameter>\n</function>')) && m.complete })())
+    const noProps = new Map([[bo('go'), { keys: [], required: [], schemas: new Map<string, JsonSchema>() }]])
+    const m2 = new ToolBodyMachineXml([bo('go')], noProps)
+    check('xml keys: schema-less tool keeps permissive keys', m2.feed(enc.encode('<function=go>\n<parameter=any>\nv\n</parameter>\n</function>')) && m2.complete)
+  }
+
+  // Whitespace after a completed json-mode value is capped at the canonical newline.
+  {
+    const props = new Map([[bo('f'), { keys: [bo('n')], required: [], schemas: new Map([[bo('n'), { type: 'number' } as JsonSchema]]) }]])
+    const feed = (s: string): boolean => new ToolBodyMachineXml([bo('f')], props).feed(enc.encode(s))
+    check('json value ws: single canonical newline ok', feed('<function=f>\n<parameter=n>\n42\n</parameter>'))
+    check('json value ws: runaway whitespace rejected', !feed('<function=f>\n<parameter=n>\n42\n\n'))
+    check('json value ws: number still extends past completeness', feed('<function=f>\n<parameter=n>\n425\n</parameter>'))
+  }
+
+  // oneOf params route through the JsonMachine (were unconstrained raw text).
+  {
+    const shape: JsonSchema = { oneOf: [
+      { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['a'] }, v: { type: 'integer' } }, required: ['kind'] },
+      { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['b'] }, v: { type: 'integer' } }, required: ['kind'] },
+    ] }
+    const props = new Map([[bo('f'), { keys: [bo('s')], required: [], schemas: new Map([[bo('s'), shape]]) }]])
+    const feed = (s: string): boolean => new ToolBodyMachineXml([bo('f')], props).feed(enc.encode(s))
+    check('oneOf param: valid discriminated object accepted', feed('<function=f>\n<parameter=s>\n{"kind": "a", "v": 1}\n</parameter>'))
+    check('oneOf param: non-JSON garbage now rejected', !feed('<function=f>\n<parameter=s>\njunk'))
+    const XT: ChatTool[] = [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: { s: shape } } } }]
+    const parsed = parseToolCallXml('<function=f>\n<parameter=s>\n{"kind": "a", "v": 1}\n</parameter>\n</function>', XT)
+    check('oneOf param: parse returns the OBJECT, not a string', parsed.name === 'f' && typeof parsed.arguments.s === 'object' && (parsed.arguments.s as { kind: string }).kind === 'a')
+  }
+
+  // makeToolFilter: body text may never spell out the close marker (the splitter scans TEXT), and
+  // XML setup fails loudly on unenforceable schemas.
+  {
+    const { makeToolFilter } = await import('../src/chat/tools')
+    const M = new Map<number, Uint8Array>([
+      [100, enc.encode('</')], [101, enc.encode('tool')], [102, enc.encode('_call')], [103, enc.encode('>')],
+      [104, enc.encode('x')], [105, enc.encode('\n<function=f>\n<parameter=q>\nsee ')],
+    ])
+    const tbl = { bytes: (id: number) => M.get(id) ?? null } as unknown as TokenByteTable
+    const tool: ChatTool = { type: 'function', function: { name: 'f', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } }
+    const prep = { tools: [tool], ids: { open: 1, close: 2, eos: 3 }, forced: null, format: 'xml' as const }
+    const f = makeToolFilter(tbl, prep)
+    f.advance(1) // <tool_call> opens the body
+    for (const id of [105, 100, 101, 102]) { check(`close-in-value: token ${id} legal en route`, f.filter([id, 104]).includes(id)); f.advance(id) }
+    const last = f.filter([103, 104])
+    check("close-in-value: the '>' completing </tool_call> as TEXT is rejected", !last.includes(103) && last.includes(104))
+    const badLen: ChatTool = { type: 'function', function: { name: 'g', parameters: { type: 'object', properties: { s: { type: 'string', minLength: 2 } } } } }
+    let threw = false
+    try { makeToolFilter(tbl, { ...prep, tools: [badLen] }) } catch { threw = true }
+    check('xml setup: minLength string param fails loudly', threw)
+    const badEnum: ChatTool = { type: 'function', function: { name: 'h', parameters: { type: 'object', properties: { s: { enum: ['ok', ''] } } } } }
+    threw = false
+    try { makeToolFilter(tbl, { ...prep, tools: [badEnum] }) } catch { threw = true }
+    check('xml setup: empty-string enum literal fails loudly', threw)
+  }
+})()
+
 console.log(failures === 0 ? '\nALL CHAT CHECKS PASSED' : `\n${failures} CHAT CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)

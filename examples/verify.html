@@ -167,6 +167,16 @@
       log(`  sampled ids (seed 42): [${s1.tokens.join(', ')}]`);
       log(`  sampled decode = ${s1.tokensPerSecond.toFixed(2)} tok/s (greedy was ${g.tokensPerSecond.toFixed(2)})`);
 
+      // (b3) forced token OUTSIDE the top-K: a candidateFilter may return an id it was not shown
+      // (chat's thinkBudget forces </think> this way). The engine must fall through to the
+      // full-vocabulary walk and emit exactly that token - never an undefined pick. Token 9 is
+      // essentially never in a natural top-20.
+      const FORCED = 9;
+      const fRes = await engine.generate(ids, { maxTokens: 3, candidateFilter: () => [FORCED] });
+      const fOk = fRes.tokens.length === 3 && fRes.tokens.every((t) => t === FORCED);
+      ok = ok && fOk;
+      log(`  ${fOk ? '[PASS]' : '[FAIL]'} candidateFilter forcing an out-of-top-K id emits it (full-vocab fallback) [${fRes.tokens.join(', ')}]`);
+
       // 6) cross-turn KV reuse (Phase 2b): a reused turn must equal a full prefill of the same sequence
       log('\ncross-turn KV reuse checks...');
       const R1 = 8, R2 = 8, delta = ids.slice(0, 5);
@@ -854,6 +864,23 @@
         log(`  ${qOkR ? '[PASS]' : '[FAIL]'} q8+sinks: 400 tokens through the window, deterministic (tail ${distinctQ}/200 distinct)`);
         log(`  q8+sinks decode ${rq1.tokensPerSecond.toFixed(2)} tok/s (flat-cost rolling window)`);
         eQ.dispose();
+        // affected-ids growth (0.19.1): under sinks the penalty history is the WHOLE conversation,
+        // so distinct token ids can exceed maxSeqLen (the old fixed affBuf bound) - the oversized
+        // writeBuffer used to be DROPPED as a validation error and stale penalties applied. Tiny
+        // window + two varied turns pushes distinct ids past the window; the validation scope must
+        // stay clean and the turn must complete.
+        {
+          const eA = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', maxSeqLen: 48, forceNoSubgroups: nosgQ });
+          const vary = (n, o) => Array.from({ length: n }, (_, i) => 100 + o + i * 7);
+          eA.device.pushErrorScope('validation');
+          await eA.generate(vary(30, 0), { maxTokens: 30, repetitionPenalty: 1.15 });
+          await eA.generate(vary(30, 300), { maxTokens: 30, reuseCache: true, repetitionPenalty: 1.15, noRepeatNgramSize: 2 });
+          const affErr = await eA.device.popErrorScope();
+          const affOk = affErr === null;
+          ok = ok && affOk;
+          log(`  ${affOk ? '[PASS]' : '[FAIL]'} sinks + penalties with distinct history > window: affBuf grows, no dropped writes${affErr ? ` (${affErr.message})` : ''}`);
+          eA.dispose();
+        }
         // f16 + sinks (when the adapter has shader-f16): same roll + determinism probe
         if ((await navigator.gpu.requestAdapter()).features.has('shader-f16')) {
           const eH = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', kvCache: 'f16', maxSeqLen: 192, forceNoSubgroups: nosgQ });

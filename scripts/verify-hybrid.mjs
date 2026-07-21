@@ -126,7 +126,20 @@ try {
       const rSeg = await eSeg.forward(ids)
       const segGen = (await eSeg.generate(pad, { maxTokens: GN })).tokens
       globalThis.__SEG = 0
-      return { ok: true, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, sampGen, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength, seg16logits: [...rSeg.logits], segGen }
+      // 0.19.1 regressions:
+      // (a) prefill()+reuse == cold: prefill() must feed all-but-last so the reuse re-feed applies
+      //     the last token to the DeltaNet recurrence exactly ONCE (it used to apply twice).
+      const eP = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
+      await eP.prefill([...hist])
+      const prefillReuse = (await eP.generate(delta, { reuseCache: true, maxTokens: 5 })).tokens
+      // (b) promptLookup on the hybrid: 'auto' silently skips speculation, explicit throws.
+      const eAuto = await createEngine({ modelUrl: `${base}/examples/model-synth-qwen35` })
+      const rAuto = await eAuto.generate(ids.slice(0, K), { maxTokens: N, promptLookup: 'auto' })
+      const pldAutoGen = rAuto.tokens
+      const pldAutoSkipped = rAuto.speculation === undefined
+      let pldExplicitThrew = false
+      try { await eAuto.generate([ids[0]], { maxTokens: 2, promptLookup: true }) } catch { pldExplicitThrew = true }
+      return { ok: true, prefillReuse, pldAutoGen, pldAutoSkipped, pldExplicitThrew, embed: [...r.embed], layer0: [...r.layer0], finalnorm: [...r.finalnorm], logits: [...r.logits], gen, ref, sampGen, growGen, growRef, q8mode, q8logits: [...rq8.logits], genQ8, refQ8, af16mode, af16logits: [...rf16.logits], genF16, refF16, snapFull, snapRestored, reuseOnly, snapBytes: snap.data.byteLength, seg16logits: [...rSeg.logits], segGen }
     } catch (e) { return { ok: false, err: String((e && e.stack) || e) } }
   }, { base: `http://127.0.0.1:${port}`, ids: params.ids })
   if (!out.ok) { console.log('ENGINE ERROR:', out.err); process.exit(1) }
@@ -185,6 +198,12 @@ try {
   if (!reuseOk) fail++
   const snapOk = JSON.stringify(out.snapRestored) === JSON.stringify(out.snapFull)
   console.log(`  [${snapOk ? 'PASS' : 'FAIL'}] snapshot restore+continue == cold full-prefill  restored=${JSON.stringify(out.snapRestored)} full=${JSON.stringify(out.snapFull)} (${out.snapBytes}B)`)
+  const pfrOk = JSON.stringify(out.prefillReuse) === JSON.stringify(out.snapFull)
+  if (!pfrOk) fail++
+  console.log(`  [${pfrOk ? 'PASS' : 'FAIL'}] prefill()+reuse == cold full-prefill (single recurrence feed)  pr=${JSON.stringify(out.prefillReuse)} full=${JSON.stringify(out.snapFull)}`)
+  const pldOk = JSON.stringify(out.pldAutoGen) === JSON.stringify(out.gen) && out.pldAutoSkipped && out.pldExplicitThrew
+  if (!pldOk) fail++
+  console.log(`  [${pldOk ? 'PASS' : 'FAIL'}] promptLookup gates on hybrid: auto skips (tokens identical, no spec), explicit throws  skipped=${out.pldAutoSkipped} threw=${out.pldExplicitThrew}`)
   if (!snapOk) fail++
   // seg-256 sub-chunked scan vs the 0.17-known-good seg-16 cadence (direct A/B, not vs golden)
   let sgmad = 0, sgdot = 0, sgna = 0, sgnb = 0
