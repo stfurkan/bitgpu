@@ -870,15 +870,15 @@
         // window + two varied turns pushes distinct ids past the window; the validation scope must
         // stay clean and the turn must complete.
         {
-          const eA = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', maxSeqLen: 48, forceNoSubgroups: nosgQ });
+          const eA = await createEngine({ modelUrl: MODEL_DIR, overflow: 'sinks', maxSeqLen: 68, forceNoSubgroups: nosgQ }); // 68 = sinks minimum (4 sinks + 64)
           const vary = (n, o) => Array.from({ length: n }, (_, i) => 100 + o + i * 7);
           eA.device.pushErrorScope('validation');
-          await eA.generate(vary(30, 0), { maxTokens: 30, repetitionPenalty: 1.15 });
-          await eA.generate(vary(30, 300), { maxTokens: 30, reuseCache: true, repetitionPenalty: 1.15, noRepeatNgramSize: 2 });
+          await eA.generate(vary(40, 0), { maxTokens: 30, repetitionPenalty: 1.15 });
+          await eA.generate(vary(40, 400), { maxTokens: 30, reuseCache: true, repetitionPenalty: 1.15, noRepeatNgramSize: 2 });
           const affErr = await eA.device.popErrorScope();
           const affOk = affErr === null;
           ok = ok && affOk;
-          log(`  ${affOk ? '[PASS]' : '[FAIL]'} sinks + penalties with distinct history > window: affBuf grows, no dropped writes${affErr ? ` (${affErr.message})` : ''}`);
+          log(`  ${affOk ? '[PASS]' : '[FAIL]'} sinks + penalties with distinct history > window (80 distinct vs 68 slots): affBuf grows, no dropped writes${affErr ? ` (${affErr.message})` : ''}`);
           eA.dispose();
         }
         // f16 + sinks (when the adapter has shader-f16): same roll + determinism probe

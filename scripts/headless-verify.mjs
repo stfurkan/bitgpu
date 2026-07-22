@@ -72,6 +72,10 @@ if (process.argv[2]) {
   urls = []
   for (const d of readdirSync(join(root, 'examples'), { withFileTypes: true })) {
     const m = d.name.match(/^model-(.+)$/)
+    if (m && m[1].startsWith('synth')) {
+      console.log(`[skip] examples/${d.name}: synthetic fixture - covered by its dedicated gate (npm run verify:hybrid), not the dense plan`)
+      continue
+    }
     if (!m) continue
     if (!existsSync(join(root, 'examples', d.name, 'manifest.json'))) continue
     if (!existsSync(join(root, `test-fixtures/forward-${m[1]}/params.json`))) {
