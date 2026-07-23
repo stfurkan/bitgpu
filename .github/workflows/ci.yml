@@ -21,5 +21,29 @@ jobs:
       - run: npm run test:chat
       - run: npm run test:gguf
       - run: npm run check:publish
-      # The GPU bit-exactness gate (npm run verify:headless) needs real WebGPU hardware
-      # and the model weights; run it locally before every release (see README).
+      # The full GPU bit-exactness gate (npm run verify:headless) needs the multi-GB model
+      # weights; run it locally before every release (see README). The weight-free GPU
+      # gates run in CI below (gpu-smoke).
+
+  gpu-smoke:
+    # Real-WebGPU smoke on the hosted Apple silicon runners: the macOS VMs expose Metal,
+    # and the preinstalled Chrome runs headless WebGPU with --use-angle=metal. Runs the
+    # two gates that need no staged weights: per-kernel bit-exactness against the numpy
+    # oracle (test:kernels) and the synthetic-model end-to-end engine gate (test:hybrid),
+    # which also exercises snapshot save/restore on a real device. If this job ever fails
+    # at the adapter probe rather than a numeric check, suspect the runner image lost
+    # WebGPU support, not a kernel regression.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install numpy
+      - run: npm ci
+      - run: npm run test:kernels
+      - run: npm run test:hybrid

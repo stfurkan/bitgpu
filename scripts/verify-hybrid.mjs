@@ -31,7 +31,7 @@ const f32 = (n) => new Float32Array(readFileSync(join(FX, n)).buffer.slice(0))
 const golden = { embed: f32('embed.bin'), layer0: f32('layer0.bin'), finalnorm: f32('finalnorm.bin'), logits: f32('logits.bin') }
 
 const browser = await chromium.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu', '--use-angle=metal'],
 })
 let fail = 0

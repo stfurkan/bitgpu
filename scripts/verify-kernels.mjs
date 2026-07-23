@@ -78,7 +78,7 @@ const server = createServer((_req, res) => { res.setHeader('content-type', 'text
 await new Promise((r) => server.listen(0, '127.0.0.1', r))
 const port = server.address().port
 const browser = await chromium.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   headless: true,
   args: ['--enable-unsafe-webgpu', '--enable-gpu', '--use-angle=metal'],
 })

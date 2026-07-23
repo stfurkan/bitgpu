@@ -558,8 +558,9 @@ npm run test:27b                             # LIVE Bonsai-27B gate: streams the
 
 Or serve the repo root (`python3 -m http.server 8000`) and open
 `http://localhost:8000/examples/verify.html` in a WebGPU browser and click Run. Run this gate on
-real hardware before every release; CI covers only the CPU-checkable parts (types, sampler math,
-drafter, chat, packaging). The headless driver also runs the baseline model once with
+real hardware before every release. CI covers the CPU-checkable parts (types, sampler math,
+drafter, chat, packaging) plus a real-GPU smoke job on the hosted Mac runners that runs the
+two weight-free gates (test:kernels and test:hybrid); the full weighted gate above stays local. The headless driver also runs the baseline model once with
 `?nosg=1` (the no-subgroup workgroup-reduction fallback used on Firefox and older adapters), so
 that path is release-gated too - it is bit-identical to the subgroup path on the committed
 known-good ids.

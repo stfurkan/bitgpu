@@ -26,7 +26,7 @@ const server = await new Promise((resolve) => {
 const port = server.address().port
 const [model = 'model-1.7b-gguf', tjs = 'onnx-community/Bonsai-1.7B-ONNX', n = '64'] = process.argv.slice(2)
 const url = `http://127.0.0.1:${port}/examples/benchmark.html?model=${encodeURIComponent(model)}&tjs=${encodeURIComponent(tjs)}&n=${encodeURIComponent(n)}`
-const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu', '--use-angle=metal'] })
+const browser = await chromium.launch({ executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true, args: ['--enable-unsafe-webgpu', '--enable-gpu', '--use-angle=metal'] })
 try {
   const page = await browser.newPage()
   page.on('pageerror', (e) => console.log('[pageerror]', e.message))

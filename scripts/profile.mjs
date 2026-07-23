@@ -43,7 +43,7 @@ if (tags.length === 0) {
 
 const { server, port } = await serveRepo()
 const browser = await chromium.launch({
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   headless: true,
   args: ['--enable-unsafe-webgpu', '--enable-gpu', '--use-angle=metal'],
 })
